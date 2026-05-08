@@ -56,6 +56,16 @@ ENV_TEMPLATE = """# /watch API configuration
 GROQ_API_KEY=
 OPENAI_API_KEY=
 
+# AssemblyAI — paid Whisper backend with automatic speaker diarization
+# (multi-speaker transcripts get [Speaker A] / [Speaker B] / … labels).
+# Used only when /watch is invoked with `--whisper assemblyai`. Optional:
+# leave blank if you don't need diarization.
+#
+# Get a key: https://www.assemblyai.com/dashboard/signup ($50 free credits;
+# diarization is roughly $0.37/hr of audio thereafter).
+
+ASSEMBLYAI_API_KEY=
+
 # Gemini native video backend — used only when /watch is invoked with
 # `--backend gemini`. Gemini ingests the whole video (or a YouTube URL)
 # directly and answers the user's question without local frame extraction.
@@ -323,12 +333,16 @@ def cmd_install() -> int:
     print("[setup] one step left: add a Whisper API key (or skip and use --whisper local / --backend gemini).")
     print("")
     print(f"  Edit {CONFIG_FILE} and set any of:")
-    print("    GROQ_API_KEY=...    (preferred — cheaper, faster; get one at console.groq.com/keys)")
-    print("    OPENAI_API_KEY=...  (fallback; get one at platform.openai.com/api-keys)")
-    print("    GEMINI_API_KEY=...  (optional — required only for --backend gemini; aistudio.google.com/apikey)")
+    print("    GROQ_API_KEY=...        (preferred — cheaper, faster; console.groq.com/keys)")
+    print("    OPENAI_API_KEY=...      (fallback; platform.openai.com/api-keys)")
+    print("    ASSEMBLYAI_API_KEY=...  (paid; speaker diarization for multi-speaker content;")
+    print("                             $50 free credits at assemblyai.com/dashboard/signup)")
+    print("    GEMINI_API_KEY=...      (optional — required only for --backend gemini;")
+    print("                             aistudio.google.com/apikey)")
     print("")
     print("  Without any of these, /watch still works but:")
     print("    - videos without captions come back frames-only (unless --whisper local + a GPU)")
+    print("    - --whisper assemblyai won't run (no speaker diarization)")
     print("    - --backend gemini won't run")
     return 3
 

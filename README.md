@@ -126,10 +126,11 @@ Captions cover the majority of public videos for free. The Whisper fallback only
 | Whisper, **local GPU** (preferred when available) | NVIDIA GPU + `pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12` | Free, no API call. ~13× realtime on RTX 2080 Ti with `large-v3` |
 | Whisper, **Groq API** | [Groq API key](https://console.groq.com/keys) — `whisper-large-v3` | Cheap, fast |
 | Whisper, **OpenAI API** | [OpenAI API key](https://platform.openai.com/api-keys) — `whisper-1` | Standard pricing |
+| Whisper, **AssemblyAI** (speaker diarization) | [AssemblyAI key](https://www.assemblyai.com/dashboard/signup) + `pip install assemblyai` | ~$0.37/hr with diarization, $50 free credits to start |
 | Disable Whisper entirely | `--no-whisper` | Free, frames-only when no captions |
 | Native Gemini video backend (`--backend gemini`) | [Gemini API key](https://aistudio.google.com/apikey) + `pip install google-genai` | Free tier on `gemini-3.1-flash-lite`; paid for `2.5-flash` / `2.5-pro` |
 
-The Whisper auto-selection priority is `local → groq → openai`. Force a specific Whisper backend with `--whisper local|groq|openai`. See [Local Whisper](#local-whisper-faster-whisper-on-gpu) for the GPU setup. The Gemini backend is independent — picked with `--backend gemini` and described in its own section below.
+The Whisper auto-selection priority is `local → groq → openai`. Force a specific Whisper backend with `--whisper local|groq|openai|assemblyai`. AssemblyAI is never auto-picked — request it explicitly when you need speaker diarization. See [Local Whisper](#local-whisper-faster-whisper-on-gpu) for the GPU setup and [Speaker diarization](#speaker-diarization-via-assemblyai) for the AssemblyAI flow. The Gemini backend is independent — picked with `--backend gemini` and described in its own section.
 
 ## Usage
 
@@ -187,8 +188,9 @@ All flags are forwarded to `scripts/watch.py`. The full set:
 | Flag | Purpose |
 |------|---------|
 | `--audio FILE` | Separate audio file (mp3/wav/m4a) to transcribe instead of the video's own audio track. Use for muted videos with separate VO. Cannot combine with `--no-whisper`. |
-| `--whisper local\|groq\|openai` | Force a specific Whisper backend. Default: auto-pick `local`, then `groq`, then `openai`. |
-| `--whisper-model NAME` | Local-backend model size: `tiny\|base\|small\|medium\|large-v2\|large-v3` (default `large-v3`). Ignored for Groq / OpenAI. |
+| `--whisper local\|groq\|openai\|assemblyai` | Force a specific Whisper backend. Default: auto-pick `local`, then `groq`, then `openai`. AssemblyAI is opt-in; see [Speaker diarization](#speaker-diarization-via-assemblyai). |
+| `--whisper-model NAME` | Local-backend model size: `tiny\|base\|small\|medium\|large-v2\|large-v3` (default `large-v3`). Ignored for Groq / OpenAI / AssemblyAI. |
+| `--diarize` / `--no-diarize` | Request speaker labels when the backend supports them (currently only AssemblyAI). Default ON. Ignored for local / groq / openai. |
 | `--no-whisper` | Disable transcription entirely; frames only. |
 
 **OCR**
@@ -251,6 +253,47 @@ A successful install prints `CUDA devices: 1` (or higher). Anything else — `0`
 | `large-v3` | 1550 M | ~10 GB | 1× | **Default.** Best quality; needs ≥ 10 GB VRAM |
 
 Speed numbers are approximate ratios — actual realtime multiplier depends heavily on the GPU. Drop a tier if you hit OOM, or if `large-v3` is overkill for the content (a clean voiceover transcribes fine with `medium`).
+
+## Speaker diarization (via AssemblyAI)
+
+The Whisper-family backends (`local`, `groq`, `openai`) all do speech-to-text but none of them split a transcript by speaker — Whisper itself doesn't diarize. When you need `[Speaker A]` / `[Speaker B]` / … turns in the output, the script ships a fourth backend: `--whisper assemblyai`.
+
+**Setup:** add `ASSEMBLYAI_API_KEY` to `~/.config/watch/.env` (get a key at [assemblyai.com/dashboard/signup](https://www.assemblyai.com/dashboard/signup) — $50 of free credits, ~135 hours of diarized audio) and install the SDK:
+
+```bash
+pip install assemblyai
+```
+
+**Usage:**
+
+```bash
+# Default behavior: diarization on, language auto-detected
+python scripts/watch.py interview.mp4 --whisper assemblyai
+
+# Skip diarization for sentence-level segments without speaker tags
+python scripts/watch.py interview.mp4 --whisper assemblyai --no-diarize
+```
+
+The transcript output switches to a speaker-tagged layout when diarization is on:
+
+```
+[Speaker A] (0:00-0:05) Welcome back to the show. Today we're talking with…
+[Speaker B] (0:05-0:09) Thanks for having me, glad to be here.
+[Speaker A] (0:09-0:18) Let's jump in — when did you first realize…
+```
+
+**When it's worth it:**
+
+| Content type | Why diarization helps |
+|--------------|-----------------------|
+| Interviews / podcasts | Separating host vs guest dialogue is the obvious win. |
+| Multi-speaker UGC | Vlog conversations, panel clips, gameplay commentary with two voices. |
+| Ads with presenter + voiceover | Keeps on-camera dialogue separate from off-camera narration. |
+| Single-speaker content | Still works — everything tagged `[Speaker A]`. Useful when you want per-utterance start/end timing surfaced. |
+
+Pricing: roughly **$0.37 per hour of audio** with diarization (text-only is cheaper). The `$50` of free credits covers ~135 hours of diarized audio at that rate, which is plenty for evaluation.
+
+**Local diarization roadmap:** [WhisperX](https://github.com/m-bain/whisperX) combines faster-whisper with pyannote speaker embeddings for fully-local diarization, but the current release pins to Python ≤ 3.13. Adding it to this skill is on the roadmap pending upstream Python 3.14 support — until then, AssemblyAI is the only diarized path that ships here.
 
 ## Native Gemini backend (`--backend gemini`)
 
@@ -318,6 +361,7 @@ This fork has been tested on **Windows 11 + Python 3.14**. Notes:
 │   ├── transcribe.py        # VTT caption parsing + dedupe
 │   ├── whisper.py           # Groq / OpenAI HTTP clients + backend resolver
 │   ├── whisper_local.py     # faster-whisper / GPU client (no network)
+│   ├── whisper_assemblyai.py # AssemblyAI client with speaker diarization
 │   ├── gemini.py            # Gemini multimodal video client (--backend gemini)
 │   ├── setup.py             # preflight + installer
 │   └── build-skill.sh       # build dist/watch.skill for claude.ai upload
@@ -342,7 +386,7 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 MIT license.
 
-Built on `yt-dlp`, `ffmpeg`, `pytesseract`, `PySceneDetect`, and Claude's multimodal `Read` tool. Whisper transcription via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (local GPU), [Groq](https://groq.com), or [OpenAI](https://openai.com). Native video understanding via [Gemini](https://ai.google.dev) when `--backend gemini` is selected.
+Built on `yt-dlp`, `ffmpeg`, `pytesseract`, `PySceneDetect`, and Claude's multimodal `Read` tool. Whisper transcription via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (local GPU), [Groq](https://groq.com), or [OpenAI](https://openai.com). Speaker diarization via [AssemblyAI](https://www.assemblyai.com). Native video understanding via [Gemini](https://ai.google.dev) when `--backend gemini` is selected.
 
 ---
 
