@@ -10,6 +10,14 @@ import re
 import sys
 from pathlib import Path
 
+# Force UTF-8 on stdout/stderr so non-ASCII output (transcripts, accented
+# paths, em-dashes) doesn't crash on Windows where the default is cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 
 TS_RE = re.compile(
     r"(\d{2}):(\d{2}):(\d{2})[.,](\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2})[.,](\d{3})"
