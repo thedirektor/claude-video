@@ -45,7 +45,9 @@ from speech import (  # noqa: E402
     two_pass_sample,
 )
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
-from whisper import load_api_key, transcribe_video  # noqa: E402
+from whisper import resolve_backend, transcribe_video  # noqa: E402
+from whisper_local import DEFAULT_MODEL as WHISPER_LOCAL_DEFAULT_MODEL  # noqa: E402
+from whisper_local import VALID_MODELS as WHISPER_LOCAL_MODELS  # noqa: E402
 
 
 HIRES_WIDTH = 1024
@@ -100,9 +102,18 @@ def main() -> int:
     )
     ap.add_argument(
         "--whisper",
-        choices=["groq", "openai"],
+        choices=["groq", "openai", "local"],
         default=None,
-        help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+        help="Force a specific Whisper backend. 'local' runs faster-whisper on the GPU "
+        "(needs faster-whisper + CUDA). Default: auto-pick local if available, "
+        "else Groq, else OpenAI.",
+    )
+    ap.add_argument(
+        "--whisper-model",
+        choices=list(WHISPER_LOCAL_MODELS),
+        default=WHISPER_LOCAL_DEFAULT_MODEL,
+        help=f"faster-whisper model for the local backend (default {WHISPER_LOCAL_DEFAULT_MODEL}). "
+        "Smaller models are faster but less accurate. Ignored for groq / openai backends.",
     )
     args = ap.parse_args()
 
@@ -182,8 +193,8 @@ def main() -> int:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
     if not transcript_segments and not args.no_whisper:
-        backend, api_key = load_api_key(args.whisper)
-        if backend and api_key:
+        backend, api_key, error_hint = resolve_backend(args.whisper)
+        if backend:
             whisper_input = str(audio_override) if audio_override else video_path
             audio_out = work / ("audio_override.mp3" if audio_override else "audio.mp3")
             try:
@@ -198,24 +209,29 @@ def main() -> int:
                     audio_out,
                     backend=backend,
                     api_key=api_key,
+                    model_name=args.whisper_model if backend == "local" else None,
                 )
                 transcript_segments = (
                     filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 )
                 transcript_text = format_transcript(transcript_segments)
+                # Build a label like "whisper (local, large-v3, --audio)" or
+                # "whisper (groq)". The model name is only meaningful for the
+                # local backend; the API backends don't expose model choice here.
+                backend_label = (
+                    f"{used_backend}, {args.whisper_model}"
+                    if used_backend == "local"
+                    else used_backend
+                )
                 transcript_source = (
-                    f"whisper ({used_backend}, --audio)"
+                    f"whisper ({backend_label}, --audio)"
                     if audio_override
-                    else f"whisper ({used_backend})"
+                    else f"whisper ({backend_label})"
                 )
             except SystemExit as exc:
                 print(f"[watch] whisper transcription failed: {exc}", file=sys.stderr)
         else:
-            hint = (
-                f"--whisper {args.whisper} was set but the matching API key is missing"
-                if args.whisper else
-                "no subtitles and no Whisper API key found"
-            )
+            hint = error_hint or "no subtitles and no Whisper backend available"
             setup_py = SCRIPT_DIR / "setup.py"
             print(
                 f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
