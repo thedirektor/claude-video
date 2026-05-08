@@ -2,6 +2,26 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.2.1] — 2026-05-09
+
+Merged upstream `bradautomates/claude-video v0.1.3` into the fork. Pulls in the
+option-injection hardening and Windows UTF-8 file-IO fix while preserving every
+fork-specific feature from v0.2.0.
+
+### Security
+- Inherits #2 from upstream: yt-dlp argv now includes `--` before the URL,
+  `is_url` rejects `-`-prefixed sources and requires a non-empty netloc, and
+  ffmpeg / ffprobe input/output paths are resolved to absolute via
+  `Path.resolve()` so a relative path beginning with `-` can't be
+  misinterpreted as a flag.
+
+### Fixed
+- Inherits #4 from upstream: explicit `encoding="utf-8"` on `.env` reads/writes
+  in `setup.py` and `whisper.py`, and on `info.json` reads in `download.py`.
+  Failed `info.json` parses now log to stderr instead of being swallowed
+  silently. Complements the existing v0.2.0 stdio-reconfigure fix to cover
+  file IO too.
+
 ## [0.2.0] — 2026-05-08
 
 Fork release covering everything added on top of upstream `bradautomates/claude-video v0.1.2`. Themes: smarter frame sampling (scenes, OCR, speech-aware two-pass), a separate-voiceover workflow, a local-GPU Whisper backend, and a real Windows story.
@@ -30,6 +50,15 @@ Fork release covering everything added on top of upstream `bradautomates/claude-
 ### Fixed
 
 - **UTF-8 encoding on all scripts.** Every Python file in `scripts/` now reconfigures `sys.stdout` / `sys.stderr` to UTF-8 at startup, preventing `UnicodeEncodeError` crashes on Windows's default cp1252 console when the transcript or filenames contain non-ASCII content (Spanish, em-dashes, accented paths). Builds on the v0.1.2 emoji-removal fix to cover all output paths.
+
+## [0.1.3] — 2026-05-09
+
+### Fixed
+- Windows: `video.info.json` is read as UTF-8 (#4). Previously `Path.read_text()` defaulted to cp1252 on Windows and crashed on yt-dlp's UTF-8 output, silently dropping Title/Uploader from the report. Same fix applied to `.env` reads/writes in `whisper.py` and `setup.py`.
+- `download.py` now logs info.json parse failures to stderr instead of swallowing them.
+
+### Security
+- Hardened subprocess argv against option injection (#2): inserted `--` before the URL in the yt-dlp argv, and tightened `is_url` to reject `-`-prefixed sources and require a non-empty netloc. Resolved video/audio paths to absolute via `Path.resolve()` before passing to `ffmpeg`/`ffprobe`, so a relative path starting with `-` can't be misinterpreted as a flag.
 
 ## [0.1.2] — 2026-04-24
 
