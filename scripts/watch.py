@@ -36,6 +36,8 @@ from frames import (  # noqa: E402
     parse_time,
     reextract_frame,
 )
+from gemini import DEFAULT_MODEL as GEMINI_DEFAULT_MODEL  # noqa: E402
+from gemini import VALID_MODELS as GEMINI_MODELS  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
 from scenes import DEFAULT_THRESHOLD, detect_scenes, pick_midpoints  # noqa: E402
 from speech import (  # noqa: E402
@@ -53,12 +55,99 @@ from whisper_local import VALID_MODELS as WHISPER_LOCAL_MODELS  # noqa: E402
 HIRES_WIDTH = 1024
 
 
+def _run_gemini_backend(args, work: Path) -> int:
+    """Hand the entire video to Gemini for native multimodal analysis.
+
+    Skips frame extraction, Whisper, OCR, scene detection, and two-pass
+    sampling — Gemini ingests the video directly and answers the user's
+    question. For YouTube URLs we pass the URL through to the model
+    (Gemini fetches it server-side); for everything else we download (if
+    needed) and upload to the Gemini Files API.
+    """
+    from gemini import generate_with_video, is_youtube_url
+
+    question = " ".join(args.question).strip()
+    if not question:
+        raise SystemExit(
+            "--backend gemini requires a question. Pass it as the trailing "
+            'positional argument: `watch.py video.mp4 --backend gemini "Describe this video"`'
+        )
+
+    if args.audio:
+        print(
+            "[watch] --audio is ignored for --backend gemini (Gemini transcribes the "
+            "video's own audio track natively).",
+            file=sys.stderr,
+        )
+
+    source = args.source
+    youtube = is_youtube_url(source)
+
+    if youtube:
+        gemini_source = source
+        mode_label = "native YouTube URL (no download)"
+    elif is_url(source):
+        print("[watch] downloading via yt-dlp before Gemini upload…", file=sys.stderr)
+        dl = download(source, work / "download")
+        gemini_source = dl["video_path"]
+        mode_label = "yt-dlp download → Gemini Files API upload"
+    else:
+        gemini_source = source
+        mode_label = "local file → Gemini Files API upload"
+
+    response_text = generate_with_video(
+        source=gemini_source,
+        question=question,
+        model_name=args.gemini_model,
+        is_youtube=youtube,
+    )
+
+    print()
+    print("# watch: video report (Gemini backend)")
+    print()
+    print(f"- **Source:** {source}")
+    print(f"- **Backend:** Gemini ({args.gemini_model})")
+    print(f"- **Mode:** {mode_label}")
+    print(f"- **Question:** {question}")
+    print()
+    print("## Gemini response")
+    print()
+    print(response_text)
+    print()
+    print("---")
+    print(f"_Work dir: `{work}` — delete when done._")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="watch",
         description="Download a video, extract auto-scaled frames, and surface the transcript.",
     )
     ap.add_argument("source", help="Video URL or local file path")
+    ap.add_argument(
+        "question",
+        nargs="*",
+        default=[],
+        help="Optional trailing question. Required for --backend gemini "
+        "(passed to the model as the prompt). Ignored for --backend claude — "
+        "Claude handles the question via its own conversation context.",
+    )
+    ap.add_argument(
+        "--backend",
+        choices=["claude", "gemini"],
+        default="claude",
+        help="claude (default): extract frames + transcript locally so Claude can `Read` them. "
+        "gemini: skip frame extraction and Whisper, hand the whole video to Gemini's "
+        "native multimodal model and print its response.",
+    )
+    ap.add_argument(
+        "--gemini-model",
+        choices=list(GEMINI_MODELS),
+        default=GEMINI_DEFAULT_MODEL,
+        help=f"Gemini model for --backend gemini (default {GEMINI_DEFAULT_MODEL}). "
+        "Use gemini-1.5-pro for longer / more complex videos. Ignored for --backend claude.",
+    )
     ap.add_argument("--max-frames", type=int, default=80, help="Cap on frame count (default 80, hard max 100)")
     ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
     ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
@@ -136,6 +225,9 @@ def main() -> int:
         work = Path(tempfile.mkdtemp(prefix="watch-"))
     work.mkdir(parents=True, exist_ok=True)
     print(f"[watch] working dir: {work}", file=sys.stderr)
+
+    if args.backend == "gemini":
+        return _run_gemini_backend(args, work)
 
     print(
         "[watch] downloading via yt-dlp…" if is_url(args.source) else "[watch] using local file…",

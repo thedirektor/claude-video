@@ -50,10 +50,20 @@ ENV_TEMPLATE = """# /watch API configuration
 # Get an OpenAI key:  https://platform.openai.com/api-keys
 #
 # Leave both blank to disable Whisper — /watch will still work, but videos
-# without native captions will come back frames-only.
+# without native captions will come back frames-only. (You can also run
+# faster-whisper locally on a GPU with `--whisper local`; no API key needed.)
 
 GROQ_API_KEY=
 OPENAI_API_KEY=
+
+# Gemini native video backend — used only when /watch is invoked with
+# `--backend gemini`. Gemini ingests the whole video (or a YouTube URL)
+# directly and answers the user's question without local frame extraction.
+# Optional: leave blank if you only use the default Claude backend.
+#
+# Get a Gemini key:  https://aistudio.google.com/apikey
+
+GEMINI_API_KEY=
 """
 
 
@@ -310,13 +320,16 @@ def cmd_install() -> int:
         return 0
 
     print("")
-    print("[setup] one step left: add a Whisper API key.")
+    print("[setup] one step left: add a Whisper API key (or skip and use --whisper local / --backend gemini).")
     print("")
-    print(f"  Edit {CONFIG_FILE} and set either:")
+    print(f"  Edit {CONFIG_FILE} and set any of:")
     print("    GROQ_API_KEY=...    (preferred — cheaper, faster; get one at console.groq.com/keys)")
     print("    OPENAI_API_KEY=...  (fallback; get one at platform.openai.com/api-keys)")
+    print("    GEMINI_API_KEY=...  (optional — required only for --backend gemini; aistudio.google.com/apikey)")
     print("")
-    print("  Without a key, /watch still works but videos without captions come back frames-only.")
+    print("  Without any of these, /watch still works but:")
+    print("    - videos without captions come back frames-only (unless --whisper local + a GPU)")
+    print("    - --backend gemini won't run")
     return 3
 
 
