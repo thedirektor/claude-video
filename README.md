@@ -15,7 +15,7 @@ Codex / generic skills:
 git clone https://github.com/bradautomates/claude-video.git ~/.codex/skills/watch
 ```
 
-Zero config to start — `yt-dlp` and `ffmpeg` install on first run via `brew` on macOS (Linux/Windows print exact commands). Captions cover most public videos for free. Whisper API key is only needed when a video has no captions.
+Zero config to start — `yt-dlp` and `ffmpeg` install on first run via `brew` on macOS (Linux/Windows print exact commands). Captions cover most public videos for free. For caption-less videos, the script picks the best available Whisper backend automatically: a **local GPU via faster-whisper** if one is set up, then **Groq** (`whisper-large-v3`), then **OpenAI** (`whisper-1`).
 
 ---
 
@@ -48,7 +48,7 @@ Claude is great at reading and synthesizing — but until now, video was the one
 1. **You paste a video and a question.** URL (anything yt-dlp supports — YouTube, Loom, TikTok, X, Instagram, plus a few hundred more) or a local path (`.mp4`, `.mov`, `.mkv`, `.webm`).
 2. **`yt-dlp` downloads it.** For URLs, into a temp working directory. For local files, no download — just probed in place.
 3. **`ffmpeg` extracts frames at an auto-scaled rate.** The frame budget is duration-aware: ≤30s gets ~30 frames, 30-60s gets ~40, 1-3min gets ~60, 3-10min gets ~80, longer gets 100 sparsely. Hard ceilings: 2 fps, 100 frames. JPEGs at 512px wide by default — bump with `--resolution 1024` if Claude needs to read on-screen text.
-4. **The transcript comes from one of two places.** First try: `yt-dlp` pulls native captions (manual or auto-generated) from the source. Free, instant, accurate-ish. Fallback: extract a mono 16 kHz audio clip and ship it to Whisper — Groq's `whisper-large-v3` (preferred — cheaper and faster) or OpenAI's `whisper-1`.
+4. **The transcript comes from one of three places.** First try: `yt-dlp` pulls native captions (manual or auto-generated) from the source — free, instant, accurate-ish. Fallback: run Whisper. The script auto-selects the best available backend: **local GPU via faster-whisper** if installed (no API call, no upload, ~13× realtime on an RTX 2080 Ti), then **Groq** (`whisper-large-v3`), then **OpenAI** (`whisper-1`). Force a specific one with `--whisper local|groq|openai`. When transcription operates on a separate voiceover file (a muted product video plus an ElevenLabs `.mp3`, say), pass `--audio FILE` and the transcript is pulled from the VO instead of the video's own track.
 5. **Frames + transcript are handed to Claude.** The script prints frame paths with `t=MM:SS` markers and the transcript with timestamps. Claude `Read`s each frame in parallel — JPEGs render directly as images in its context.
 6. **Claude answers grounded in what's actually on screen and in the audio.** Not "based on the description" or "according to the title." It saw the frames. It heard the transcript. It answers the way someone who watched the video would.
 7. **Cleanup.** The script prints a working directory at the end. If you're not asking follow-ups, Claude removes it.
@@ -116,16 +116,19 @@ On the first `/watch` call, the skill runs `scripts/setup.py --check`. If `ffmpe
 
 After setup, preflight is silent and `/watch` just works. The check is a sub-100ms lookup, so it doesn't slow you down on subsequent runs.
 
-## Bring your own keys
+## Bring your own keys (or run Whisper locally)
 
 Captions cover the majority of public videos for free. The Whisper fallback only kicks in when a video genuinely has no caption track — typically local files, TikToks, some Vimeos, and the occasional caption-less YouTube upload.
 
 | Capability | What you need | Cost |
 |------------|---------------|------|
 | Download + native captions | `yt-dlp` + `ffmpeg` | Free |
-| Whisper fallback (preferred) | [Groq API key](https://console.groq.com/keys) — `whisper-large-v3` | Cheap, fast |
-| Whisper fallback (alt) | [OpenAI API key](https://platform.openai.com/api-keys) — `whisper-1` | Standard pricing |
+| Whisper, **local GPU** (preferred when available) | NVIDIA GPU + `pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12` | Free, no API call. ~13× realtime on RTX 2080 Ti with `large-v3` |
+| Whisper, **Groq API** | [Groq API key](https://console.groq.com/keys) — `whisper-large-v3` | Cheap, fast |
+| Whisper, **OpenAI API** | [OpenAI API key](https://platform.openai.com/api-keys) — `whisper-1` | Standard pricing |
 | Disable Whisper entirely | `--no-whisper` | Free, frames-only when no captions |
+
+The auto-selection priority is `local → groq → openai`. Force a specific backend with `--whisper local|groq|openai`. See [Local Whisper](#local-whisper-faster-whisper-on-gpu) for the GPU setup.
 
 ## Usage
 
@@ -143,14 +146,108 @@ Focused on a specific section — denser frame budget, lower token cost:
 /watch "$URL" --start 1:12:00            # from 1h12m to end
 ```
 
-Other knobs (passed to `scripts/watch.py`):
+Muted product video + separate ElevenLabs voiceover (the case this fork was extended for) — `--audio` retargets transcription to the VO file, two-pass sampling auto-enables, and frames concentrate on the moments the VO is actually narrating:
+```
+/watch "Product Video.mp4" --audio "ElevenLabs_VO.mp3"
+```
 
-- `--max-frames N` — lower the frame cap for a tighter token budget.
-- `--resolution W` — bump frame width to 1024 px when Claude needs to read on-screen text (slides, terminals, code).
-- `--fps F` — override the auto-fps calculation (still capped at 2 fps).
-- `--whisper groq|openai` — force a specific Whisper backend.
-- `--no-whisper` — disable transcription entirely; frames only.
-- `--out-dir DIR` — keep working files somewhere specific (default: auto-generated tmp dir).
+### Flags
+
+All flags are forwarded to `scripts/watch.py`. The full set:
+
+**Range / budget**
+
+| Flag | Purpose |
+|------|---------|
+| `--start T` / `--end T` | Focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. |
+| `--max-frames N` | Lower the frame cap for a tighter token budget (hard ceiling 100). |
+| `--resolution W` | Frame width in px (default 512; bump to 1024 for slides / terminals / on-screen text). |
+| `--fps F` | Override auto-fps (still capped at 2 fps). Disables scene detection and two-pass sampling. |
+| `--out-dir DIR` | Keep working files somewhere specific (default: auto-generated tmp dir). |
+
+**Frame sampling**
+
+| Flag | Purpose |
+|------|---------|
+| `--no-scene-detect` | Skip PySceneDetect; use fixed-fps extraction. Right call for talking-head video with no cuts. |
+| `--scene-threshold F` | ContentDetector threshold (default `27.0`). Lower = more cuts. |
+| `--two-pass` / `--no-two-pass` | Distribute the frame budget proportionally to speech windows from the transcript (70 % inside speech, 30 % outside). Default ON when a transcript is available. |
+
+**Audio / transcription**
+
+| Flag | Purpose |
+|------|---------|
+| `--audio FILE` | Separate audio file (mp3/wav/m4a) to transcribe instead of the video's own audio track. Use for muted videos with separate VO. Cannot combine with `--no-whisper`. |
+| `--whisper local\|groq\|openai` | Force a specific Whisper backend. Default: auto-pick `local`, then `groq`, then `openai`. |
+| `--whisper-model NAME` | Local-backend model size: `tiny\|base\|small\|medium\|large-v2\|large-v3` (default `large-v3`). Ignored for Groq / OpenAI. |
+| `--no-whisper` | Disable transcription entirely; frames only. |
+
+**OCR**
+
+| Flag | Purpose |
+|------|---------|
+| `--no-ocr` | Disable the OCR pass (Tesseract over each frame, lang=`spa+eng`, with adaptive 1024 px re-extraction of text-heavy frames). |
+
+## Local Whisper (faster-whisper on GPU)
+
+The `local` backend runs Whisper directly on an NVIDIA GPU via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and CTranslate2. No API call, no 25 MB upload limit, no rate limit. Tested at ~13× realtime on an RTX 2080 Ti with `large-v3`.
+
+**Prerequisites**
+
+- NVIDIA GPU with CUDA 12 support and ≥ enough VRAM for the chosen model (see table below)
+- Python 3.10+ (3.13 / 3.14 confirmed working)
+- `faster-whisper`, `nvidia-cublas-cu12`, `nvidia-cudnn-cu12` installed via pip
+
+**Install**
+
+```bash
+pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12
+```
+
+**Windows-only PATH fix.** The cuBLAS / cuDNN DLLs land inside `site-packages\nvidia\<lib>\bin`, but Windows doesn't search those directories by default — `import ctranslate2` will fail with a DLL-load error until you add them to PATH. PowerShell one-liner that finds the right Python prefix and prepends both directories to the user PATH:
+
+```powershell
+$prefix = (python -c "import sys; print(sys.prefix)")
+$cublas = "$prefix\Lib\site-packages\nvidia\cublas\bin"
+$cudnn  = "$prefix\Lib\site-packages\nvidia\cudnn\bin"
+[Environment]::SetEnvironmentVariable("PATH", "$cublas;$cudnn;" + [Environment]::GetEnvironmentVariable("PATH","User"), "User")
+# Restart the terminal afterwards so the new PATH is picked up.
+```
+
+Linux / macOS-with-NVIDIA users typically don't need this — pip's RPATH metadata handles DLL discovery on those platforms.
+
+**Verify**
+
+```bash
+python -c "import ctranslate2; print('CUDA devices:', ctranslate2.get_cuda_device_count())"
+```
+
+A successful install prints `CUDA devices: 1` (or higher). Anything else — `0`, an `OSError`, an `ImportError` — means the runtime can't reach a GPU and `--whisper local` will fall through to the API backends in auto mode (or hard-error if you forced `--whisper local`).
+
+**First-run model download.** On first use of `--whisper local`, the chosen faster-whisper model is downloaded into `~/.cache/huggingface/hub`. `large-v3` is ~3 GB; subsequent runs reuse the cached weights instantly.
+
+**Model picker — `--whisper-model`**
+
+| Model | Parameters | VRAM (fp16) | Relative speed | When to use |
+|-------|-----------:|-------------|----------------|-------------|
+| `tiny` | 39 M | ~1 GB | ~32× | Toy / smoke tests; clean speech only |
+| `base` | 74 M | ~1 GB | ~16× | Lightweight, low-VRAM GPUs |
+| `small` | 244 M | ~2 GB | ~6× | Decent quality, fits 4 GB cards |
+| `medium` | 769 M | ~5 GB | ~2× | Solid quality, fits 8 GB cards |
+| `large-v2` | 1550 M | ~10 GB | 1× | High quality, older v2 dataset |
+| `large-v3` | 1550 M | ~10 GB | 1× | **Default.** Best quality; needs ≥ 10 GB VRAM |
+
+Speed numbers are approximate ratios — actual realtime multiplier depends heavily on the GPU. Drop a tier if you hit OOM, or if `large-v3` is overkill for the content (a clean voiceover transcribes fine with `medium`).
+
+## Windows compatibility
+
+This fork has been tested on **Windows 11 + Python 3.14**. Notes:
+
+- **UTF-8 encoding fix is already applied to all scripts.** Each Python file in `scripts/` reconfigures `sys.stdout` / `sys.stderr` to UTF-8 at startup, so non-ASCII content (Spanish transcripts, em-dashes, accented filenames) doesn't crash with `UnicodeEncodeError` on the default cp1252 console.
+- **Use `python` not `python3`.** On Windows the `python3` command typically resolves to the Microsoft Store stub. The skill docs use `python3` for Unix conventions but on Windows substitute `python`.
+- **Tesseract for OCR** must be installed separately. Default install path is `C:\Program Files\Tesseract-OCR`; make sure that directory is on `PATH` so `pytesseract` can find `tesseract.exe`. Install via `winget install UB-Mannheim.TesseractOCR` or grab the [installer](https://github.com/UB-Mannheim/tesseract/wiki). For Spanish OCR you also need the `spa.traineddata` language pack — bundled by default in the Mannheim installer.
+- **Local Whisper PATH fix.** See the PowerShell snippet under [Local Whisper](#local-whisper-faster-whisper-on-gpu); without it `import ctranslate2` fails to load cuBLAS / cuDNN even when the wheels are installed.
+- **Long paths.** Some yt-dlp downloads produce long filenames; if you hit "filename too long" errors, enable Win32 long paths via Group Policy or pass `--out-dir` to a short path like `D:\w`.
 
 ## Limits
 
@@ -168,8 +265,12 @@ Other knobs (passed to `scripts/watch.py`):
 │   ├── watch.py             # entry point — orchestrates download → frames → transcript
 │   ├── download.py          # yt-dlp wrapper
 │   ├── frames.py            # ffmpeg frame extraction + auto-fps logic
-│   ├── transcribe.py        # VTT parsing + dedupe + Whisper orchestration
-│   ├── whisper.py           # Groq / OpenAI clients (pure stdlib)
+│   ├── scenes.py            # PySceneDetect wrapper + scene-midpoint picker
+│   ├── speech.py            # speech-window detection + two-pass sampling
+│   ├── ocr.py               # Tesseract OCR over frames (lang=spa+eng) + adaptive upscale
+│   ├── transcribe.py        # VTT caption parsing + dedupe
+│   ├── whisper.py           # Groq / OpenAI HTTP clients + backend resolver
+│   ├── whisper_local.py     # faster-whisper / GPU client (no network)
 │   ├── setup.py             # preflight + installer
 │   └── build-skill.sh       # build dist/watch.skill for claude.ai upload
 ├── hooks/                   # SessionStart status hook (Claude Code only)
@@ -193,7 +294,7 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 MIT license.
 
-Built on `yt-dlp`, `ffmpeg`, and Claude's multimodal `Read` tool. Whisper transcription via [Groq](https://groq.com) or [OpenAI](https://openai.com).
+Built on `yt-dlp`, `ffmpeg`, `pytesseract`, `PySceneDetect`, and Claude's multimodal `Read` tool. Whisper transcription via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (local GPU), [Groq](https://groq.com), or [OpenAI](https://openai.com).
 
 ---
 
