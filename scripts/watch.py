@@ -38,6 +38,12 @@ from frames import (  # noqa: E402
 )
 from ocr import is_significant, run_ocr  # noqa: E402
 from scenes import DEFAULT_THRESHOLD, detect_scenes, pick_midpoints  # noqa: E402
+from speech import (  # noqa: E402
+    DEFAULT_SPEECH_SHARE,
+    compute_speech_windows,
+    format_windows,
+    two_pass_sample,
+)
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -57,6 +63,13 @@ def main() -> int:
     ap.add_argument("--start", type=str, default=None, help="Range start (SS, MM:SS, or HH:MM:SS)")
     ap.add_argument("--end", type=str, default=None, help="Range end (SS, MM:SS, or HH:MM:SS)")
     ap.add_argument("--out-dir", type=str, default=None, help="Working directory (default: tmp)")
+    ap.add_argument(
+        "--audio",
+        type=str,
+        default=None,
+        help="Separate audio file (mp3/wav/m4a) to transcribe instead of the video's audio track. "
+        "Useful when the video is muted and the VO ships as a separate file.",
+    )
     ap.add_argument(
         "--no-whisper",
         action="store_true",
@@ -79,6 +92,13 @@ def main() -> int:
         help=f"ContentDetector threshold (default {DEFAULT_THRESHOLD}). Lower = more cuts.",
     )
     ap.add_argument(
+        "--two-pass",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Distribute frame budget proportionally to speech windows from the transcript "
+        "(70%% inside speech, 30%% outside). Default ON when a transcript is available.",
+    )
+    ap.add_argument(
         "--whisper",
         choices=["groq", "openai"],
         default=None,
@@ -87,6 +107,17 @@ def main() -> int:
     args = ap.parse_args()
 
     max_frames = min(args.max_frames, 100)
+
+    if args.audio and args.no_whisper:
+        raise SystemExit(
+            "--audio implies Whisper transcription of that file; cannot combine with --no-whisper. "
+            "Drop one of the two flags."
+        )
+    audio_override: Path | None = None
+    if args.audio:
+        audio_override = Path(args.audio).expanduser().resolve()
+        if not audio_override.exists():
+            raise SystemExit(f"--audio file not found: {audio_override}")
 
     if args.out_dir:
         work = Path(args.out_dir).expanduser().resolve()
@@ -133,10 +164,81 @@ def main() -> int:
         if focused else f"full {effective_duration:.1f}s"
     )
 
-    # Sampling decision: scene-detect by default, fps if forced or fps overridden.
+    # ──────────────────────────────────────────────────────────────────
+    # Transcript first: speech windows drive two-pass sampling, so we
+    # need timing info before we pick frame timestamps.
+    # ──────────────────────────────────────────────────────────────────
+    transcript_segments: list[dict] = []
+    transcript_text: str | None = None
+    transcript_source: str | None = None
+
+    if audio_override is None and dl.get("subtitle_path"):
+        try:
+            all_segments = parse_vtt(dl["subtitle_path"])
+            transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+            transcript_text = format_transcript(transcript_segments)
+            transcript_source = "captions"
+        except Exception as exc:
+            print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
+
+    if not transcript_segments and not args.no_whisper:
+        backend, api_key = load_api_key(args.whisper)
+        if backend and api_key:
+            whisper_input = str(audio_override) if audio_override else video_path
+            audio_out = work / ("audio_override.mp3" if audio_override else "audio.mp3")
+            try:
+                if audio_override:
+                    print(
+                        f"[watch] transcribing separate audio file via {backend}: "
+                        f"{audio_override.name}",
+                        file=sys.stderr,
+                    )
+                all_segments, used_backend = transcribe_video(
+                    whisper_input,
+                    audio_out,
+                    backend=backend,
+                    api_key=api_key,
+                )
+                transcript_segments = (
+                    filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+                )
+                transcript_text = format_transcript(transcript_segments)
+                transcript_source = (
+                    f"whisper ({used_backend}, --audio)"
+                    if audio_override
+                    else f"whisper ({used_backend})"
+                )
+            except SystemExit as exc:
+                print(f"[watch] whisper transcription failed: {exc}", file=sys.stderr)
+        else:
+            hint = (
+                f"--whisper {args.whisper} was set but the matching API key is missing"
+                if args.whisper else
+                "no subtitles and no Whisper API key found"
+            )
+            setup_py = SCRIPT_DIR / "setup.py"
+            print(
+                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
+                file=sys.stderr,
+            )
+
+    # Speech windows are clipped to the focus range so two-pass distribution
+    # respects --start/--end.
+    speech_windows = compute_speech_windows(
+        transcript_segments,
+        range_start=effective_start,
+        range_end=effective_end,
+    )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Sampling decision: two-pass > scene-detect > fps.
+    # ──────────────────────────────────────────────────────────────────
     use_scenes = not args.no_scene_detect and args.fps is None
+    scenes: list[tuple[float, float]] = []
     scene_count: int | None = None
     sampling_mode = "fps"
+    speech_frame_count = 0
+    non_speech_frame_count = 0
     frames: list[dict] = []
 
     if use_scenes:
@@ -151,11 +253,29 @@ def main() -> int:
             end_seconds=end_sec,
         )
         scene_count = len(scenes)
-        if scenes:
-            timestamps = pick_midpoints(scenes, max_frames=max_frames)
+
+    two_pass_active = (
+        args.two_pass
+        and bool(speech_windows)
+        and args.fps is None
+    )
+
+    if two_pass_active:
+        plan = two_pass_sample(
+            range_start=effective_start,
+            range_end=effective_end,
+            speech_windows=speech_windows,
+            scenes=scenes,
+            max_frames=max_frames,
+            speech_share=DEFAULT_SPEECH_SHARE,
+        )
+        timestamps = plan["timestamps"]
+        speech_frame_count = plan["speech_count"]
+        non_speech_frame_count = plan["non_speech_count"]
+        if timestamps:
             print(
-                f"[watch] {scene_count} scenes detected; extracting "
-                f"{len(timestamps)} mid-scene frames…",
+                f"[watch] two-pass sampling: {speech_frame_count} frames in speech "
+                f"windows, {non_speech_frame_count} outside (max {max_frames})…",
                 file=sys.stderr,
             )
             frames = extract_at_timestamps(
@@ -164,14 +284,29 @@ def main() -> int:
                 timestamps=timestamps,
                 resolution=args.resolution,
             )
-            sampling_mode = "scenes"
-        else:
+            sampling_mode = "two-pass"
+
+    if not frames and use_scenes and scenes:
+        timestamps = pick_midpoints(scenes, max_frames=max_frames)
+        print(
+            f"[watch] {scene_count} scenes detected; extracting "
+            f"{len(timestamps)} mid-scene frames…",
+            file=sys.stderr,
+        )
+        frames = extract_at_timestamps(
+            video_path,
+            work / "frames",
+            timestamps=timestamps,
+            resolution=args.resolution,
+        )
+        sampling_mode = "scenes"
+
+    if not frames:
+        if use_scenes and scene_count == 0 and not two_pass_active:
             print(
                 "[watch] no scene cuts detected — falling back to fixed-fps extraction.",
                 file=sys.stderr,
             )
-
-    if not frames:
         print(f"[watch] extracting ~{target} frames at {fps:.3f} fps over {scope}…", file=sys.stderr)
         frames = extract(
             video_path,
@@ -184,6 +319,9 @@ def main() -> int:
         )
         sampling_mode = "fps"
 
+    # ──────────────────────────────────────────────────────────────────
+    # OCR + adaptive 1024px upscale on text-heavy frames (unchanged).
+    # ──────────────────────────────────────────────────────────────────
     ocr_text: dict[str, str] = {}
     hires_count = 0
     if not args.no_ocr and frames:
@@ -212,51 +350,14 @@ def main() -> int:
             )
             print(f"[watch] OCR results saved to {ocr_json_path}", file=sys.stderr)
 
-    transcript_segments: list[dict] = []
-    transcript_text: str | None = None
-    transcript_source: str | None = None
-    if dl.get("subtitle_path"):
-        try:
-            all_segments = parse_vtt(dl["subtitle_path"])
-            transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-            transcript_text = format_transcript(transcript_segments)
-            transcript_source = "captions"
-        except Exception as exc:
-            print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
-
-    if not transcript_segments and not args.no_whisper:
-        backend, api_key = load_api_key(args.whisper)
-        if backend and api_key:
-            try:
-                all_segments, used_backend = transcribe_video(
-                    video_path,
-                    work / "audio.mp3",
-                    backend=backend,
-                    api_key=api_key,
-                )
-                transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-                transcript_text = format_transcript(transcript_segments)
-                transcript_source = f"whisper ({used_backend})"
-            except SystemExit as exc:
-                print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
-        else:
-            hint = (
-                f"--whisper {args.whisper} was set but the matching API key is missing"
-                if args.whisper else
-                "no subtitles and no Whisper API key found"
-            )
-            setup_py = SCRIPT_DIR / "setup.py"
-            print(
-                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
-                file=sys.stderr,
-            )
-
     info = dl.get("info") or {}
 
     print()
     print("# watch: video report")
     print()
     print(f"- **Source:** {args.source}")
+    if audio_override is not None:
+        print(f"- **Audio source:** `{audio_override}` (separate file via `--audio`)")
     if info.get("title"):
         print(f"- **Title:** {info['title']}")
     if info.get("uploader"):
@@ -269,22 +370,36 @@ def main() -> int:
         )
     if meta.get("width") and meta.get("height"):
         print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
+
     mode = "focused" if focused else "full"
-    if sampling_mode == "scenes" and scene_count is not None:
+    if sampling_mode == "two-pass":
+        scene_note = ""
+        if scene_count and scene_count > 0:
+            scene_note = f", {scene_count} scenes informing pick"
+        print(
+            f"- **Frames:** {len(frames)} extracted via two-pass "
+            f"({speech_frame_count} in speech windows, {non_speech_frame_count} outside; "
+            f"speech share {int(DEFAULT_SPEECH_SHARE * 100)}%{scene_note}, "
+            f"max {max_frames}, {mode} mode)"
+        )
+    elif sampling_mode == "scenes" and scene_count is not None:
+        suffix = ""
+        if args.two_pass and not speech_windows and not args.no_whisper:
+            suffix = " — two-pass requested but no transcript with timing was available"
         print(
             f"- **Frames:** {scene_count} scenes detected, "
             f"{len(frames)} extracted at scene midpoints "
-            f"(max {max_frames}, threshold {args.scene_threshold}, {mode} mode)"
+            f"(max {max_frames}, threshold {args.scene_threshold}, {mode} mode){suffix}"
         )
     else:
         suffix = ""
-        if not args.no_scene_detect and args.fps is None:
-            # Scene-detect tried but fell back.
+        if not args.no_scene_detect and args.fps is None and scene_count == 0:
             suffix = " — scene-detect found no cuts, fell back to fps"
         print(
             f"- **Frames:** {len(frames)} @ {fps:.3f} fps, {mode} mode "
             f"(budget {target}, max {max_frames}){suffix}"
         )
+
     if hires_count:
         print(
             f"- **Frame size:** {args.resolution}px wide "
@@ -305,6 +420,13 @@ def main() -> int:
             f"- **Transcript:** {len(transcript_segments)} segments{in_range} "
             f"(via {transcript_source or 'captions'})"
         )
+        if speech_windows:
+            speech_total = sum(e - s for s, e in speech_windows)
+            denom = effective_duration if focused else full_duration
+            print(
+                f"- **Speech windows:** "
+                f"{format_windows(speech_windows, speech_total=speech_total, full_duration=denom)}"
+            )
     else:
         print("- **Transcript:** none available")
 
@@ -335,12 +457,15 @@ def main() -> int:
             f"{HIRES_WIDTH}px so the text is legible when you Read them."
         )
     print()
+    speech_set = [(s, e) for s, e in speech_windows]
     for frame in frames:
         ts = format_time(frame["timestamp_seconds"])
         line = f"- `{frame['path']}` (t={ts})"
+        if sampling_mode == "two-pass" and speech_set:
+            in_speech = any(s <= frame["timestamp_seconds"] <= e for s, e in speech_set)
+            line += " [speech]" if in_speech else " [silent]"
         text = ocr_text.get(frame["path"], "").strip() if ocr_text else ""
         if text:
-            # Collapse whitespace so multi-line OCR fits on one bullet.
             collapsed = " ".join(text.split())
             line += f" — OCR: {collapsed}"
         print(line)
