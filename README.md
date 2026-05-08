@@ -204,7 +204,12 @@ The `local` backend runs Whisper directly on an NVIDIA GPU via [faster-whisper](
 pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
-**Windows-only PATH fix.** The cuBLAS / cuDNN DLLs land inside `site-packages\nvidia\<lib>\bin`, but Windows doesn't search those directories by default — `import ctranslate2` will fail with a DLL-load error until you add them to PATH. PowerShell one-liner that finds the right Python prefix and prepends both directories to the user PATH:
+**Windows DLL discovery (handled automatically).** `scripts/whisper_local.py` runs `os.add_dll_directory()` at import time on Windows to register `<sys.prefix>\Lib\site-packages\nvidia\cublas\bin` and `…\nvidia\cudnn\bin` with the loader, so `import ctranslate2` finds the cuBLAS / cuDNN wheels with no environment changes. **No manual PATH editing required** for the standard `pip install` layout.
+
+Linux / macOS-with-NVIDIA users don't hit this in the first place — pip's RPATH metadata handles DLL discovery on those platforms.
+
+<details>
+<summary>Manual PATH fallback (only if the auto-registration fails — non-standard install layout, conda site-packages outside <code>sys.prefix</code>, or importing <code>ctranslate2</code> from a tool that loads before <code>whisper_local</code>)</summary>
 
 ```powershell
 $prefix = (python -c "import sys; print(sys.prefix)")
@@ -213,8 +218,7 @@ $cudnn  = "$prefix\Lib\site-packages\nvidia\cudnn\bin"
 [Environment]::SetEnvironmentVariable("PATH", "$cublas;$cudnn;" + [Environment]::GetEnvironmentVariable("PATH","User"), "User")
 # Restart the terminal afterwards so the new PATH is picked up.
 ```
-
-Linux / macOS-with-NVIDIA users typically don't need this — pip's RPATH metadata handles DLL discovery on those platforms.
+</details>
 
 **Verify**
 
@@ -246,7 +250,7 @@ This fork has been tested on **Windows 11 + Python 3.14**. Notes:
 - **UTF-8 encoding fix is already applied to all scripts.** Each Python file in `scripts/` reconfigures `sys.stdout` / `sys.stderr` to UTF-8 at startup, so non-ASCII content (Spanish transcripts, em-dashes, accented filenames) doesn't crash with `UnicodeEncodeError` on the default cp1252 console.
 - **Use `python` not `python3`.** On Windows the `python3` command typically resolves to the Microsoft Store stub. The skill docs use `python3` for Unix conventions but on Windows substitute `python`.
 - **Tesseract for OCR** must be installed separately. Default install path is `C:\Program Files\Tesseract-OCR`; make sure that directory is on `PATH` so `pytesseract` can find `tesseract.exe`. Install via `winget install UB-Mannheim.TesseractOCR` or grab the [installer](https://github.com/UB-Mannheim/tesseract/wiki). For Spanish OCR you also need the `spa.traineddata` language pack — bundled by default in the Mannheim installer.
-- **Local Whisper PATH fix.** See the PowerShell snippet under [Local Whisper](#local-whisper-faster-whisper-on-gpu); without it `import ctranslate2` fails to load cuBLAS / cuDNN even when the wheels are installed.
+- **Local Whisper DLL discovery is automatic.** `scripts/whisper_local.py` calls `os.add_dll_directory()` for the bundled cuBLAS / cuDNN wheels at import time, so `--whisper local` works out of the box after `pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12`. The manual PATH edit shown under [Local Whisper](#local-whisper-faster-whisper-on-gpu) is only needed as a fallback for non-standard install layouts.
 - **Long paths.** Some yt-dlp downloads produce long filenames; if you hit "filename too long" errors, enable Win32 long paths via Group Policy or pass `--out-dir` to a short path like `D:\w`.
 
 ## Limits
