@@ -1,7 +1,7 @@
 ---
 description: Watch a video (URL or local path). Downloads with yt-dlp, extracts frames with ffmpeg, transcribes from captions or Whisper, and answers questions about what's in the video.
 argument-hint: <video-url-or-path> [question]
-allowed-tools: [Bash, Read, AskUserQuestion]
+allowed-tools: Bash, Read, AskUserQuestion
 ---
 
 Invoke the `watch` skill (defined in SKILL.md) with the user's arguments: $ARGUMENTS
