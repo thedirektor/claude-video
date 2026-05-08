@@ -146,7 +146,9 @@ def main() -> int:
         choices=list(GEMINI_MODELS),
         default=GEMINI_DEFAULT_MODEL,
         help=f"Gemini model for --backend gemini (default {GEMINI_DEFAULT_MODEL}). "
-        "Use gemini-1.5-pro for longer / more complex videos. Ignored for --backend claude.",
+        "Use gemini-2.5-flash for harder reasoning over the visual content, or "
+        "gemini-2.5-pro for very long videos / extensive output. "
+        "Ignored for --backend claude.",
     )
     ap.add_argument("--max-frames", type=int, default=80, help="Cap on frame count (default 80, hard max 100)")
     ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")

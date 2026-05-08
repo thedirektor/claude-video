@@ -54,6 +54,35 @@ Within a single session, you can skip Step 0 on follow-up `/watch` calls — onc
 - User points at a local video file (`.mp4`, `.mov`, `.mkv`, `.webm`, etc.) and asks about it.
 - User types `/watch <url-or-path> [question]`.
 
+## Backends
+
+Two top-level backends, picked with `--backend`:
+
+- **`--backend claude`** *(default)* — the pipeline described in the rest of this document. Download → frame extraction → OCR → transcript → Claude `Read`s each frame and answers from its own context. Best for: any case where you want Claude to reason over the video, ask follow-ups in the same session, or compare with prior conversation.
+- **`--backend gemini`** — skip frame extraction, OCR, and Whisper entirely. Hand the whole video (or a YouTube URL) to Gemini's multimodal model and print its response. Best for: one-shot full-video analyses ("timestamp all on-screen text", "summarize this 30-minute keynote") where Gemini's native video understanding is what you want.
+
+Set `GEMINI_API_KEY` in `~/.config/watch/.env` (or the environment) and pass the question as the trailing positional argument:
+
+```bash
+# Local file: uploaded to Gemini Files API, polled until ACTIVE, then sent
+python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" video.mp4 --backend gemini "Describe this video"
+
+# YouTube URL: passed straight to Gemini, no yt-dlp download — fetched server-side
+python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "https://youtu.be/abc" --backend gemini "Summarize"
+```
+
+Non-YouTube URLs (Vimeo, TikTok, etc.) are downloaded with yt-dlp first and then uploaded to the Files API, since the model only natively fetches YouTube.
+
+### `--gemini-model` picker
+
+| Model | Notes | When to pick |
+|-------|-------|--------------|
+| `gemini-3.1-flash-lite` | **Default.** Stable May 7 2026. 1M-token input / 65k output, multimodal (text/image/video/audio/PDF). Free-tier quota available. | General default — fastest, cheapest, still video-capable. |
+| `gemini-2.5-flash` | Balanced. | When `3.1-flash-lite`'s quality isn't enough but `2.5-pro` is overkill — mid-length videos that need careful reasoning over the visuals. |
+| `gemini-2.5-pro` | Highest quality, longest context (~2M tokens). | Very long videos or deep reasoning with extensive output. |
+
+`gemini-2.0-flash` and `gemini-1.5-pro` are not in the picker — 1.5-pro returns 404 on the current `v1beta` API, and 2.0-flash has no free-tier quota on most accounts. Override with `--gemini-model` if you need to point at a specific model that's been added later.
+
 ## Recommended limits
 
 - **Best accuracy: videos under 10 minutes.** Frame coverage scales inversely with duration.
@@ -76,6 +105,11 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/watch.py" "<source>"
 ```
 
 Optional flags:
+
+**Backend**
+- `--backend claude|gemini` — pick the orchestrator. Default `claude` runs the local frame pipeline. `gemini` short-circuits everything below and hands the video to Gemini directly. See "Backends" above.
+- `--gemini-model NAME` — Gemini model when `--backend gemini`. Choices: `gemini-3.1-flash-lite | gemini-2.5-flash | gemini-2.5-pro`. Default `gemini-3.1-flash-lite`. Ignored for `--backend claude`.
+- *(positional)* `question` — required for `--backend gemini`. Pass it as a trailing positional after the source. Ignored for `--backend claude`, where Claude takes the question from the chat instead.
 
 **Range / budget**
 - `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, fps auto-scales denser (see "Focusing on a section" below).
@@ -261,6 +295,12 @@ This fork has been tested on **Windows 11 + Python 3.14** (and the Bash tool's P
 - **Whisper API request fails** → the error is printed to stderr (likely: invalid key, rate limit, or 25 MB upload limit on a very long video). The report will say "none available" for transcript. Retry options: `--whisper openai` if Groq failed (or vice versa), or `--whisper local` if a GPU is available.
 - **`--whisper local` requested but unavailable** → the script hard-errors with the install hint (`pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12`). Auto-mode falls through to Groq/OpenAI silently instead.
 - **OCR unavailable** → `pytesseract` or the `tesseract` binary missing. Report shows `OCR: unavailable (...)`. Either install Tesseract (Windows: `C:\Program Files\Tesseract-OCR` plus the `spa` language pack) or pass `--no-ocr` to silence the warning.
+- **`--backend gemini` errors** →
+  - *Missing key:* `GEMINI_API_KEY` not set. Add it to `~/.config/watch/.env` or the environment; get a key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+  - *SDK missing:* `pip install google-genai` (the script prints the exact line).
+  - *429 RESOURCE_EXHAUSTED with `limit: 0`:* the chosen model has no free-tier quota on this account — retry with `--gemini-model gemini-3.1-flash-lite` (the default) or enable billing on the Google Cloud project.
+  - *404 NOT_FOUND on a model:* the model was retired server-side. Pass an explicit `--gemini-model` from the current picker.
+  - *Empty response:* check stderr for the `finish_reason` — usually safety blocking or a malformed prompt. Rephrase the question.
 
 ## Token efficiency
 
@@ -279,6 +319,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 - When `--whisper local` is selected (or auto-picked because a GPU is available), runs faster-whisper / CTranslate2 entirely on the user's machine — no network call, no upload
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set and the local backend isn't used
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and the local backend isn't used, or when `--whisper openai` is forced
+- When `--backend gemini` is used, uploads the entire video file to Google's Gemini Files API (`generativelanguage.googleapis.com`) and sends a `generateContent` request with the user's question. For YouTube URLs, the URL is passed to Gemini and Google fetches the video server-side instead of uploading it ourselves.
 - Runs Tesseract locally (via `pytesseract`) over the extracted frames for OCR text detection (no network call); disable with `--no-ocr`
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
 - Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
@@ -287,11 +328,12 @@ If you already watched a video this session and the user asks a follow-up, do **
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when an API Whisper backend is in use
 - Does not upload anything when `--whisper local` is the active backend — the audio stays on disk and is processed entirely on-device
+- Does not upload the *video* in `--backend claude` mode either — only the extracted audio (when an API Whisper backend is in use). The full video only leaves the machine when `--backend gemini` is explicitly selected
 - Does not access any platform account (no login, no session cookies, no posting)
-- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
+- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`, Gemini key only goes to `generativelanguage.googleapis.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory, `~/.config/watch/.env`, and the HuggingFace model cache (when local Whisper is used) — clean up the working directory when you're done (Step 5)
 
-**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction + auto-fps), `scripts/scenes.py` (PySceneDetect wrapper + midpoint picker), `scripts/speech.py` (speech-window detection + two-pass sampling), `scripts/ocr.py` (Tesseract OCR over frames), `scripts/transcribe.py` (VTT caption parsing), `scripts/whisper.py` (Groq / OpenAI clients + backend resolver), `scripts/whisper_local.py` (faster-whisper / GPU client), `scripts/setup.py` (preflight + installer)
+**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction + auto-fps), `scripts/scenes.py` (PySceneDetect wrapper + midpoint picker), `scripts/speech.py` (speech-window detection + two-pass sampling), `scripts/ocr.py` (Tesseract OCR over frames), `scripts/transcribe.py` (VTT caption parsing), `scripts/whisper.py` (Groq / OpenAI clients + backend resolver), `scripts/whisper_local.py` (faster-whisper / GPU client), `scripts/gemini.py` (Gemini multimodal video client — `--backend gemini`), `scripts/setup.py` (preflight + installer)
 
 Review scripts before first use to verify behavior.

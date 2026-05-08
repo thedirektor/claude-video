@@ -127,8 +127,9 @@ Captions cover the majority of public videos for free. The Whisper fallback only
 | Whisper, **Groq API** | [Groq API key](https://console.groq.com/keys) — `whisper-large-v3` | Cheap, fast |
 | Whisper, **OpenAI API** | [OpenAI API key](https://platform.openai.com/api-keys) — `whisper-1` | Standard pricing |
 | Disable Whisper entirely | `--no-whisper` | Free, frames-only when no captions |
+| Native Gemini video backend (`--backend gemini`) | [Gemini API key](https://aistudio.google.com/apikey) + `pip install google-genai` | Free tier on `gemini-3.1-flash-lite`; paid for `2.5-flash` / `2.5-pro` |
 
-The auto-selection priority is `local → groq → openai`. Force a specific backend with `--whisper local|groq|openai`. See [Local Whisper](#local-whisper-faster-whisper-on-gpu) for the GPU setup.
+The Whisper auto-selection priority is `local → groq → openai`. Force a specific Whisper backend with `--whisper local|groq|openai`. See [Local Whisper](#local-whisper-faster-whisper-on-gpu) for the GPU setup. The Gemini backend is independent — picked with `--backend gemini` and described in its own section below.
 
 ## Usage
 
@@ -154,6 +155,14 @@ Muted product video + separate ElevenLabs voiceover (the case this fork was exte
 ### Flags
 
 All flags are forwarded to `scripts/watch.py`. The full set:
+
+**Backend**
+
+| Flag | Purpose |
+|------|---------|
+| `--backend claude\|gemini` | Pick the orchestrator. `claude` (default): local frame pipeline. `gemini`: short-circuit and send the video to Gemini's multimodal model. See [Native Gemini backend](#native-gemini-backend---backend-gemini). |
+| `--gemini-model NAME` | Gemini model when `--backend gemini`. Choices: `gemini-3.1-flash-lite \| gemini-2.5-flash \| gemini-2.5-pro`. Default `gemini-3.1-flash-lite`. |
+| *(positional)* `question` | Required for `--backend gemini` — the prompt to send to the model. Ignored for `--backend claude`. |
 
 **Range / budget**
 
@@ -243,6 +252,40 @@ A successful install prints `CUDA devices: 1` (or higher). Anything else — `0`
 
 Speed numbers are approximate ratios — actual realtime multiplier depends heavily on the GPU. Drop a tier if you hit OOM, or if `large-v3` is overkill for the content (a clean voiceover transcribes fine with `medium`).
 
+## Native Gemini backend (`--backend gemini`)
+
+The default `claude` backend extracts frames + transcript locally so Claude can `Read` each frame in its own context. The `gemini` backend is the alternative: skip frame extraction entirely, hand the *whole* video (or a YouTube URL) to Gemini's multimodal model, and print Gemini's response directly. Best for one-shot full-video analyses where you want Gemini's native video understanding rather than Claude's frame-by-frame interpretation.
+
+**Setup:** add `GEMINI_API_KEY` to `~/.config/watch/.env` (get a key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)) and install the SDK:
+
+```bash
+pip install google-genai
+```
+
+**Usage** — pass the question as the trailing positional argument:
+
+```bash
+# Local file: uploaded to Gemini Files API, polled until ACTIVE, then sent
+python scripts/watch.py video.mp4 --backend gemini "Describe this video and timestamp on-screen text"
+
+# YouTube URL: passed straight to Gemini, no yt-dlp download — fetched server-side
+python scripts/watch.py "https://youtu.be/dQw4w9WgXcQ" --backend gemini "What happens here?"
+```
+
+Non-YouTube URLs (Vimeo, TikTok, etc.) are downloaded with yt-dlp first and uploaded via the Files API, since Gemini only ingests YouTube URLs natively.
+
+### Model picker (`--gemini-model`)
+
+| Model | Notes | When to pick |
+|-------|-------|--------------|
+| `gemini-3.1-flash-lite` | **Default.** Stable May 7 2026. 1M-token input / 65k output, multimodal (text/image/video/audio/PDF). Free-tier quota available. | General default — fastest, cheapest, still video-capable. |
+| `gemini-2.5-flash` | Balanced. | When `3.1-flash-lite`'s quality isn't enough but `2.5-pro` is overkill — mid-length videos that need careful reasoning over the visuals. |
+| `gemini-2.5-pro` | Highest quality, longest context (~2M tokens). | Very long videos or deep reasoning with extensive output. |
+
+`gemini-2.0-flash` and `gemini-1.5-pro` are not in the picker — `1.5-pro` returns 404 on the current `v1beta` API, and `2.0-flash` has zero free-tier quota on most accounts.
+
+**Output:** the script prints a report header with `Backend / Mode / Question`, then Gemini's full response. The frame-extraction / OCR / Whisper pipeline does not run.
+
 ## Windows compatibility
 
 This fork has been tested on **Windows 11 + Python 3.14**. Notes:
@@ -275,6 +318,7 @@ This fork has been tested on **Windows 11 + Python 3.14**. Notes:
 │   ├── transcribe.py        # VTT caption parsing + dedupe
 │   ├── whisper.py           # Groq / OpenAI HTTP clients + backend resolver
 │   ├── whisper_local.py     # faster-whisper / GPU client (no network)
+│   ├── gemini.py            # Gemini multimodal video client (--backend gemini)
 │   ├── setup.py             # preflight + installer
 │   └── build-skill.sh       # build dist/watch.skill for claude.ai upload
 ├── hooks/                   # SessionStart status hook (Claude Code only)
@@ -298,7 +342,7 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 MIT license.
 
-Built on `yt-dlp`, `ffmpeg`, `pytesseract`, `PySceneDetect`, and Claude's multimodal `Read` tool. Whisper transcription via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (local GPU), [Groq](https://groq.com), or [OpenAI](https://openai.com).
+Built on `yt-dlp`, `ffmpeg`, `pytesseract`, `PySceneDetect`, and Claude's multimodal `Read` tool. Whisper transcription via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (local GPU), [Groq](https://groq.com), or [OpenAI](https://openai.com). Native video understanding via [Gemini](https://ai.google.dev) when `--backend gemini` is selected.
 
 ---
 

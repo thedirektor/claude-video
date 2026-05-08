@@ -32,13 +32,30 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 
-DEFAULT_MODEL = "gemini-2.0-flash"
-# Note: gemini-1.5-pro was deprecated on the v1beta Generative Language API
-# (404 NOT_FOUND as of 2026). The 2.5 lineup is the current production tier;
-# 2.0-flash is kept as the documented default but may require a paid plan on
-# some accounts (free-tier quota varies). Override with --gemini-model.
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
+# Three production tiers, picked at the time of writing for the
+# generativelanguage.googleapis.com v1beta API. Override with --gemini-model.
+#
+#   gemini-3.1-flash-lite (default)
+#       Stable May 7 2026. Newest and cheapest of the lineup; works on the
+#       free tier where 2.0-flash often returns 429 limit:0. ~1M input /
+#       ~65k output tokens, multimodal (text/image/video/audio/PDF).
+#       Optimized for low-latency, high-frequency calls. Good general default.
+#
+#   gemini-2.5-flash
+#       Balanced. Pick this when 3.1-flash-lite's quality isn't enough but
+#       2.5-pro's cost / latency is overkill — e.g. mid-length videos that
+#       need careful reasoning over the visual content.
+#
+#   gemini-2.5-pro
+#       Highest quality, longest context (~2M tokens). Pick this for very
+#       long videos or videos that need deep reasoning + extensive output.
+#
+# gemini-2.0-flash was dropped from this list: it's strictly older than the
+# 2.5 / 3.1 tiers and the free-tier quota is gone on most accounts.
+# gemini-1.5-pro was dropped earlier — the v1beta API now returns 404 for it.
 VALID_MODELS = (
-    "gemini-2.0-flash",
+    "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
 )
