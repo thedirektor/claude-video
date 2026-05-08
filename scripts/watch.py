@@ -7,6 +7,7 @@ then Reads each frame path to see the video.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -24,9 +25,24 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from download import download, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract, format_time, get_metadata, parse_time  # noqa: E402
+from frames import (  # noqa: E402
+    MAX_FPS,
+    auto_fps,
+    auto_fps_focus,
+    extract,
+    extract_at_timestamps,
+    format_time,
+    get_metadata,
+    parse_time,
+    reextract_frame,
+)
+from ocr import is_significant, run_ocr  # noqa: E402
+from scenes import DEFAULT_THRESHOLD, detect_scenes, pick_midpoints  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
+
+
+HIRES_WIDTH = 1024
 
 
 def main() -> int:
@@ -45,6 +61,22 @@ def main() -> int:
         "--no-whisper",
         action="store_true",
         help="Disable Whisper fallback. Report frames-only if no captions available.",
+    )
+    ap.add_argument(
+        "--no-ocr",
+        action="store_true",
+        help="Disable OCR pass. Skips text detection on frames and the high-res re-extract.",
+    )
+    ap.add_argument(
+        "--no-scene-detect",
+        action="store_true",
+        help="Skip PySceneDetect and use fixed-fps extraction (the pre-scene-detect behavior).",
+    )
+    ap.add_argument(
+        "--scene-threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help=f"ContentDetector threshold (default {DEFAULT_THRESHOLD}). Lower = more cuts.",
     )
     ap.add_argument(
         "--whisper",
@@ -100,17 +132,85 @@ def main() -> int:
         f"{format_time(effective_start)}-{format_time(effective_end)} ({effective_duration:.1f}s)"
         if focused else f"full {effective_duration:.1f}s"
     )
-    print(f"[watch] extracting ~{target} frames at {fps:.3f} fps over {scope}…", file=sys.stderr)
 
-    frames = extract(
-        video_path,
-        work / "frames",
-        fps=fps,
-        resolution=args.resolution,
-        max_frames=max_frames,
-        start_seconds=start_sec,
-        end_seconds=end_sec,
-    )
+    # Sampling decision: scene-detect by default, fps if forced or fps overridden.
+    use_scenes = not args.no_scene_detect and args.fps is None
+    scene_count: int | None = None
+    sampling_mode = "fps"
+    frames: list[dict] = []
+
+    if use_scenes:
+        print(
+            f"[watch] detecting scenes (threshold={args.scene_threshold}) over {scope}…",
+            file=sys.stderr,
+        )
+        scenes = detect_scenes(
+            video_path,
+            threshold=args.scene_threshold,
+            start_seconds=start_sec,
+            end_seconds=end_sec,
+        )
+        scene_count = len(scenes)
+        if scenes:
+            timestamps = pick_midpoints(scenes, max_frames=max_frames)
+            print(
+                f"[watch] {scene_count} scenes detected; extracting "
+                f"{len(timestamps)} mid-scene frames…",
+                file=sys.stderr,
+            )
+            frames = extract_at_timestamps(
+                video_path,
+                work / "frames",
+                timestamps=timestamps,
+                resolution=args.resolution,
+            )
+            sampling_mode = "scenes"
+        else:
+            print(
+                "[watch] no scene cuts detected — falling back to fixed-fps extraction.",
+                file=sys.stderr,
+            )
+
+    if not frames:
+        print(f"[watch] extracting ~{target} frames at {fps:.3f} fps over {scope}…", file=sys.stderr)
+        frames = extract(
+            video_path,
+            work / "frames",
+            fps=fps,
+            resolution=args.resolution,
+            max_frames=max_frames,
+            start_seconds=start_sec,
+            end_seconds=end_sec,
+        )
+        sampling_mode = "fps"
+
+    ocr_text: dict[str, str] = {}
+    hires_count = 0
+    if not args.no_ocr and frames:
+        print(f"[watch] running OCR on {len(frames)} frames (lang=spa+eng)…", file=sys.stderr)
+        ocr_text = run_ocr([f["path"] for f in frames])
+        if ocr_text:
+            hires_targets = [f for f in frames if is_significant(ocr_text.get(f["path"], ""))]
+            if hires_targets and args.resolution < HIRES_WIDTH:
+                print(
+                    f"[watch] re-extracting {len(hires_targets)} text-heavy frames "
+                    f"at {HIRES_WIDTH}px…",
+                    file=sys.stderr,
+                )
+                for f in hires_targets:
+                    if reextract_frame(
+                        video_path,
+                        Path(f["path"]),
+                        f["timestamp_seconds"],
+                        resolution=HIRES_WIDTH,
+                    ):
+                        hires_count += 1
+            ocr_json_path = work / "ocr.json"
+            ocr_json_path.write_text(
+                json.dumps(ocr_text, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"[watch] OCR results saved to {ocr_json_path}", file=sys.stderr)
 
     transcript_segments: list[dict] = []
     transcript_text: str | None = None
@@ -170,8 +270,35 @@ def main() -> int:
     if meta.get("width") and meta.get("height"):
         print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
     mode = "focused" if focused else "full"
-    print(f"- **Frames:** {len(frames)} @ {fps:.3f} fps, {mode} mode (budget {target}, max {max_frames})")
-    print(f"- **Frame size:** {args.resolution}px wide")
+    if sampling_mode == "scenes" and scene_count is not None:
+        print(
+            f"- **Frames:** {scene_count} scenes detected, "
+            f"{len(frames)} extracted at scene midpoints "
+            f"(max {max_frames}, threshold {args.scene_threshold}, {mode} mode)"
+        )
+    else:
+        suffix = ""
+        if not args.no_scene_detect and args.fps is None:
+            # Scene-detect tried but fell back.
+            suffix = " — scene-detect found no cuts, fell back to fps"
+        print(
+            f"- **Frames:** {len(frames)} @ {fps:.3f} fps, {mode} mode "
+            f"(budget {target}, max {max_frames}){suffix}"
+        )
+    if hires_count:
+        print(
+            f"- **Frame size:** {args.resolution}px wide "
+            f"({hires_count} text-heavy frames upscaled to {HIRES_WIDTH}px)"
+        )
+    else:
+        print(f"- **Frame size:** {args.resolution}px wide")
+    if args.no_ocr:
+        print("- **OCR:** disabled (`--no-ocr`)")
+    elif ocr_text:
+        text_frames = sum(1 for v in ocr_text.values() if v.strip())
+        print(f"- **OCR:** {text_frames}/{len(frames)} frames had detected text (lang=spa+eng)")
+    else:
+        print("- **OCR:** unavailable (pytesseract or tesseract binary missing — see stderr)")
     if transcript_segments:
         in_range = " in range" if focused else ""
         print(
@@ -199,9 +326,24 @@ def main() -> int:
         "**Read each frame path below with the Read tool to view the image.** "
         "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video."
     )
+    if ocr_text:
+        print()
+        print(
+            "Each frame line includes any text detected by OCR (Spanish + English). "
+            "Use it to correlate visuals with on-screen captions, slides, UI text, etc. "
+            "Frames where OCR found significant text were re-extracted at "
+            f"{HIRES_WIDTH}px so the text is legible when you Read them."
+        )
     print()
     for frame in frames:
-        print(f"- `{frame['path']}` (t={format_time(frame['timestamp_seconds'])})")
+        ts = format_time(frame["timestamp_seconds"])
+        line = f"- `{frame['path']}` (t={ts})"
+        text = ocr_text.get(frame["path"], "").strip() if ocr_text else ""
+        if text:
+            # Collapse whitespace so multi-line OCR fits on one bullet.
+            collapsed = " ".join(text.split())
+            line += f" — OCR: {collapsed}"
+        print(line)
 
     print()
     print("## Transcript")

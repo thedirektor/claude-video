@@ -193,6 +193,94 @@ def extract(
     ]
 
 
+def extract_at_timestamps(
+    video_path: str,
+    out_dir: Path,
+    timestamps: list[float],
+    resolution: int = 512,
+) -> list[dict]:
+    """Extract one JPG per timestamp. Used for scene-aware (mid-scene) sampling.
+
+    Filenames mirror the fps extractor (`frame_NNNN.jpg`) so OCR and the
+    high-res re-extract path don't care which sampler produced them.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for existing in out_dir.glob("frame_*.jpg"):
+        existing.unlink()
+
+    frames: list[dict] = []
+    for i, ts in enumerate(timestamps, start=1):
+        out_path = out_dir / f"frame_{i:04d}.jpg"
+        # -ss before -i = fast seek; for mid-scene single frames the keyframe
+        # snap is well within scene bounds, so we don't pay for accurate seek.
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-ss", f"{max(0.0, ts):.3f}",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-vf", f"scale={resolution}:-2",
+            "-q:v", "4",
+            str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not out_path.exists():
+            print(
+                f"[frames] failed at t={ts:.2f}s: {result.stderr.strip()}",
+                file=sys.stderr,
+            )
+            continue
+        frames.append({
+            "index": i - 1,
+            "timestamp_seconds": round(ts, 2),
+            "path": str(out_path),
+        })
+    return frames
+
+
+def reextract_frame(
+    video_path: str,
+    out_path: Path,
+    timestamp_seconds: float,
+    resolution: int,
+) -> bool:
+    """Re-extract a single frame at the given timestamp at a target width.
+
+    Used after OCR finds significant text on a 512px frame: re-pull that exact
+    moment at e.g. 1024px so Claude can actually read the on-screen text.
+    Overwrites `out_path` so the existing report's frame path stays valid.
+    """
+    if shutil.which("ffmpeg") is None:
+        return False
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-ss", f"{max(0.0, timestamp_seconds):.3f}",
+        "-i", video_path,
+        "-frames:v", "1",
+        "-vf", f"scale={resolution}:-2",
+        "-q:v", "3",
+        str(out_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(
+            f"[frames] re-extract failed at t={timestamp_seconds:.2f}s: "
+            f"{result.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(
