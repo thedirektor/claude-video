@@ -24,6 +24,14 @@ import uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+# Force UTF-8 on stdout/stderr so non-ASCII output (transcripts, accented
+# paths, em-dashes) doesn't crash on Windows where the default is cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3"

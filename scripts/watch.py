@@ -11,6 +11,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Force UTF-8 on stdout/stderr so non-ASCII output (transcripts, accented
+# paths, em-dashes) doesn't crash on Windows where the default is cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
