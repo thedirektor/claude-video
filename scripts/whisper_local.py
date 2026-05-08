@@ -13,6 +13,7 @@ will fail.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +24,41 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
         pass
+
+
+def _register_cuda_dlls_on_windows() -> None:
+    """Register pip-installed nvidia-cublas / nvidia-cudnn DLL directories.
+
+    Runs only on Windows. The cuBLAS / cuDNN wheels drop their DLLs under
+    `<sys.prefix>/Lib/site-packages/nvidia/<lib>/bin`, but Windows doesn't
+    search those directories by default — so `import ctranslate2` would fail
+    with a DLL-load error. We hand them to the loader explicitly via
+    os.add_dll_directory() so the GPU backend can initialize without the user
+    having to edit their PATH.
+
+    Silent in every failure case: non-Windows platforms, missing dirs (CPU-only
+    install), or os.add_dll_directory raising. The downstream is_available()
+    probe is the single place we surface "local backend isn't reachable".
+    """
+    if sys.platform != "win32":
+        return
+
+    site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+    for sub in ("cublas", "cudnn"):
+        bin_dir = site_packages / "nvidia" / sub / "bin"
+        if not bin_dir.is_dir():
+            continue
+        try:
+            os.add_dll_directory(str(bin_dir))
+        except (OSError, AttributeError):
+            # AttributeError on Python < 3.8 (we don't support that, but cheap
+            # to guard); OSError if Windows refuses to register the path. Either
+            # way, fall through — is_available() will catch the resulting CUDA
+            # init failure and the user can apply the manual PATH fallback.
+            pass
+
+
+_register_cuda_dlls_on_windows()
 
 
 VALID_MODELS = ("tiny", "base", "small", "medium", "large-v2", "large-v3")
