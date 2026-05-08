@@ -1,6 +1,6 @@
 ---
 name: watch
-description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, or OpenAI), and hands the result to Claude so it can answer questions about what's in the video.
+description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
 homepage: https://github.com/bradautomates/claude-video
@@ -125,12 +125,14 @@ Optional flags:
 
 **Audio / transcription**
 - `--audio FILE` — separate audio file (mp3/wav/m4a) to transcribe instead of the video's own audio track. Use when the video is muted and the voiceover ships as a separate ElevenLabs/recorded file. Cannot combine with `--no-whisper`.
-- `--whisper groq|openai|local` — force a specific Whisper backend.
+- `--whisper groq|openai|local|assemblyai` — force a specific Whisper backend.
   - `groq` — `whisper-large-v3` via Groq API. Cheap, fast, needs `GROQ_API_KEY`.
   - `openai` — `whisper-1` via OpenAI API. Needs `OPENAI_API_KEY`.
   - `local` — runs faster-whisper on the local GPU. No API key, no upload, no rate limit — but needs an NVIDIA GPU and faster-whisper installed (see "Local Whisper" below).
-  - **Default:** auto-pick `local` if available, else `groq`, else `openai`.
-- `--whisper-model NAME` — faster-whisper model size for the local backend. Choices: `tiny | base | small | medium | large-v2 | large-v3`. Default `large-v3`. Ignored for groq/openai. See the model table below.
+  - `assemblyai` — paid (~$0.37/hr with diarization, $50 free credits). The only backend in the picker that returns speaker labels (`[Speaker A]`, `[Speaker B]`, …). Needs `ASSEMBLYAI_API_KEY`. See "Speaker diarization" below.
+  - **Default:** auto-pick `local` if available, else `groq`, else `openai`. AssemblyAI is never auto-picked — request it explicitly when you need diarization.
+- `--whisper-model NAME` — faster-whisper model size for the local backend. Choices: `tiny | base | small | medium | large-v2 | large-v3`. Default `large-v3`. Ignored for groq / openai / assemblyai. See the model table below.
+- `--diarize` / `--no-diarize` — request speaker labels when the backend supports them (currently only AssemblyAI). Default ON; pass `--no-diarize` for sentence-level segments without speaker tags. Ignored for local / groq / openai.
 - `--no-whisper` — disable Whisper entirely (frames-only if no captions).
 
 **OCR**
@@ -177,21 +179,43 @@ If the user asked a specific question, answer it directly citing timestamps. If 
 
 ## Transcription
 
-The script gets a timestamped transcript via three possible backends, in priority order:
+The script gets a timestamped transcript via four possible backends, in priority order:
 
 1. **Native captions (free, preferred).** yt-dlp pulls manual or auto-generated subtitles from the source platform if available.
-2. **Local Whisper via faster-whisper (no API call).** If no captions came back AND faster-whisper + a CUDA GPU are available, the script runs Whisper directly on the user's GPU. No upload, no key, no rate limit. See "Local Whisper" below for setup.
+2. **Local Whisper via faster-whisper (no API call).** If no captions came back AND faster-whisper + a CUDA GPU are available, the script runs Whisper directly on the user's GPU. No upload, no key, no rate limit. See "Local Whisper" below.
 3. **Whisper API fallback.** If local isn't available, the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever Whisper API has a key configured:
    - **Groq** — `whisper-large-v3`. Preferred API default: cheaper, faster. Get a key at console.groq.com/keys.
    - **OpenAI** — `whisper-1`. Fallback. Get a key at platform.openai.com/api-keys.
+4. **AssemblyAI (paid, opt-in).** Only used when explicitly requested via `--whisper assemblyai`. The differentiator is **automatic speaker diarization** — multi-speaker transcripts come back tagged `[Speaker A]`, `[Speaker B]`, etc. See "Speaker diarization" below.
 
-API keys live in `~/.config/watch/.env`. Auto-selection priority: `local` → `groq` → `openai`. Force a specific backend with `--whisper local|groq|openai`. Use `--no-whisper` to skip transcription entirely.
+API keys live in `~/.config/watch/.env`. Auto-selection priority: `local` → `groq` → `openai`. AssemblyAI is never auto-picked — request it explicitly when diarization is the goal. Use `--no-whisper` to skip transcription entirely.
 
 The report header shows the backend used:
 - `via captions` — yt-dlp pulled native subs
 - `via whisper (local, large-v3)` — local GPU
 - `via whisper (groq)` / `via whisper (openai)` — API
+- `via whisper (assemblyai, diarized)` — AssemblyAI with speaker labels (or `assemblyai` if `--no-diarize`)
 - `via whisper (..., --audio)` suffix — `--audio FILE` was used to transcribe a separate VO track
+
+### Speaker diarization
+
+When `--whisper assemblyai` is used (with `--diarize`, the default), each transcript segment carries a speaker tag and the formatted output looks like:
+
+```
+[Speaker A] (0:00-0:05) Welcome back to the show. Today we're talking with…
+[Speaker B] (0:05-0:09) Thanks for having me, glad to be here.
+[Speaker A] (0:09-0:18) Let's jump in — when did you first realize…
+```
+
+When to reach for it:
+- **Interviews / podcasts** — separating host vs guest dialogue is the obvious win.
+- **Multi-speaker UGC** — vlog conversations, panel clips, gameplay commentary with two voices.
+- **Ads with presenter + voiceover** — keeps the on-camera dialogue separate from the off-camera narration.
+- **Single-speaker content** — still works; the structure is just `[Speaker A]` for everything. Useful when you want the per-utterance start/end timing surfaced.
+
+The other Whisper backends (local / groq / openai) do not produce speaker labels — Whisper itself doesn't diarize. Pricing on AssemblyAI is roughly **$0.37 per hour of audio** with diarization enabled (text-only transcription is cheaper); new accounts get **$50 of free credits**, which covers ~135 hours of diarized audio.
+
+> **Roadmap note:** Local diarization via [WhisperX](https://github.com/m-bain/whisperX) (which combines faster-whisper with pyannote speaker embeddings) is on the roadmap pending upstream Python 3.14 support — the current WhisperX release pins to ≤ 3.13. Until then, AssemblyAI is the only diarized path that ships in this skill.
 
 ### Local Whisper (faster-whisper on GPU)
 
@@ -292,7 +316,8 @@ This fork has been tested on **Windows 11 + Python 3.14** (and the Bash tool's P
 - **No transcript available** → captions missing AND no Whisper backend usable (no GPU + faster-whisper, no API key, or all three failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
-- **Whisper API request fails** → the error is printed to stderr (likely: invalid key, rate limit, or 25 MB upload limit on a very long video). The report will say "none available" for transcript. Retry options: `--whisper openai` if Groq failed (or vice versa), or `--whisper local` if a GPU is available.
+- **Whisper API request fails** → the error is printed to stderr (likely: invalid key, rate limit, or 25 MB upload limit on a very long video). The report will say "none available" for transcript. Retry options: `--whisper openai` if Groq failed (or vice versa), or `--whisper local` if a GPU is available, or `--whisper assemblyai` if you want speaker labels and have credits.
+- **`--whisper assemblyai` errors** → missing key prints the install hint with the signup URL; an upstream error from AssemblyAI is surfaced verbatim (typically billing / quota / unsupported audio). Retry with `--no-diarize` to skip the diarization step if it was the diarization that timed out — the cheaper non-diarized path is more lenient.
 - **`--whisper local` requested but unavailable** → the script hard-errors with the install hint (`pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12`). Auto-mode falls through to Groq/OpenAI silently instead.
 - **OCR unavailable** → `pytesseract` or the `tesseract` binary missing. Report shows `OCR: unavailable (...)`. Either install Tesseract (Windows: `C:\Program Files\Tesseract-OCR` plus the `spa` language pack) or pass `--no-ocr` to silence the warning.
 - **`--backend gemini` errors** →
@@ -319,6 +344,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 - When `--whisper local` is selected (or auto-picked because a GPU is available), runs faster-whisper / CTranslate2 entirely on the user's machine — no network call, no upload
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set and the local backend isn't used
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and the local backend isn't used, or when `--whisper openai` is forced
+- When `--whisper assemblyai` is forced, uploads the extracted audio clip to AssemblyAI (`api.assemblyai.com`) and requests automatic speaker diarization + language detection. Only runs when the user explicitly requests this backend.
 - When `--backend gemini` is used, uploads the entire video file to Google's Gemini Files API (`generativelanguage.googleapis.com`) and sends a `generateContent` request with the user's question. For YouTube URLs, the URL is passed to Gemini and Google fetches the video server-side instead of uploading it ourselves.
 - Runs Tesseract locally (via `pytesseract`) over the extracted frames for OCR text detection (no network call); disable with `--no-ocr`
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
@@ -330,10 +356,10 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Does not upload anything when `--whisper local` is the active backend — the audio stays on disk and is processed entirely on-device
 - Does not upload the *video* in `--backend claude` mode either — only the extracted audio (when an API Whisper backend is in use). The full video only leaves the machine when `--backend gemini` is explicitly selected
 - Does not access any platform account (no login, no session cookies, no posting)
-- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`, Gemini key only goes to `generativelanguage.googleapis.com`)
+- Does not share API keys between providers (Groq → `api.groq.com`, OpenAI → `api.openai.com`, AssemblyAI → `api.assemblyai.com`, Gemini → `generativelanguage.googleapis.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory, `~/.config/watch/.env`, and the HuggingFace model cache (when local Whisper is used) — clean up the working directory when you're done (Step 5)
 
-**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction + auto-fps), `scripts/scenes.py` (PySceneDetect wrapper + midpoint picker), `scripts/speech.py` (speech-window detection + two-pass sampling), `scripts/ocr.py` (Tesseract OCR over frames), `scripts/transcribe.py` (VTT caption parsing), `scripts/whisper.py` (Groq / OpenAI clients + backend resolver), `scripts/whisper_local.py` (faster-whisper / GPU client), `scripts/gemini.py` (Gemini multimodal video client — `--backend gemini`), `scripts/setup.py` (preflight + installer)
+**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction + auto-fps), `scripts/scenes.py` (PySceneDetect wrapper + midpoint picker), `scripts/speech.py` (speech-window detection + two-pass sampling), `scripts/ocr.py` (Tesseract OCR over frames), `scripts/transcribe.py` (VTT caption parsing + speaker-aware formatting), `scripts/whisper.py` (Groq / OpenAI clients + backend resolver), `scripts/whisper_local.py` (faster-whisper / GPU client), `scripts/whisper_assemblyai.py` (AssemblyAI client with speaker diarization), `scripts/gemini.py` (Gemini multimodal video client — `--backend gemini`), `scripts/setup.py` (preflight + installer)
 
 Review scripts before first use to verify behavior.

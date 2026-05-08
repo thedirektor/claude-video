@@ -89,11 +89,28 @@ def filter_range(
 
 
 def format_transcript(segments: list[dict]) -> str:
+    """Render segments as a timestamped block.
+
+    If any segment carries a `speaker` field (set by AssemblyAI when
+    diarization is enabled), switch to a "[Speaker A] (M:SS-M:SS) text"
+    layout that surfaces speaker turns and their duration. Otherwise keep
+    the original "[MM:SS] text" format used by the caption / Groq / OpenAI /
+    local-Whisper backends.
+    """
+    has_speakers = any("speaker" in s for s in segments)
     lines = []
     for seg in segments:
         start = int(seg["start"])
-        stamp = f"[{start // 60:02d}:{start % 60:02d}]"
-        lines.append(f"{stamp} {seg['text']}")
+        end = int(seg["end"])
+        if has_speakers and seg.get("speaker"):
+            speaker = seg["speaker"]
+            stamp = (
+                f"({start // 60}:{start % 60:02d}-{end // 60}:{end % 60:02d})"
+            )
+            lines.append(f"[{speaker}] {stamp} {seg['text']}")
+        else:
+            stamp = f"[{start // 60:02d}:{start % 60:02d}]"
+            lines.append(f"{stamp} {seg['text']}")
     return "\n".join(lines)
 
 

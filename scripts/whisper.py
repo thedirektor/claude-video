@@ -102,19 +102,23 @@ def resolve_backend(
       - When (None, None, hint) is returned, no backend is usable.
 
     If `preferred` is set, that backend is required:
-      - 'local'  → must have faster-whisper + a CUDA GPU available
-      - 'groq'   → must have GROQ_API_KEY
-      - 'openai' → must have OPENAI_API_KEY
+      - 'local'      → must have faster-whisper + a CUDA GPU available
+      - 'groq'       → must have GROQ_API_KEY
+      - 'openai'     → must have OPENAI_API_KEY
+      - 'assemblyai' → must have ASSEMBLYAI_API_KEY (paid; speaker diarization)
     No silent fallback to a different backend when the user asked for one.
 
     If `preferred` is None, auto-select with priority:
       1. 'local'  (if faster-whisper imports and a CUDA GPU is reachable)
       2. 'groq'   (if GROQ_API_KEY is set)
       3. 'openai' (if OPENAI_API_KEY is set)
+    AssemblyAI is intentionally excluded from auto-pick because it's paid
+    and only adds value when you specifically want speaker diarization.
     """
-    # Make sure `whisper_local` (sibling module) is importable when whisper.py
-    # is imported standalone. watch.py already inserts scripts/ on sys.path,
-    # but doing it here too keeps direct CLI use of whisper.py honest.
+    # Make sure sibling modules (whisper_local, whisper_assemblyai) are
+    # importable when whisper.py is imported standalone. watch.py already
+    # inserts scripts/ on sys.path, but doing it here too keeps direct CLI
+    # use of whisper.py honest.
     sys.path.insert(0, str(Path(__file__).parent))
 
     if preferred == "local":
@@ -129,6 +133,24 @@ def resolve_backend(
             return "local", None, None
         return None, None, (
             f"--whisper local was set but it can't run: {reason}\n{INSTALL_HINT}"
+        )
+
+    if preferred == "assemblyai":
+        try:
+            from whisper_assemblyai import (
+                load_api_key as _aai_load_key,
+                INSTALL_HINT as AAI_INSTALL_HINT,
+            )
+        except ImportError as exc:
+            return None, None, (
+                f"--whisper assemblyai was set but whisper_assemblyai module is unavailable: {exc}"
+            )
+        key = _aai_load_key()
+        if key:
+            return "assemblyai", key, None
+        return None, None, (
+            "--whisper assemblyai was set but ASSEMBLYAI_API_KEY is missing.\n"
+            + AAI_INSTALL_HINT
         )
 
     if preferred in ("groq", "openai"):
@@ -343,11 +365,18 @@ def transcribe_video(
     backend: str | None = None,
     api_key: str | None = None,
     model_name: str | None = None,
+    enable_diarization: bool = True,
 ) -> tuple[list[dict], str]:
     """Run the full flow: extract audio → upload (or run locally) → parse segments.
 
-    Returns (segments, backend_used). For the local backend, `audio_out` is
-    ignored and `model_name` (e.g. 'large-v3') selects the faster-whisper model.
+    Returns (segments, backend_used). Per-backend extras:
+      - local:      `model_name` (e.g. 'large-v3') selects the faster-whisper model;
+                    `audio_out` is ignored (faster-whisper handles ffmpeg internally).
+      - assemblyai: `enable_diarization` toggles speaker labels on the returned
+                    segments (`speaker` field). `api_key` is informational; the
+                    AssemblyAI module reads ASSEMBLYAI_API_KEY itself.
+      - groq/openai: `audio_out` receives the extracted mono 16 kHz mp3 that
+                     gets uploaded.
     Raises SystemExit on any failure.
     """
     if backend == "local":
@@ -359,6 +388,23 @@ def transcribe_video(
         if not segments:
             raise SystemExit("Whisper returned no transcript segments")
         return segments, "local"
+
+    if backend == "assemblyai":
+        sys.path.insert(0, str(Path(__file__).parent))
+        from whisper_assemblyai import transcribe_assemblyai
+
+        # Extract a compact mono 16 kHz mp3 first — keeps the upload small
+        # and matches what we hand to Groq / OpenAI. AssemblyAI accepts video
+        # directly too, but for a 100 MB+ source the smaller payload is a
+        # meaningful round-trip win.
+        print(f"[watch] extracting audio for AssemblyAI…", file=sys.stderr)
+        audio_path = extract_audio(video_path, audio_out)
+        segments = transcribe_assemblyai(
+            audio_path, enable_diarization=enable_diarization
+        )
+        if not segments:
+            raise SystemExit("Whisper returned no transcript segments")
+        return segments, "assemblyai"
 
     if backend is None or api_key is None:
         detected_backend, detected_key = load_api_key()

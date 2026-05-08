@@ -193,18 +193,28 @@ def main() -> int:
     )
     ap.add_argument(
         "--whisper",
-        choices=["groq", "openai", "local"],
+        choices=["groq", "openai", "local", "assemblyai"],
         default=None,
         help="Force a specific Whisper backend. 'local' runs faster-whisper on the GPU "
-        "(needs faster-whisper + CUDA). Default: auto-pick local if available, "
-        "else Groq, else OpenAI.",
+        "(needs faster-whisper + CUDA). 'assemblyai' is paid (~$0.37/hr with diarization, "
+        "$50 free credits) and adds automatic speaker labels to the transcript. "
+        "Default: auto-pick local if available, else Groq, else OpenAI. "
+        "AssemblyAI is never auto-picked — request it explicitly when you need diarization.",
     )
     ap.add_argument(
         "--whisper-model",
         choices=list(WHISPER_LOCAL_MODELS),
         default=WHISPER_LOCAL_DEFAULT_MODEL,
         help=f"faster-whisper model for the local backend (default {WHISPER_LOCAL_DEFAULT_MODEL}). "
-        "Smaller models are faster but less accurate. Ignored for groq / openai backends.",
+        "Smaller models are faster but less accurate. Ignored for groq / openai / assemblyai.",
+    )
+    ap.add_argument(
+        "--diarize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Request speaker diarization when the backend supports it (currently AssemblyAI). "
+        "Default ON. Pass --no-diarize to skip speaker labels and get sentence-level segments. "
+        "Ignored for local / groq / openai (none of those expose diarization here).",
     )
     args = ap.parse_args()
 
@@ -304,19 +314,24 @@ def main() -> int:
                     backend=backend,
                     api_key=api_key,
                     model_name=args.whisper_model if backend == "local" else None,
+                    enable_diarization=args.diarize if backend == "assemblyai" else False,
                 )
                 transcript_segments = (
                     filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 )
                 transcript_text = format_transcript(transcript_segments)
-                # Build a label like "whisper (local, large-v3, --audio)" or
-                # "whisper (groq)". The model name is only meaningful for the
-                # local backend; the API backends don't expose model choice here.
-                backend_label = (
-                    f"{used_backend}, {args.whisper_model}"
-                    if used_backend == "local"
-                    else used_backend
-                )
+                # Build a label like "whisper (local, large-v3, --audio)",
+                # "whisper (assemblyai, diarized)", or "whisper (groq)".
+                # Per-backend extras are folded into a single comma list so
+                # the transcript header tells you exactly what produced it.
+                if used_backend == "local":
+                    backend_label = f"local, {args.whisper_model}"
+                elif used_backend == "assemblyai":
+                    backend_label = (
+                        "assemblyai, diarized" if args.diarize else "assemblyai"
+                    )
+                else:
+                    backend_label = used_backend
                 transcript_source = (
                     f"whisper ({backend_label}, --audio)"
                     if audio_override
