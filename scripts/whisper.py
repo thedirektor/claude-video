@@ -41,9 +41,11 @@ OPENAI_MODEL = "whisper-1"
 
 
 def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, None]:
-    """Return (backend, api_key). Prefers Groq, falls back to OpenAI.
+    """Return (backend, api_key) for an API backend (groq | openai).
 
-    If `preferred` is "groq" or "openai", only that backend's key is considered.
+    Prefers Groq, falls back to OpenAI. If `preferred` is "groq" or "openai",
+    only that backend's key is considered. The "local" backend doesn't use an
+    API key and is handled by resolve_backend() instead.
     """
     def _from_env(name: str) -> str | None:
         value = os.environ.get(name)
@@ -88,6 +90,72 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
             return backend, value
 
     return None, None
+
+
+def resolve_backend(
+    preferred: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Pick a Whisper backend across local / groq / openai.
+
+    Returns (backend, api_key, error_hint).
+      - For 'local', api_key is None.
+      - When (None, None, hint) is returned, no backend is usable.
+
+    If `preferred` is set, that backend is required:
+      - 'local'  → must have faster-whisper + a CUDA GPU available
+      - 'groq'   → must have GROQ_API_KEY
+      - 'openai' → must have OPENAI_API_KEY
+    No silent fallback to a different backend when the user asked for one.
+
+    If `preferred` is None, auto-select with priority:
+      1. 'local'  (if faster-whisper imports and a CUDA GPU is reachable)
+      2. 'groq'   (if GROQ_API_KEY is set)
+      3. 'openai' (if OPENAI_API_KEY is set)
+    """
+    # Make sure `whisper_local` (sibling module) is importable when whisper.py
+    # is imported standalone. watch.py already inserts scripts/ on sys.path,
+    # but doing it here too keeps direct CLI use of whisper.py honest.
+    sys.path.insert(0, str(Path(__file__).parent))
+
+    if preferred == "local":
+        try:
+            from whisper_local import is_available, INSTALL_HINT
+        except ImportError as exc:
+            return None, None, (
+                f"--whisper local was set but whisper_local module is unavailable: {exc}"
+            )
+        ok, reason = is_available()
+        if ok:
+            return "local", None, None
+        return None, None, (
+            f"--whisper local was set but it can't run: {reason}\n{INSTALL_HINT}"
+        )
+
+    if preferred in ("groq", "openai"):
+        backend, key = load_api_key(preferred)
+        if backend and key:
+            return backend, key, None
+        return None, None, (
+            f"--whisper {preferred} was set but the matching API key is missing"
+        )
+
+    # Auto-select. Try local first (no API call, no upload).
+    try:
+        from whisper_local import is_available
+        ok, _ = is_available()
+        if ok:
+            return "local", None, None
+    except ImportError:
+        pass  # faster-whisper not installed → fall through to API backends
+
+    backend, key = load_api_key()
+    if backend and key:
+        return backend, key, None
+
+    return None, None, (
+        "no Whisper backend available — no local GPU + faster-whisper, "
+        "and neither GROQ_API_KEY nor OPENAI_API_KEY is set"
+    )
 
 
 def extract_audio(video_path: str, out_path: Path) -> Path:
@@ -274,11 +342,24 @@ def transcribe_video(
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
+    model_name: str | None = None,
 ) -> tuple[list[dict], str]:
-    """Run the full flow: extract audio → upload → parse segments.
+    """Run the full flow: extract audio → upload (or run locally) → parse segments.
 
-    Returns (segments, backend_used). Raises SystemExit on any failure.
+    Returns (segments, backend_used). For the local backend, `audio_out` is
+    ignored and `model_name` (e.g. 'large-v3') selects the faster-whisper model.
+    Raises SystemExit on any failure.
     """
+    if backend == "local":
+        sys.path.insert(0, str(Path(__file__).parent))
+        from whisper_local import transcribe_local, DEFAULT_MODEL
+
+        used_model = model_name or DEFAULT_MODEL
+        segments = transcribe_local(video_path, model_name=used_model)
+        if not segments:
+            raise SystemExit("Whisper returned no transcript segments")
+        return segments, "local"
+
     if backend is None or api_key is None:
         detected_backend, detected_key = load_api_key()
         backend = backend or detected_backend
