@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 concurrency:
   group: smoke-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -71,6 +74,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: choco install ffmpeg -y --no-progress
+
+      - name: Install yt-dlp
+        run: pip install yt-dlp
 
       - name: setup.py --check on a clean machine (expect 0 or 3)
         shell: bash
