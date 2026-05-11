@@ -55,7 +55,7 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
         if not path.exists():
             return None
         try:
-            for line in path.read_text(encoding="utf-8").splitlines():
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
