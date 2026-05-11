@@ -2,6 +2,20 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.2.2] — 2026-05-11
+
+### Fixed
+- Tolerate legacy cp1252 `.env` files on Windows. Upstream #4 fixed config
+  *writes* to UTF-8 but not reads, so users who first ran `setup.py` before
+  that fix had `~/.config/watch/.env` written in cp1252 (em-dashes from the
+  comment template land as byte 0x97), which then crashed every UTF-8 read
+  with `UnicodeDecodeError` and bricked the preflight, the SessionStart
+  hook, and every backend that looks up an API key. `setup.py`, `whisper.py`,
+  `whisper_assemblyai.py`, and `gemini.py` now read `.env` with
+  `errors="replace"` — API keys are ASCII so only comment em-dashes degrade.
+- `whisper_assemblyai.py` and `gemini.py` gain the explicit `encoding="utf-8"`
+  arg they were missing on `.env` reads, which on Windows defaults to cp1252.
+
 ## [0.2.1] — 2026-05-09
 
 Merged upstream `bradautomates/claude-video v0.1.3` into the fork. Pulls in the
