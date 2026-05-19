@@ -18,7 +18,7 @@ fi
 
 # Frontmatter format check: YAML inline-list syntax `allowed-tools: [a, b]`
 # silently breaks slash-command registration in Claude Code (upstream issue
-# #6 — bradautomates/claude-video). The supported form is a bare
+# #6 — thedirektor/claude-video). The supported form is a bare
 # comma-separated string. Bail if any frontmatter regresses to the
 # bracketed form before we package the skill.
 BAD_FRONTMATTER=$(grep -lE '^allowed-tools:[[:space:]]*\[' SKILL.md commands/*.md 2>/dev/null || true)

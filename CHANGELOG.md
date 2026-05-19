@@ -18,7 +18,7 @@ All notable changes to `/watch` are documented here.
 
 ## [0.2.1] — 2026-05-09
 
-Merged upstream `bradautomates/claude-video v0.1.3` into the fork. Pulls in the
+Merged upstream `thedirektor/claude-video v0.1.3` into the fork. Pulls in the
 option-injection hardening and Windows UTF-8 file-IO fix while preserving every
 fork-specific feature from v0.2.0.
 
@@ -38,7 +38,7 @@ fork-specific feature from v0.2.0.
 
 ## [0.2.0] — 2026-05-08
 
-Fork release covering everything added on top of upstream `bradautomates/claude-video v0.1.2`. Themes: smarter frame sampling (scenes, OCR, speech-aware two-pass), a separate-voiceover workflow, a local-GPU Whisper backend, and a real Windows story.
+Fork release covering everything added on top of upstream `thedirektor/claude-video v0.1.2`. Themes: smarter frame sampling (scenes, OCR, speech-aware two-pass), a separate-voiceover workflow, a local-GPU Whisper backend, and a real Windows story.
 
 ### Added
 
