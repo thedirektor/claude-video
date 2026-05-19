@@ -38,6 +38,8 @@ from frames import (  # noqa: E402
 )
 from gemini import DEFAULT_MODEL as GEMINI_DEFAULT_MODEL  # noqa: E402
 from gemini import VALID_MODELS as GEMINI_MODELS  # noqa: E402
+from openrouter import DEFAULT_AUDIO_MODEL as OR_AUDIO_DEFAULT  # noqa: E402
+from openrouter import DEFAULT_VISION_MODEL as OR_VISION_DEFAULT  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
 from scenes import DEFAULT_THRESHOLD, detect_scenes, pick_midpoints  # noqa: E402
 from speech import (  # noqa: E402
@@ -47,7 +49,7 @@ from speech import (  # noqa: E402
     two_pass_sample,
 )
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
-from whisper import resolve_backend, transcribe_video  # noqa: E402
+from whisper import extract_audio, resolve_backend, transcribe_video  # noqa: E402
 from whisper_local import DEFAULT_MODEL as WHISPER_LOCAL_DEFAULT_MODEL  # noqa: E402
 from whisper_local import VALID_MODELS as WHISPER_LOCAL_MODELS  # noqa: E402
 
@@ -119,6 +121,154 @@ def _run_gemini_backend(args, work: Path) -> int:
     return 0
 
 
+def _run_openrouter_backend(args, work: Path) -> int:
+    """Extract frames, transcribe via OpenRouter audio, then query OpenRouter vision.
+
+    Follows the same download → transcript → extract pipeline as the claude
+    backend, but instead of printing frame paths for Claude to Read, encodes
+    all frames as base64 and POSTs them together with the transcript and
+    question to the OpenRouter chat completions endpoint.
+    """
+    from openrouter import analyze_with_frames, transcribe_audio
+
+    question = " ".join(args.question).strip()
+    if not question:
+        raise SystemExit(
+            "--backend openrouter requires a question. Pass it as the trailing "
+            'positional argument: `watch.py video.mp4 --backend openrouter "Describe this video"`'
+        )
+
+    if args.audio:
+        print(
+            "[watch] --audio is ignored for --backend openrouter (use the default audio "
+            "pipeline which extracts audio from the video).",
+            file=sys.stderr,
+        )
+
+    print(
+        "[watch] downloading via yt-dlp…" if is_url(args.source) else "[watch] using local file…",
+        file=sys.stderr,
+    )
+    dl = download(args.source, work / "download")
+    video_path = dl["video_path"]
+
+    meta = get_metadata(video_path)
+    full_duration = meta["duration_seconds"]
+    start_sec = parse_time(args.start)
+    end_sec = parse_time(args.end)
+    effective_start = start_sec if start_sec is not None else 0.0
+    effective_end = end_sec if end_sec is not None else full_duration
+    effective_duration = max(0.0, effective_end - effective_start)
+    focused = start_sec is not None or end_sec is not None
+
+    max_frames = min(args.max_frames, 100)
+    if focused:
+        fps, target = auto_fps_focus(effective_duration, max_frames=max_frames)
+    else:
+        fps, target = auto_fps(effective_duration, max_frames=max_frames)
+    if args.fps is not None:
+        fps = min(args.fps, MAX_FPS)
+        target = max(1, int(round(fps * effective_duration)))
+
+    # Transcript: captions first, then OpenRouter audio model
+    transcript_segments: list[dict] = []
+    transcript_text: str | None = None
+    transcript_source: str | None = None
+
+    if dl.get("subtitle_path"):
+        try:
+            all_segs = parse_vtt(dl["subtitle_path"])
+            transcript_segments = filter_range(all_segs, start_sec, end_sec) if focused else all_segs
+            transcript_text = format_transcript(transcript_segments)
+            transcript_source = "captions"
+        except Exception as exc:
+            print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
+
+    if not transcript_segments and not args.no_whisper:
+        audio_out = work / "audio.mp3"
+        print(
+            f"[watch] extracting audio for OpenRouter ({args.openrouter_audio_model})…",
+            file=sys.stderr,
+        )
+        try:
+            audio_path = extract_audio(video_path, audio_out)
+            size_kb = audio_path.stat().st_size / 1024
+            print(
+                f"[watch] audio: {size_kb:.0f} kB — transcribing via OpenRouter…",
+                file=sys.stderr,
+            )
+            transcript_segments = transcribe_audio(audio_path, model=args.openrouter_audio_model)
+            if focused:
+                transcript_segments = filter_range(transcript_segments, start_sec, end_sec)
+            transcript_text = format_transcript(transcript_segments)
+            transcript_source = f"openrouter ({args.openrouter_audio_model})"
+            print(
+                f"[watch] transcribed {len(transcript_segments)} segments via OpenRouter",
+                file=sys.stderr,
+            )
+        except SystemExit as exc:
+            print(f"[watch] OpenRouter audio transcription failed: {exc}", file=sys.stderr)
+
+    # Frame extraction
+    print(f"[watch] extracting ~{target} frames at {fps:.3f} fps…", file=sys.stderr)
+    frames = extract(
+        video_path,
+        work / "frames",
+        fps=fps,
+        resolution=args.resolution,
+        max_frames=max_frames,
+        start_seconds=start_sec,
+        end_seconds=end_sec,
+    )
+
+    frame_paths = [f["path"] for f in frames]
+    print(
+        f"[watch] sending {len(frame_paths)} frames to OpenRouter ({args.openrouter_vision_model})…",
+        file=sys.stderr,
+    )
+
+    response_text = analyze_with_frames(
+        frame_paths=frame_paths,
+        transcript_text=transcript_text,
+        question=question,
+        vision_model=args.openrouter_vision_model,
+    )
+
+    info = dl.get("info") or {}
+    scope = (
+        f"{format_time(effective_start)}–{format_time(effective_end)}"
+        if focused
+        else "full"
+    )
+
+    print()
+    print("# watch: video report (OpenRouter backend)")
+    print()
+    print(f"- **Source:** {args.source}")
+    if info.get("title"):
+        print(f"- **Title:** {info['title']}")
+    if info.get("uploader"):
+        print(f"- **Uploader:** {info['uploader']}")
+    print(f"- **Duration:** {format_time(full_duration)} ({full_duration:.1f}s)")
+    if focused:
+        print(f"- **Focus:** {scope}")
+    print(f"- **Vision model:** {args.openrouter_vision_model}")
+    print(f"- **Frames:** {len(frame_paths)} @ {fps:.3f} fps ({scope})")
+    if transcript_segments:
+        print(f"- **Transcript:** {len(transcript_segments)} segments (via {transcript_source})")
+    else:
+        print("- **Transcript:** none")
+    print(f"- **Question:** {question}")
+    print()
+    print("## OpenRouter response")
+    print()
+    print(response_text)
+    print()
+    print("---")
+    print(f"_Work dir: `{work}` — delete when done._")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="watch",
@@ -135,11 +285,13 @@ def main() -> int:
     )
     ap.add_argument(
         "--backend",
-        choices=["claude", "gemini"],
+        choices=["claude", "gemini", "openrouter"],
         default="claude",
         help="claude (default): extract frames + transcript locally so Claude can `Read` them. "
         "gemini: skip frame extraction and Whisper, hand the whole video to Gemini's "
-        "native multimodal model and print its response.",
+        "native multimodal model and print its response. "
+        "openrouter: extract frames, transcribe via OpenRouter audio model, then POST "
+        "everything to an OpenRouter vision model and print its response.",
     )
     ap.add_argument(
         "--gemini-model",
@@ -148,7 +300,21 @@ def main() -> int:
         help=f"Gemini model for --backend gemini (default {GEMINI_DEFAULT_MODEL}). "
         "Use gemini-2.5-flash for harder reasoning over the visual content, or "
         "gemini-2.5-pro for very long videos / extensive output. "
-        "Ignored for --backend claude.",
+        "Ignored for --backend claude / openrouter.",
+    )
+    ap.add_argument(
+        "--openrouter-vision-model",
+        default=OR_VISION_DEFAULT,
+        help=f"OpenRouter model for vision/chat analysis (default {OR_VISION_DEFAULT}). "
+        "Any multimodal model available on OpenRouter can be used here. "
+        "Only applies to --backend openrouter.",
+    )
+    ap.add_argument(
+        "--openrouter-audio-model",
+        default=OR_AUDIO_DEFAULT,
+        help=f"OpenRouter model for audio transcription (default {OR_AUDIO_DEFAULT}). "
+        "Used when no captions are found and --no-whisper is not set. "
+        "Only applies to --backend openrouter.",
     )
     ap.add_argument("--max-frames", type=int, default=80, help="Cap on frame count (default 80, hard max 100)")
     ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
@@ -240,6 +406,9 @@ def main() -> int:
 
     if args.backend == "gemini":
         return _run_gemini_backend(args, work)
+
+    if args.backend == "openrouter":
+        return _run_openrouter_backend(args, work)
 
     print(
         "[watch] downloading via yt-dlp…" if is_url(args.source) else "[watch] using local file…",
