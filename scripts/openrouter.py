@@ -48,6 +48,9 @@ _X_TITLE = "claude-video /watch"
 _MAX_ATTEMPTS = 3
 _RETRY_BASE = 2.0
 
+_GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
+_GROQ_MODEL = "whisper-large-v3"
+
 
 def load_api_key() -> str | None:
     """Return OPENROUTER_API_KEY from env or ~/.config/watch/.env."""
@@ -94,6 +97,99 @@ def _retry_after(exc: urllib.error.HTTPError) -> float | None:
         return None
 
 
+def _load_groq_key() -> str | None:
+    """Return GROQ_API_KEY from env or ~/.config/watch/.env."""
+    value = os.environ.get("GROQ_API_KEY")
+    if value and value.strip():
+        return value.strip()
+    for candidate in [
+        Path.home() / ".config" / "watch" / ".env",
+        Path.cwd() / ".env",
+    ]:
+        if not candidate.exists():
+            continue
+        try:
+            for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() != "GROQ_API_KEY":
+                    continue
+                v = v.strip()
+                if len(v) >= 2 and v[0] in ('"', "'") and v[-1] == v[0]:
+                    v = v[1:-1]
+                if v:
+                    return v
+        except OSError:
+            continue
+    return None
+
+
+def _groq_transcribe(audio_path: Path, groq_key: str) -> list[dict]:
+    """Transcribe audio via Groq whisper-large-v3. Called as a fallback by transcribe_audio()."""
+    boundary = f"----WatchGroq{uuid.uuid4().hex}"
+    eol = b"\r\n"
+    buf = io.BytesIO()
+    for name, value in [
+        ("model", _GROQ_MODEL),
+        ("response_format", "verbose_json"),
+        ("temperature", "0"),
+    ]:
+        buf.write(f"--{boundary}".encode()); buf.write(eol)
+        buf.write(f'Content-Disposition: form-data; name="{name}"'.encode()); buf.write(eol)
+        buf.write(eol)
+        buf.write(str(value).encode()); buf.write(eol)
+    mime = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+    buf.write(f"--{boundary}".encode()); buf.write(eol)
+    buf.write(
+        f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"'.encode()
+    )
+    buf.write(eol)
+    buf.write(f"Content-Type: {mime}".encode()); buf.write(eol)
+    buf.write(eol)
+    buf.write(audio_path.read_bytes())
+    buf.write(eol)
+    buf.write(f"--{boundary}--".encode()); buf.write(eol)
+
+    body = buf.getvalue()
+    headers = {
+        "Authorization": f"Bearer {groq_key}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "User-Agent": "watch-skill/1.0 (+claude-code; python-urllib)",
+    }
+
+    ctx = ssl.create_default_context()
+    req = Request(_GROQ_ENDPOINT, data=body, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=300, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"Groq fallback transcription failed ({exc.code}){_read_error(exc)}")
+    except Exception as exc:
+        raise SystemExit(f"Groq fallback transcription failed: {type(exc).__name__}: {exc}")
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Groq fallback returned non-JSON: {exc}: {raw[:200]}")
+
+    out: list[dict] = []
+    for seg in data.get("segments") or []:
+        text = (seg.get("text") or "").strip()
+        if text:
+            out.append({
+                "start": round(float(seg.get("start") or 0.0), 2),
+                "end": round(float(seg.get("end") or 0.0), 2),
+                "text": text,
+            })
+    if not out:
+        full = (data.get("text") or "").strip()
+        if full:
+            out.append({"start": 0.0, "end": 0.0, "text": full})
+    return out
+
+
 def transcribe_audio(
     audio_path: Path,
     model: str = DEFAULT_AUDIO_MODEL,
@@ -103,7 +199,11 @@ def transcribe_audio(
 
     Returns segments in {start, end, text} format. Falls back to a single
     segment from the plain-text response if verbose_json is not supported.
-    Raises SystemExit on unrecoverable errors.
+
+    If the OpenRouter endpoint fails after all retries, automatically falls
+    back to Groq whisper-large-v3 using GROQ_API_KEY from the environment or
+    ~/.config/watch/.env, logging a warning before the fallback triggers.
+    Raises SystemExit only if both OpenRouter and the Groq fallback fail.
     """
     if api_key is None:
         api_key = load_api_key()
@@ -199,9 +299,19 @@ def transcribe_audio(
                 out.append({"start": 0.0, "end": 0.0, "text": full})
         return out
 
-    raise SystemExit(
-        f"OpenRouter transcription failed after {_MAX_ATTEMPTS} attempts: {last_exc}"
+    # All OpenRouter retries exhausted — fall back to Groq whisper-large-v3
+    groq_key = _load_groq_key()
+    if not groq_key:
+        raise SystemExit(
+            f"OpenRouter transcription failed after {_MAX_ATTEMPTS} attempts: {last_exc}. "
+            "No GROQ_API_KEY found for fallback — set it in ~/.config/watch/.env."
+        )
+    print(
+        f"[watch] WARNING: OpenRouter audio transcription failed ({last_exc}) — "
+        "falling back to Groq whisper-large-v3…",
+        file=sys.stderr,
     )
+    return _groq_transcribe(audio_path, groq_key)
 
 
 def analyze_with_frames(
