@@ -40,7 +40,7 @@ CHAT_ENDPOINT = f"{OPENROUTER_BASE}/chat/completions"
 TRANSCRIPTION_ENDPOINT = f"{OPENROUTER_BASE}/audio/transcriptions"
 
 DEFAULT_VISION_MODEL = "google/gemini-2.5-flash"
-DEFAULT_AUDIO_MODEL = "openai/gpt-4o-mini-transcribe"
+DEFAULT_AUDIO_MODEL = "qwen/qwen3-asr-flash-2026-02-10"
 
 _HTTP_REFERER = "https://github.com/thedirektor/claude-video"
 _X_TITLE = "claude-video /watch"
@@ -50,6 +50,7 @@ _RETRY_BASE = 2.0
 
 _GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 _GROQ_MODEL = "whisper-large-v3"
+_VOXTRAL_FALLBACK_MODEL = "mistralai/voxtral-mini-transcribe"
 
 
 def load_api_key() -> str | None:
@@ -190,29 +191,17 @@ def _groq_transcribe(audio_path: Path, groq_key: str) -> list[dict]:
     return out
 
 
-def transcribe_audio(
+def _openrouter_transcribe_attempt(
     audio_path: Path,
-    model: str = DEFAULT_AUDIO_MODEL,
-    api_key: str | None = None,
+    model: str,
+    api_key: str,
 ) -> list[dict]:
-    """Transcribe audio via OpenRouter's transcription endpoint.
+    """Try transcribing audio with one OpenRouter model (with retries).
 
-    Returns segments in {start, end, text} format. Falls back to a single
-    segment from the plain-text response if verbose_json is not supported.
-
-    If the OpenRouter endpoint fails after all retries, automatically falls
-    back to Groq whisper-large-v3 using GROQ_API_KEY from the environment or
-    ~/.config/watch/.env, logging a warning before the fallback triggers.
-    Raises SystemExit only if both OpenRouter and the Groq fallback fail.
+    Returns segments on success. Raises RuntimeError on any failure so the
+    caller can fall through to the next model in the chain without catching
+    SystemExit prematurely.
     """
-    if api_key is None:
-        api_key = load_api_key()
-    if not api_key:
-        raise SystemExit(
-            "OPENROUTER_API_KEY not set. Add it to ~/.config/watch/.env or "
-            "export OPENROUTER_API_KEY in your environment."
-        )
-
     boundary = f"----WatchOR{uuid.uuid4().hex}"
     eol = b"\r\n"
     buf = io.BytesIO()
@@ -256,33 +245,33 @@ def transcribe_audio(
         except urllib.error.HTTPError as exc:
             last_exc = exc
             detail = _read_error(exc)
-            if 400 <= exc.code < 500 and exc.code != 429:
-                raise SystemExit(f"OpenRouter transcription failed ({exc.code}){detail}")
-            delay = _retry_after(exc) or _RETRY_BASE * (2 ** attempt)
-            if attempt < _MAX_ATTEMPTS - 1:
+            if attempt < _MAX_ATTEMPTS - 1 and (exc.code == 429 or exc.code >= 500):
+                delay = _retry_after(exc) or _RETRY_BASE * (2 ** attempt)
                 print(
-                    f"[watch] openrouter audio HTTP {exc.code} — retrying in {delay:.1f}s",
+                    f"[watch] openrouter audio ({model}) HTTP {exc.code} — "
+                    f"retrying in {delay:.1f}s",
                     file=sys.stderr,
                 )
                 time.sleep(delay)
-            continue
+                continue
+            raise RuntimeError(f"HTTP {exc.code}{detail}")
         except (urllib.error.URLError, TimeoutError, ConnectionResetError, OSError) as exc:
             last_exc = exc
             if attempt < _MAX_ATTEMPTS - 1:
                 delay = _RETRY_BASE * (attempt + 1)
                 print(
-                    f"[watch] openrouter audio network error — retrying in {delay:.1f}s",
+                    f"[watch] openrouter audio ({model}) network error — "
+                    f"retrying in {delay:.1f}s",
                     file=sys.stderr,
                 )
                 time.sleep(delay)
-            continue
+                continue
+            raise RuntimeError(f"{type(exc).__name__}: {exc}")
 
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise SystemExit(
-                f"OpenRouter transcription returned non-JSON: {exc}: {raw[:200]}"
-            )
+            raise RuntimeError(f"non-JSON response: {exc}: {raw[:200]}")
 
         out: list[dict] = []
         for seg in data.get("segments") or []:
@@ -299,18 +288,57 @@ def transcribe_audio(
                 out.append({"start": 0.0, "end": 0.0, "text": full})
         return out
 
-    # All OpenRouter retries exhausted — fall back to Groq whisper-large-v3
+    raise RuntimeError(f"failed after {_MAX_ATTEMPTS} attempts: {last_exc}")
+
+
+def transcribe_audio(
+    audio_path: Path,
+    model: str = DEFAULT_AUDIO_MODEL,
+    api_key: str | None = None,
+) -> list[dict]:
+    """Transcribe audio via a three-model fallback chain.
+
+    Tries in order, logging a WARNING each time a leg fails:
+      1. `model` param on OpenRouter (default: qwen/qwen3-asr-flash-2026-02-10)
+      2. mistralai/voxtral-mini-transcribe on OpenRouter (skipped if same as model)
+      3. Groq whisper-large-v3 via GROQ_API_KEY from env / ~/.config/watch/.env
+
+    Returns segments in {start, end, text} format.
+    Raises SystemExit only if every leg of the chain fails.
+    """
+    if api_key is None:
+        api_key = load_api_key()
+    if not api_key:
+        raise SystemExit(
+            "OPENROUTER_API_KEY not set. Add it to ~/.config/watch/.env or "
+            "export OPENROUTER_API_KEY in your environment."
+        )
+
+    # Build the OpenRouter sub-chain (deduplicated so we don't repeat a model)
+    or_models = [model]
+    if _VOXTRAL_FALLBACK_MODEL != model:
+        or_models.append(_VOXTRAL_FALLBACK_MODEL)
+
+    last_error: Exception | None = None
+    for idx, m in enumerate(or_models):
+        try:
+            return _openrouter_transcribe_attempt(audio_path, m, api_key)
+        except RuntimeError as exc:
+            last_error = exc
+            remaining = or_models[idx + 1:] + ["Groq whisper-large-v3"]
+            print(
+                f"[watch] WARNING: OpenRouter audio ({m}) failed ({exc}) — "
+                f"trying {remaining[0]}…",
+                file=sys.stderr,
+            )
+
+    # All OpenRouter models exhausted — fall back to Groq
     groq_key = _load_groq_key()
     if not groq_key:
         raise SystemExit(
-            f"OpenRouter transcription failed after {_MAX_ATTEMPTS} attempts: {last_exc}. "
-            "No GROQ_API_KEY found for fallback — set it in ~/.config/watch/.env."
+            f"All OpenRouter audio models failed. Last error: {last_error}. "
+            "No GROQ_API_KEY found for Groq fallback — set it in ~/.config/watch/.env."
         )
-    print(
-        f"[watch] WARNING: OpenRouter audio transcription failed ({last_exc}) — "
-        "falling back to Groq whisper-large-v3…",
-        file=sys.stderr,
-    )
     return _groq_transcribe(audio_path, groq_key)
 
 
