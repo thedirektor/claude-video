@@ -14,3 +14,8 @@ htmlcov/
 
 # local Claude Code settings
 .claude/settings.local.json
+
+# secrets — never commit API keys
+.env
+*.env
+!.env.example
