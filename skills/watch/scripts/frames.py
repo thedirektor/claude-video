@@ -395,24 +395,40 @@ def extract_at_timestamps(
     return out, meta
 
 
-def reextract_frame(video_path: str, out_path: Path, timestamp_seconds: float, resolution: int) -> bool:
-    """Re-extract a single frame at higher resolution (OCR hi-res upgrade).
+def reextract_frame(
+    video_path: str,
+    out_path: Path,
+    timestamp_seconds: float,
+    resolution: int,
+) -> bool:
+    """Re-extract a single frame at the given timestamp at a target width.
 
-    Seeks to the specified timestamp and extracts one frame at the given resolution.
-    Returns True if successful, False if the timestamp is out of bounds or extraction fails.
+    Used after OCR finds significant text on a 512px frame: re-pull that exact
+    moment at e.g. 1024px so Claude can actually read the on-screen text.
+    Overwrites `out_path` so the existing report's frame path stays valid.
     """
-    resolved = str(Path(video_path).resolve())
+    if shutil.which("ffmpeg") is None:
+        return False
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-ss", f"{timestamp_seconds:.3f}", "-i", resolved,
-        "-frames:v", "1", "-vf", _scale_filter(resolution),
-        "-q:v", "2", "-y", str(out_path),
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-ss", f"{max(0.0, timestamp_seconds):.3f}",
+        "-i", video_path,
+        "-frames:v", "1",
+        "-vf", _scale_filter(resolution),
+        "-q:v", "3",
+        str(out_path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
-        if proc.stderr:
-            print(f"[frames] re-extract failed at {timestamp_seconds:.1f}s: {proc.stderr.strip()}",
-                  file=sys.stderr)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        print(
+            f"[frames] re-extract failed at t={timestamp_seconds:.2f}s: "
+            f"{result.stderr.strip()}",
+            file=sys.stderr,
+        )
         return False
     return True
 
