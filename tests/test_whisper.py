@@ -175,7 +175,9 @@ def _fake_assemblyai(key="aai_k"):
     return mod
 
 
-def test_resolve_backend_auto_prefers_local(monkeypatch):
+def test_resolve_backend_auto_prefers_local(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setitem(sys.modules, "whisper_local", _fake_local(ok=True))
     monkeypatch.setenv("GROQ_API_KEY", "gsk_x")
     backend, key, hint = whisper.resolve_backend(None)
@@ -183,7 +185,9 @@ def test_resolve_backend_auto_prefers_local(monkeypatch):
     assert hint is None
 
 
-def test_resolve_backend_auto_falls_to_groq_without_gpu(monkeypatch):
+def test_resolve_backend_auto_falls_to_groq_without_gpu(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setitem(sys.modules, "whisper_local", _fake_local(ok=False, reason="no CUDA"))
     monkeypatch.setenv("GROQ_API_KEY", "gsk_x")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -194,6 +198,7 @@ def test_resolve_backend_auto_falls_to_groq_without_gpu(monkeypatch):
 
 def test_resolve_backend_auto_never_picks_assemblyai(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setitem(sys.modules, "whisper_local", _fake_local(ok=False, reason="no CUDA"))
     monkeypatch.setitem(sys.modules, "whisper_assemblyai", _fake_assemblyai())
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
