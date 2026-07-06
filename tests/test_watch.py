@@ -14,12 +14,30 @@ def _run(clip: Path, *args: str, env_extra: dict | None = None) -> str:
     env.pop("WATCH_DETAIL", None)
     if env_extra:
         env.update(env_extra)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     proc = subprocess.run(
         [sys.executable, str(WATCH), str(clip), "--no-whisper", *args],
         capture_output=True, text=True, env=env,
     )
     assert proc.returncode == 0, proc.stderr
     return proc.stdout
+
+
+def _run_raw(clip: Path, *args: str, env_extra: dict | None = None) -> subprocess.CompletedProcess:
+    """Same invocation as _run but without --no-whisper or a success assertion.
+
+    Returns the completed process so callers can assert on returncode/stderr
+    for the fork-flag validation paths (backend dispatch, question guards).
+    """
+    env = dict(os.environ)
+    env.pop("WATCH_DETAIL", None)
+    if env_extra:
+        env.update(env_extra)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return subprocess.run(
+        [sys.executable, str(WATCH), str(clip), *args],
+        capture_output=True, text=True, env=env,
+    )
 
 
 def test_efficient_uses_keyframe_engine(cut_clip: Path):
@@ -83,3 +101,27 @@ def test_no_dedup_preserves_static_frames(static_clip: Path):
     out = _run(static_clip, "--no-dedup")
     assert "near-duplicate" not in out
     assert _frame_lines(out) > 1
+
+
+def test_gemini_backend_requires_question(cut_clip: Path, tmp_path: Path):
+    proc = _run_raw(cut_clip, "--backend", "gemini", "--out-dir", str(tmp_path))
+    assert proc.returncode != 0
+    assert "question" in (proc.stderr + proc.stdout).lower()
+
+
+def test_unknown_backend_rejected(cut_clip: Path, tmp_path: Path):
+    proc = _run_raw(cut_clip, "--backend", "bogus", "--out-dir", str(tmp_path))
+    assert proc.returncode != 0
+
+
+def test_claude_backend_default_pipeline_unchanged(cut_clip: Path, tmp_path: Path):
+    # upstream flow must keep working with zero fork flags
+    proc = _run_raw(cut_clip, "--no-whisper", "--no-ocr", "--out-dir", str(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    assert "# watch: video report" in proc.stdout
+
+
+def test_no_ocr_and_scene_threshold_accepted(cut_clip: Path, tmp_path: Path):
+    proc = _run_raw(cut_clip, "--no-whisper", "--no-ocr", "--no-scene-detect",
+                    "--scene-threshold", "30", "--no-two-pass", "--out-dir", str(tmp_path))
+    assert proc.returncode == 0, proc.stderr
