@@ -68,3 +68,16 @@ def test_scene_fallback_on_static_clip(static_clip: Path, tmp_path: Path):
     )
     assert meta["engine"] == "uniform"
     assert meta["fallback"] is True
+
+
+def test_reextract_frame_produces_higher_res(cut_clip: Path, tmp_path: Path):
+    out = tmp_path / "hires.jpg"
+    ok = frames.reextract_frame(str(cut_clip), out, 1.0, resolution=640)
+    assert ok is True
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_reextract_frame_bad_timestamp_returns_false(cut_clip: Path, tmp_path: Path):
+    out = tmp_path / "nope.jpg"
+    ok = frames.reextract_frame(str(cut_clip), out, 99999.0, resolution=640)
+    assert ok is False
