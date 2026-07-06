@@ -78,3 +78,14 @@ def test_key_present_is_ready(tmp_path):
     assert js["status"] == "ready"
     assert js["can_proceed"] is True
     assert js["whisper_backend"] == "groq"
+
+
+def test_scaffolded_env_mentions_all_backends(tmp_path):
+    """The installer must scaffold a template mentioning all backend API keys."""
+    proc = _run([], home=tmp_path)
+    env_file = tmp_path / ".config" / "watch" / ".env"
+    assert env_file.exists(), f"scaffolded env file does not exist at {env_file}"
+    content = env_file.read_text(encoding="utf-8")
+    for key in ("GROQ_API_KEY", "OPENAI_API_KEY", "ASSEMBLYAI_API_KEY",
+                "GEMINI_API_KEY", "OPENROUTER_API_KEY"):
+        assert key in content, f"missing {key} stanza in scaffolded .env"
