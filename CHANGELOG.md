@@ -2,6 +2,30 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.3.0] — 2026-07-06
+
+### Changed
+- Rebased the fork onto upstream 0.2.0: `skills/watch/` self-contained Agent
+  Skills layout, detail levels (`WATCH_DETAIL`), perceptual frame dedup,
+  Whisper auto-chunking, transcript-cue frames, and the upstream pytest suite.
+- `/watch` slash command now comes from SKILL.md frontmatter (no `commands/`
+  wrapper); scripts resolve via `${SKILL_DIR}`.
+- Transcript resolution (captions → Whisper) now runs fully **before** frame
+  extraction, not just for caption-bearing URLs — so two-pass speech-aware
+  sampling is available for local files and Whisper-only transcripts too, not
+  only videos with native captions.
+
+### Added (re-ported fork features)
+- Multi-backend: `--backend claude|gemini|openrouter` (Gemini native video incl.
+  YouTube pass-through; OpenRouter vision + audio with qwen3-asr → voxtral →
+  groq fallback chain).
+- Transcription backends: `--whisper local` (faster-whisper GPU) and
+  `--whisper assemblyai` (+ `--diarize` speaker labels).
+- Two-pass speech-aware frame sampling (`--two-pass`, default on),
+  PySceneDetect option (`--scene-threshold`), OCR pass with hi-res re-extract
+  (`--no-ocr` to skip), external audio track via `--audio`.
+- cp1252-tolerant config reads; UTF-8 stdout/stderr on Windows.
+
 ## [0.2.0] — 2026-06-29
 
 ### Added
