@@ -15,6 +15,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
 
 MAX_FPS = 2.0
 SCENE_THRESHOLD = 0.20

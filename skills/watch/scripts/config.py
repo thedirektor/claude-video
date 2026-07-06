@@ -21,7 +21,7 @@ def read_env_file(path: Path | None = None) -> dict[str, str]:
     if not path.exists():
         return values
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return values
     for line in lines:
