@@ -21,6 +21,11 @@ from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, ext
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
 
 def main() -> int:
     ap = argparse.ArgumentParser(

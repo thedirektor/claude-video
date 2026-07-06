@@ -35,3 +35,10 @@ def test_frame_cap_mapping():
     assert config.frame_cap("token-burner") is None
     assert config.frame_cap("transcript") is None
     assert config.frame_cap("anything-else") == 100
+
+
+def test_read_env_file_tolerates_cp1252_bytes(tmp_path):
+    env = tmp_path / ".env"
+    env.write_bytes(b"GROQ_API_KEY=gsk_test\x97key\n")  # \x97 = cp1252 em dash, invalid UTF-8
+    values = config.read_env_file(env)
+    assert values["GROQ_API_KEY"].startswith("gsk_test")

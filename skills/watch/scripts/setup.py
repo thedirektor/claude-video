@@ -31,6 +31,11 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from config import get_config  # noqa: E402
 
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
 
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
 CONFIG_DIR = Path.home() / ".config" / "watch"
@@ -97,7 +102,7 @@ def _read_env_key(name: str) -> str | None:
         return None
     _check_file_permissions(CONFIG_FILE)
     try:
-        for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+        for line in CONFIG_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -148,7 +153,7 @@ def _write_setup_complete() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     existing = ""
     if CONFIG_FILE.exists():
-        existing = CONFIG_FILE.read_text(encoding="utf-8")
+        existing = CONFIG_FILE.read_text(encoding="utf-8", errors="replace")
         for line in existing.splitlines():
             if line.strip().startswith("SETUP_COMPLETE="):
                 return
