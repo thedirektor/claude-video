@@ -1,0 +1,161 @@
+name: Smoke test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  static:
+    name: Static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: JSON configs parse
+        run: |
+          python -c "import json; json.load(open('.claude-plugin/plugin.json'))"
+          python -c "import json; json.load(open('.claude-plugin/marketplace.json'))"
+          python -c "import json; json.load(open('.codex-plugin/plugin.json'))"
+          python -c "import json; json.load(open('hooks/hooks.json'))"
+
+      - name: allowed-tools uses bare-list, not YAML inline-list
+        run: |
+          if grep -lE '^allowed-tools:[[:space:]]*\[' skills/watch/SKILL.md 2>/dev/null; then
+            echo "::error::YAML inline-list syntax breaks slash-command registration (upstream issue #6)"
+            exit 1
+          fi
+
+      - name: version in sync across plugin.json (x2), SKILL.md frontmatter, and CHANGELOG top entry
+        run: |
+          CPV=$(python -c "import json; print(json.load(open('.claude-plugin/plugin.json'))['version'])")
+          XPV=$(python -c "import json; print(json.load(open('.codex-plugin/plugin.json'))['version'])")
+          SPV=$(python -c "
+          import re
+          text = open('skills/watch/SKILL.md', encoding='utf-8').read()
+          fm = text.split('---')[1]
+          m = re.search(r'^version:\s*\"?([0-9]+\.[0-9]+\.[0-9]+)\"?', fm, re.MULTILINE)
+          print(m.group(1))
+          ")
+          CV=$(grep -oE '## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | head -1 | tr -d '[]' | awk '{print $2}')
+          echo "claude-plugin=$CPV codex-plugin=$XPV skill-md=$SPV changelog=$CV"
+          if [ "$CPV" != "$CV" ] || [ "$XPV" != "$CV" ] || [ "$SPV" != "$CV" ]; then
+            echo "::error::version mismatch — .claude-plugin/plugin.json=$CPV, .codex-plugin/plugin.json=$XPV, SKILL.md=$SPV, CHANGELOG top entry=$CV"
+            exit 1
+          fi
+          echo "version=$CV"
+
+      - name: Compile all Python scripts
+        run: python -m py_compile skills/watch/scripts/*.py
+
+  pipeline:
+    name: Pipeline (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+
+      - name: setup.py --check on a clean machine (expect 0 or 3)
+        shell: bash
+        run: |
+          set +e
+          python skills/watch/scripts/setup.py --check
+          rc=$?
+          if [ "$rc" -ne 3 ] && [ "$rc" -ne 0 ]; then
+            echo "::error::setup.py --check exit=$rc (expected 0=ready or 3=key-missing)"
+            exit 1
+          fi
+          echo "setup.py --check exit=$rc"
+
+      - name: Regression guard — legacy cp1252 .env must not crash setup.py
+        shell: bash
+        run: |
+          python -c "from pathlib import Path; p=Path.home()/'.config'/'watch'/'.env'; p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(b'# legacy file \x97 em-dash\nGROQ_API_KEY=ci-smoke-test\n')"
+          OUT=$(python skills/watch/scripts/setup.py --json)
+          echo "$OUT"
+          echo "$OUT" | python -c "import json,sys; d=json.load(sys.stdin); assert d['has_api_key'], d; assert d['whisper_backend']=='groq', d"
+
+      - name: Synthesize test video (3s color bars + tone)
+        shell: bash
+        run: |
+          ffmpeg -hide_banner -loglevel error \
+            -f lavfi -i "testsrc=duration=3:size=320x240:rate=10" \
+            -f lavfi -i "sine=frequency=440:duration=3" \
+            -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -y test.mp4
+
+      - name: Run watch.py against test video (frames-only)
+        shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python skills/watch/scripts/watch.py test.mp4 "smoke test" \
+            --no-whisper --no-ocr --no-scene-detect \
+            --max-frames 3 --out-dir watch-out
+          test -d watch-out
+
+  tests:
+    name: Pytest suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run suite
+        run: python3 -m pytest -q
+
+  build:
+    name: Build .skill artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build .skill
+        run: bash skills/watch/scripts/build-skill.sh
+      - name: Verify artifact
+        run: test -f dist/watch.skill
+      - name: Upload .skill artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-skill-${{ github.sha }}
+          path: dist/watch.skill
+          retention-days: 14
