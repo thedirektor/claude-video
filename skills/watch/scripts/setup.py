@@ -57,6 +57,15 @@ ENV_TEMPLATE = """# /watch API configuration
 GROQ_API_KEY=
 OPENAI_API_KEY=
 
+# Optional: AssemblyAI for speaker diarization (--whisper assemblyai).
+# ASSEMBLYAI_API_KEY=
+
+# Optional: Gemini native-video backend (--backend gemini).
+# GEMINI_API_KEY=
+
+# Optional: OpenRouter backend (--backend openrouter) and audio transcription.
+# OPENROUTER_API_KEY=
+
 # Default watch behavior (the /watch first-run wizard sets this for you).
 # Allowed values: transcript | efficient | balanced | token-burner
 # Keep the value on its own line with no trailing comment.
@@ -281,7 +290,7 @@ def cmd_check() -> int:
     if s["missing_binaries"]:
         parts.append(f"missing binaries: {', '.join(s['missing_binaries'])}")
     if not s["has_api_key"] and not s["setup_complete"]:
-        parts.append("no Whisper API key (GROQ_API_KEY or OPENAI_API_KEY)")
+        parts.append("no Whisper API key (GROQ_API_KEY or OPENAI_API_KEY; or use --whisper local or --backend gemini/openrouter)")
     installer = Path(__file__).resolve()
     sys.stderr.write(
         f"[watch] setup incomplete ({'; '.join(parts)}). "
@@ -345,11 +354,16 @@ def cmd_install() -> int:
         return 0
 
     print("")
-    print("[setup] one step left: add a Whisper API key.")
+    print("[setup] one step left: add a Whisper API key (or use keyless alternatives).")
     print("")
     print(f"  Edit {CONFIG_FILE} and set either:")
     print("    GROQ_API_KEY=...    (preferred — cheaper, faster; get one at console.groq.com/keys)")
     print("    OPENAI_API_KEY=...  (fallback; get one at platform.openai.com/api-keys)")
+    print("")
+    print("  Or use keyless options:")
+    print("    --whisper local     (transcribe audio locally without an API key)")
+    print("    --backend gemini    (Google Gemini native-video, requires GEMINI_API_KEY)")
+    print("    --backend openrouter (OpenRouter multimodal, requires OPENROUTER_API_KEY)")
     print("")
     print("  Without a key, /watch still works but videos without captions come back frames-only.")
     return 3
