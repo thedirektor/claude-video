@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import math
 import subprocess
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -155,3 +157,59 @@ class TestTranscribeChunks:
 
         with pytest.raises(SystemExit):
             whisper.transcribe_chunks(chunks, always_fail)
+
+
+def _fake_local(ok=True, reason=""):
+    mod = types.ModuleType("whisper_local")
+    mod.is_available = lambda: (ok, reason)
+    mod.INSTALL_HINT = "pip install faster-whisper"
+    mod.DEFAULT_MODEL = "large-v3"
+    mod.VALID_MODELS = ("tiny", "large-v3")
+    return mod
+
+
+def _fake_assemblyai(key="aai_k"):
+    mod = types.ModuleType("whisper_assemblyai")
+    mod.load_api_key = lambda: key
+    mod.INSTALL_HINT = "pip install assemblyai"
+    return mod
+
+
+def test_resolve_backend_auto_prefers_local(monkeypatch):
+    monkeypatch.setitem(sys.modules, "whisper_local", _fake_local(ok=True))
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_x")
+    backend, key, hint = whisper.resolve_backend(None)
+    assert backend == "local"
+    assert hint is None
+
+
+def test_resolve_backend_auto_falls_to_groq_without_gpu(monkeypatch):
+    monkeypatch.setitem(sys.modules, "whisper_local", _fake_local(ok=False, reason="no CUDA"))
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_x")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    backend, key, hint = whisper.resolve_backend(None)
+    assert backend == "groq"
+    assert key == "gsk_x"
+
+
+def test_resolve_backend_auto_never_picks_assemblyai(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "whisper_local", _fake_local(ok=False, reason="no CUDA"))
+    monkeypatch.setitem(sys.modules, "whisper_assemblyai", _fake_assemblyai())
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    backend, key, hint = whisper.resolve_backend(None)
+    assert backend is None  # paid diarization is opt-in only
+
+
+def test_resolve_backend_explicit_assemblyai(monkeypatch):
+    monkeypatch.setitem(sys.modules, "whisper_assemblyai", _fake_assemblyai(key="aai_k"))
+    backend, key, hint = whisper.resolve_backend("assemblyai")
+    assert (backend, key) == ("assemblyai", "aai_k")
+
+
+def test_resolve_backend_explicit_missing_key_gives_hint(monkeypatch):
+    monkeypatch.setitem(sys.modules, "whisper_assemblyai", _fake_assemblyai(key=None))
+    backend, key, hint = whisper.resolve_backend("assemblyai")
+    assert backend is None
+    assert hint  # actionable message

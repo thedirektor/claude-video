@@ -117,6 +117,94 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
     return None, None
 
 
+def resolve_backend(
+    preferred: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Pick a Whisper backend across local / groq / openai.
+
+    Returns (backend, api_key, error_hint).
+      - For 'local', api_key is None.
+      - When (None, None, hint) is returned, no backend is usable.
+
+    If `preferred` is set, that backend is required:
+      - 'local'      → must have faster-whisper + a CUDA GPU available
+      - 'groq'       → must have GROQ_API_KEY
+      - 'openai'     → must have OPENAI_API_KEY
+      - 'assemblyai' → must have ASSEMBLYAI_API_KEY (paid; speaker diarization)
+    No silent fallback to a different backend when the user asked for one.
+
+    If `preferred` is None, auto-select with priority:
+      1. 'local'  (if faster-whisper imports and a CUDA GPU is reachable)
+      2. 'groq'   (if GROQ_API_KEY is set)
+      3. 'openai' (if OPENAI_API_KEY is set)
+    AssemblyAI is intentionally excluded from auto-pick because it's paid
+    and only adds value when you specifically want speaker diarization.
+    """
+    # Make sure sibling modules (whisper_local, whisper_assemblyai) are
+    # importable when whisper.py is imported standalone. watch.py already
+    # inserts scripts/ on sys.path, but doing it here too keeps direct CLI
+    # use of whisper.py honest.
+    sys.path.insert(0, str(Path(__file__).parent))
+
+    if preferred == "local":
+        try:
+            from whisper_local import is_available, INSTALL_HINT
+        except ImportError as exc:
+            return None, None, (
+                f"--whisper local was set but whisper_local module is unavailable: {exc}"
+            )
+        ok, reason = is_available()
+        if ok:
+            return "local", None, None
+        return None, None, (
+            f"--whisper local was set but it can't run: {reason}\n{INSTALL_HINT}"
+        )
+
+    if preferred == "assemblyai":
+        try:
+            from whisper_assemblyai import (
+                load_api_key as _aai_load_key,
+                INSTALL_HINT as AAI_INSTALL_HINT,
+            )
+        except ImportError as exc:
+            return None, None, (
+                f"--whisper assemblyai was set but whisper_assemblyai module is unavailable: {exc}"
+            )
+        key = _aai_load_key()
+        if key:
+            return "assemblyai", key, None
+        return None, None, (
+            "--whisper assemblyai was set but ASSEMBLYAI_API_KEY is missing.\n"
+            + AAI_INSTALL_HINT
+        )
+
+    if preferred in ("groq", "openai"):
+        backend, key = load_api_key(preferred)
+        if backend and key:
+            return backend, key, None
+        return None, None, (
+            f"--whisper {preferred} was set but the matching API key is missing"
+        )
+
+    # Auto-select. Try local first (no API call, no upload).
+    try:
+        from whisper_local import is_available
+        ok, _ = is_available()
+        if ok:
+            return "local", None, None
+    except ImportError:
+        pass  # faster-whisper not installed → fall through to API backends
+
+    backend, key = load_api_key()
+    if backend and key:
+        return backend, key, None
+
+    return None, None, (
+        "no Whisper backend available — no local GPU + faster-whisper, "
+        "and neither GROQ_API_KEY nor OPENAI_API_KEY is set"
+    )
+
+
 def extract_audio(video_path: str, out_path: Path) -> Path:
     """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit."""
     if shutil.which("ffmpeg") is None:
@@ -421,11 +509,52 @@ def transcribe_video(
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
+    model_name: str | None = None,
+    enable_diarization: bool = False,
 ) -> tuple[list[dict], str]:
-    """Run the full flow: extract audio → upload → parse segments.
+    """Run the full flow: extract audio → transcribe (local/API) → parse segments.
 
     Returns (segments, backend_used). Raises SystemExit on any failure.
+
+    Per-backend notes:
+      - local:       runs faster-whisper on the extracted mono 16 kHz mp3;
+                     `model_name` selects the faster-whisper model (defaults
+                     to whisper_local.DEFAULT_MODEL).
+      - assemblyai:  uploads the extracted mp3 to AssemblyAI; `enable_diarization`
+                     toggles speaker labels on the returned segments.
+      - groq/openai: upstream's existing size-check -> plan_chunks -> split_audio
+                     -> transcribe_chunks flow, untouched.
     """
+    if backend is None:
+        backend, api_key, hint = resolve_backend(None)
+        if backend is None:
+            raise SystemExit(hint or "No Whisper backend available. Run setup.py")
+
+    print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
+    audio_path = extract_audio(video_path, audio_out)
+
+    if backend == "local":
+        sys.path.insert(0, str(Path(__file__).parent))
+        from whisper_local import DEFAULT_MODEL, transcribe_local
+
+        segments = transcribe_local(audio_path, model_name=model_name or DEFAULT_MODEL)
+        if not segments:
+            raise SystemExit("Whisper returned no transcript segments")
+        print(f"[watch] transcribed {len(segments)} segments via local", file=sys.stderr)
+        return segments, "local"
+
+    if backend == "assemblyai":
+        sys.path.insert(0, str(Path(__file__).parent))
+        from whisper_assemblyai import transcribe_assemblyai
+
+        segments = transcribe_assemblyai(audio_path, enable_diarization=enable_diarization)
+        if not segments:
+            raise SystemExit("Whisper returned no transcript segments")
+        print(f"[watch] transcribed {len(segments)} segments via assemblyai", file=sys.stderr)
+        return segments, "assemblyai"
+
+    # groq / openai: keep upstream's existing size-check -> plan_chunks ->
+    # split_audio -> transcribe_chunks flow EXACTLY as-is from here down.
     if backend is None or api_key is None:
         detected_backend, detected_key = load_api_key()
         backend = backend or detected_backend
@@ -439,8 +568,6 @@ def transcribe_video(
             f"Run `python3 {setup_py}` to configure."
         )
 
-    print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
-    audio_path = extract_audio(video_path, audio_out)
     audio_bytes = audio_path.stat().st_size
 
     def transcribe_one(path: Path) -> list[dict]:
