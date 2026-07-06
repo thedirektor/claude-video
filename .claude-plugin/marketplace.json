@@ -1,21 +1,21 @@
 {
   "name": "claude-video",
   "metadata": {
-    "description": "Give Claude a video input. /watch downloads, extracts frames, transcribes, and hands it all to Claude."
+    "description": "Give Claude a video input. /watch downloads, extracts frames (scene detection + OCR), transcribes via captions or Whisper (local GPU, Groq, OpenAI, or AssemblyAI diarization), and hands it all to Claude — or routes the whole video through a Gemini or OpenRouter backend."
   },
   "owner": {
-    "name": "Bradley Bonanno"
+    "name": "thedirektor"
   },
   "plugins": [
     {
       "name": "watch",
-      "description": "Watch a video (URL or local path). Downloads with yt-dlp, extracts frames with ffmpeg, transcribes via captions or Whisper.",
+      "description": "Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts frames with ffmpeg (scene detection + OCR), transcribes via captions or Whisper (local, Groq, OpenAI, or AssemblyAI diarization).",
       "author": {
-        "name": "Bradley Bonanno"
+        "name": "thedirektor"
       },
       "source": "./",
       "category": "productivity",
-      "homepage": "https://github.com/bradautomates/claude-video"
+      "homepage": "https://github.com/thedirektor/claude-video"
     }
   ]
 }

@@ -4,25 +4,25 @@
 
 Claude Code (recommended — auto-updates via marketplace):
 ```
-/plugin marketplace add bradautomates/claude-video
+/plugin marketplace add thedirektor/claude-video
 /plugin install watch@claude-video
 ```
 
 Codex, Cursor, Copilot, Gemini CLI, or any of 50+ [Agent Skills](https://agentskills.io) hosts:
 ```bash
-npx skills add bradautomates/claude-video -g
+npx skills add thedirektor/claude-video -g
 ```
 (`-g` installs globally for your user, available across all projects. Drop it to scope per-project.)
 
 More install options (claude.ai web, manual) in the [Install](#install) section below.
 
-Zero config to start — `yt-dlp` and `ffmpeg` install on first run via `brew` on macOS (Linux/Windows print exact commands). Captions cover most public videos for free. Whisper API key is only needed when a video has no captions.
+Zero config to start — `yt-dlp` and `ffmpeg` install on first run via `brew` on macOS (Linux/Windows print exact commands). Captions cover most public videos for free. Whisper API key is only needed when a video has no captions and you don't have a local GPU (see [Local Whisper](#local-whisper-faster-whisper-on-gpu)).
 
 ---
 
 Claude can read a webpage, run a script, browse a repo. What it can't do, out of the box, is *watch a video*. You paste a YouTube link and it has to either guess from the title or pull a transcript that's missing 90% of what's on screen.
 
-With Claude Video `/watch` you can paste a URL or a local path, ask a question, and Claude fetches captions first, downloads only what it needs, extracts frames (scene-aware, or fast keyframes at `efficient` detail), pulls a timestamped transcript (free captions when available, Whisper API as fallback), and `Read`s every frame as an image. By the time it answers, it has *seen* the video and *heard* the audio.
+With Claude Video `/watch` you can paste a URL or a local path, ask a question, and Claude fetches captions first, downloads only what it needs, extracts frames (scene-aware, or fast keyframes at `efficient` detail), pulls a timestamped transcript (free captions when available, Whisper API or local GPU as fallback), and `Read`s every frame as an image. By the time it answers, it has *seen* the video and *heard* the audio. Prefer a hosted model instead of Claude doing the reasoning? `--backend gemini` or `--backend openrouter` route the whole job to Gemini's native video understanding or an OpenRouter vision model — see [Backends](#backends) below.
 
 ```
 /watch https://youtu.be/dQw4w9WgXcQ what happens at the 30 second mark?
@@ -49,6 +49,25 @@ With Claude Video `/watch` you can paste a URL or a local path, ask a question, 
 5. **Frames + transcript are handed to Claude.** The script prints frame paths with `t=MM:SS` markers and the transcript with timestamps. Claude `Read`s each frame in parallel — JPEGs render directly as images in its context.
 6. **Claude answers grounded in what's actually on screen and in the audio.** Not "based on the description" or "according to the title." It saw the frames. It heard the transcript. It answers the way someone who watched the video would.
 7. **Cleanup.** The script prints a working directory at the end. If you're not asking follow-ups, Claude removes it.
+
+## Backends
+
+The default `--backend claude` is everything described above — frames + transcript handed to Claude to reason over in your conversation. Two alternate backends skip that and hand the job to a hosted multimodal model directly, printing its response instead:
+
+| Backend | What happens | Best for |
+|---------|--------------|----------|
+| `claude` *(default)* | Local pipeline above; Claude `Read`s the frames. | Follow-up questions, comparing against prior context, anything conversational. |
+| `gemini` | Skips frame extraction, OCR, and Whisper — hands the whole video (or a YouTube URL, fetched server-side) to Gemini's native video model. | One-shot full-video analysis on long videos ("summarize this 30-minute keynote"). |
+| `openrouter` | Runs the same local frame + transcript pipeline as `claude`, then POSTs base64 frames + transcript to an OpenRouter vision model. | Routing analysis through a specific OpenRouter-hosted model. |
+
+`gemini` and `openrouter` need the question passed as a trailing argument, since there's no follow-up turn for them to read it from:
+
+```bash
+/watch https://youtu.be/abc --backend gemini "Summarize this"
+/watch video.mp4 --backend openrouter "What's on screen at the end?"
+```
+
+`--gemini-model` picks between `gemini-3.1-flash-lite` (default), `gemini-2.5-flash`, and `gemini-2.5-pro`. `--openrouter-vision-model` / `--openrouter-audio-model` override OpenRouter's defaults (`google/gemini-2.5-flash` for vision, `qwen/qwen3-asr-flash-2026-02-10` for audio, which falls back to `mistralai/voxtral-mini-transcribe` and then Groq if it fails). `GEMINI_API_KEY` / `OPENROUTER_API_KEY` go in `~/.config/watch/.env` alongside the Whisper keys.
 
 ## Frame budget — why it matters
 
@@ -99,15 +118,15 @@ End-to-end from a cold URL, `transcript` is the cheapest mode by far; the frame 
 
 | Surface | Install |
 |---------|---------|
-| **Claude Code** | `/plugin marketplace add bradautomates/claude-video` then `/plugin install watch@claude-video` |
-| **Codex, Cursor, Copilot, Gemini CLI, +50 more** | `npx skills add bradautomates/claude-video -g` |
-| **claude.ai** (web) | [Download `watch.skill`](https://github.com/bradautomates/claude-video/releases/latest) → Settings → Capabilities → Skills → `+` |
+| **Claude Code** | `/plugin marketplace add thedirektor/claude-video` then `/plugin install watch@claude-video` |
+| **Codex, Cursor, Copilot, Gemini CLI, +50 more** | `npx skills add thedirektor/claude-video -g` |
+| **claude.ai** (web) | [Download `watch.skill`](https://github.com/thedirektor/claude-video/releases/latest) → Settings → Capabilities → Skills → `+` |
 | **Manual / dev** | `git clone` then symlink `skills/watch` into your host's skills dir (see below) |
 
 ### Claude Code
 
 ```
-/plugin marketplace add bradautomates/claude-video
+/plugin marketplace add thedirektor/claude-video
 /plugin install watch@claude-video
 ```
 
@@ -118,7 +137,7 @@ Update later with `/plugin update watch@claude-video`.
 The [Agent Skills](https://agentskills.io) CLI installs the skill into whatever agents it detects:
 
 ```bash
-npx skills add bradautomates/claude-video -g
+npx skills add thedirektor/claude-video -g
 ```
 
 `-g` installs globally for your user (`~/.codex/skills`, `~/.cursor/skills`, etc.); drop it to install into the current project instead. Useful flags:
@@ -133,7 +152,7 @@ Update later with `npx skills update watch -g`.
 
 ### claude.ai (web)
 
-1. [Download `watch.skill`](https://github.com/bradautomates/claude-video/releases/latest) from the latest release.
+1. [Download `watch.skill`](https://github.com/thedirektor/claude-video/releases/latest) from the latest release.
 2. Go to Settings → Capabilities → Skills.
 3. Click `+` and drop the file in.
 
@@ -144,7 +163,7 @@ Enable "Code execution and file creation" under Capabilities first — the skill
 Clone the repo and symlink the self-contained skill folder into your host's skills directory — the symlink keeps the install in sync with your working tree as you edit:
 
 ```bash
-git clone https://github.com/bradautomates/claude-video.git
+git clone https://github.com/thedirektor/claude-video.git
 ln -s "$(pwd)/claude-video/skills/watch" ~/.claude/skills/watch   # or ~/.codex/skills/watch
 ```
 
@@ -157,7 +176,7 @@ On the first `/watch` call, the skill runs `scripts/setup.py --check`. If `ffmpe
 - **macOS** — auto-runs `brew install ffmpeg yt-dlp`.
 - **Linux** — prints the exact `apt` / `dnf` / `pipx` commands.
 - **Windows** — prints the `winget` / `pip` commands.
-- **API key** — scaffolds `~/.config/watch/.env` (mode `0600`) with commented placeholders for `GROQ_API_KEY` (preferred) and `OPENAI_API_KEY`.
+- **API key** — scaffolds `~/.config/watch/.env` (mode `0600`) with commented placeholders for `GROQ_API_KEY` (preferred) and `OPENAI_API_KEY`, plus optional `ASSEMBLYAI_API_KEY`, `GEMINI_API_KEY`, and `OPENROUTER_API_KEY` for diarization and the hosted backends.
 
 After setup, preflight is silent and `/watch` just works. The check is a sub-100ms lookup, so it doesn't slow you down on subsequent runs.
 
@@ -170,7 +189,27 @@ Captions cover the majority of public videos for free. The Whisper fallback only
 | Download + native captions | `yt-dlp` + `ffmpeg` | Free |
 | Whisper fallback (preferred) | [Groq API key](https://console.groq.com/keys) — `whisper-large-v3` | Cheap, fast |
 | Whisper fallback (alt) | [OpenAI API key](https://platform.openai.com/api-keys) — `whisper-1` | Standard pricing |
+| Whisper fallback (local) | NVIDIA GPU + `faster-whisper` — `--whisper local` | Free, no upload — see [Local Whisper](#local-whisper-faster-whisper-on-gpu) |
+| Speaker diarization | [AssemblyAI API key](https://www.assemblyai.com/) — `--whisper assemblyai --diarize` | ~$0.37/hr, $50 free credits |
+| `--backend gemini` | [Gemini API key](https://aistudio.google.com/apikey) | Free tier available |
+| `--backend openrouter` | [OpenRouter API key](https://openrouter.ai/keys) | Pay-per-model |
 | Disable Whisper entirely | `--no-whisper` | Free, frames-only when no captions |
+
+## Local Whisper (faster-whisper on GPU)
+
+`--whisper local` runs [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + CTranslate2 directly on an NVIDIA GPU — no API call, no 25 MB upload cap, no rate limit. Tested at ~13× realtime on an RTX 2080 Ti with `large-v3`.
+
+```bash
+pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12
+```
+
+Auto-selection tries `local` first, then falls back to Groq, then OpenAI (AssemblyAI is never auto-picked). Pick a smaller model with `--whisper-model tiny|base|small|medium|large-v2|large-v3` (default `large-v3`, needs ~10 GB VRAM) if you're on a lower-VRAM card or want faster turnaround on clean audio. On Windows, DLL discovery for cuBLAS/cuDNN is automatic (`whisper_local.py` registers the wheel paths at import time) — no manual `PATH` edits for a standard `pip install`. Verify the install with:
+
+```bash
+python -c "import ctranslate2; print('CUDA devices:', ctranslate2.get_cuda_device_count())"
+```
+
+If faster-whisper or a GPU isn't available, `--whisper local` in auto mode falls through silently to Groq/OpenAI; forcing it (`--whisper local`) hard-errors with the install hint instead.
 
 ## Usage
 
@@ -190,20 +229,48 @@ Focused on a specific section — denser frame budget, lower token cost:
 
 Other knobs (passed to `scripts/watch.py`):
 
+**Backend**
+- `--backend claude|gemini|openrouter` — pick the orchestrator (default `claude`). See [Backends](#backends).
+- `--gemini-model NAME` / `--openrouter-vision-model NAME` / `--openrouter-audio-model NAME` — override the default model for the chosen hosted backend.
+
+**Range / budget**
 - `--detail transcript|efficient|balanced|token-burner` — fidelity/speed dial. `transcript` skips frames (transcript only); `efficient` uses fast keyframes (cap 50); `balanced` uses scene-aware frames (cap 100); `token-burner` is scene-aware and uncapped.
 - `--timestamps T1,T2,…` — grab a frame at each absolute timestamp (`SS`/`MM:SS`/`HH:MM:SS`). Claude reads the transcript first, then targets the moments the presenter flags ("look here", "as you can see"). Added on top of the detail frames (reserved against the cap); out-of-window cues are dropped in focus mode; with `--detail transcript` these become the only frames.
 - `--max-frames N` — lower the frame cap for a tighter token budget.
 - `--resolution W` — bump frame width to 1024 px when Claude needs to read on-screen text (slides, terminals, code).
-- `--fps F` — override the auto-fps calculation (still capped at 2 fps).
-- `--whisper groq|openai` — force a specific Whisper backend.
-- `--no-whisper` — disable transcription entirely; frames only.
-- `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the one before them (held slides, static screen recordings, paused video), so the frame budget is spent on distinct content; this flag turns that off.
+- `--fps F` — override the auto-fps calculation (still capped at 2 fps); disables two-pass speech-aware sampling.
 - `--out-dir DIR` — keep working files somewhere specific (default: auto-generated tmp dir).
+
+**Frame sampling**
+- `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the one before them (held slides, static screen recordings, paused video), so the frame budget is spent on distinct content; this flag turns that off.
+- `--no-scene-detect` — skip PySceneDetect when computing scene boundaries for two-pass sampling (even spacing instead). Doesn't affect the `balanced`/`token-burner` detail engines' own scene-cut detection.
+- `--scene-threshold F` — PySceneDetect cut-detection threshold for two-pass (default `27.0`; lower = more cuts).
+- `--two-pass` / `--no-two-pass` — distribute frames 70/30 across speech vs. silent windows from the transcript. Default on whenever a timed transcript is available (captions or Whisper, local files included — transcript resolution now runs before frame extraction).
+
+**Audio / transcription**
+- `--audio FILE` — transcribe a separate audio file (e.g. a muted video's ElevenLabs voiceover) instead of the video's own track.
+- `--whisper groq|openai|local|assemblyai` — force a specific Whisper backend. `local` runs faster-whisper on your GPU; `assemblyai` adds speaker diarization. Default: auto-pick `local` if available, else `groq`, else `openai`.
+- `--whisper-model NAME` — faster-whisper model size for `--whisper local` (`tiny|base|small|medium|large-v2|large-v3`, default `large-v3`).
+- `--diarize` / `--no-diarize` — speaker labels on AssemblyAI transcripts (default on).
+- `--no-whisper` — disable transcription entirely; frames only.
+
+**OCR**
+- `--no-ocr` — skip the Tesseract OCR pass (default `spa+eng`) and the hi-res re-extract it triggers on text-heavy frames.
 
 ## Limits
 
 - **Long-video accuracy depends on the detail mode.** On the capped modes (`efficient`, default `balanced`) coverage thins out past ~10 minutes — the frame cap spreads across the whole clip, so the script prints a "sparse scan" warning and you're better off re-running focused with `--start`/`--end`. `token-burner` lifts the cap and keeps *every* scene-change frame across the full video, so it stays complete on longer clips at the cost of more image tokens. The 10-minute mark is guidance for the capped modes, not a hard ceiling.
 - **Detail is one dial.** Defaults are balanced: scene-aware frames, 2 fps max, 100-frame cap. Use `--detail efficient` for a fast 50-frame keyframe pass, or `--detail token-burner` for uncapped scene candidates. Set `WATCH_DETAIL` in `~/.config/watch/.env` to change the default.
+
+## Windows
+
+Tested on **Windows 11 + Python 3.14** (including the Bash tool's PowerShell shell):
+
+- Every script reconfigures `stdout`/`stderr` to UTF-8 at startup, so Spanish transcripts, em-dashes, and accented filenames don't crash a cp1252 console.
+- Use `python`, not `python3` — `python3` on Windows typically resolves to the Microsoft Store stub.
+- OCR needs Tesseract installed separately (`winget install UB-Mannheim.TesseractOCR`); default path is `C:\Program Files\Tesseract-OCR`, which must be on `PATH`. The Mannheim installer bundles the `spa` language pack used by default.
+- `--whisper local` DLL discovery (cuBLAS/cuDNN) is automatic — no manual `PATH` editing for a standard `pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12`.
+- If a yt-dlp download hits "filename too long", enable Win32 long paths via Group Policy or pass `--out-dir` to a short path like `D:\w`.
 
 ## Structure
 
@@ -214,9 +281,16 @@ Other knobs (passed to `scripts/watch.py`):
 │   └── scripts/
 │       ├── watch.py              # entry point — orchestrates download → frames → transcript
 │       ├── download.py           # yt-dlp wrapper
-│       ├── frames.py             # ffmpeg frame extraction + auto-fps logic
-│       ├── transcribe.py         # VTT parsing + dedupe + Whisper orchestration
-│       ├── whisper.py            # Groq / OpenAI clients (pure stdlib)
+│       ├── frames.py             # ffmpeg frame extraction + auto-fps + dedup
+│       ├── scenes.py             # PySceneDetect wrapper + midpoint picker
+│       ├── speech.py             # speech-window detection + two-pass sampling
+│       ├── ocr.py                # Tesseract OCR over frames
+│       ├── transcribe.py         # VTT parsing + speaker-aware formatting
+│       ├── whisper.py            # Groq / OpenAI clients + backend resolver + auto-chunking
+│       ├── whisper_local.py      # faster-whisper / GPU client
+│       ├── whisper_assemblyai.py # AssemblyAI client with speaker diarization
+│       ├── gemini.py             # Gemini multimodal video client (--backend gemini)
+│       ├── openrouter.py         # OpenRouter vision + audio client (--backend openrouter)
 │       ├── config.py             # shared config (~/.config/watch/.env)
 │       ├── setup.py              # preflight + installer
 │       └── build-skill.sh        # build dist/watch.skill for claude.ai upload (dev-only)
@@ -247,20 +321,20 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 MIT license.
 
-Built on `yt-dlp`, `ffmpeg`, and Claude's multimodal `Read` tool. Whisper transcription via [Groq](https://groq.com) or [OpenAI](https://openai.com).
+Built on `yt-dlp`, `ffmpeg`, and Claude's multimodal `Read` tool. Whisper transcription via [Groq](https://groq.com), [OpenAI](https://openai.com), local [faster-whisper](https://github.com/SYSTRAN/faster-whisper), or [AssemblyAI](https://www.assemblyai.com/) diarization. Hosted-backend analysis via [Gemini](https://aistudio.google.com/) and [OpenRouter](https://openrouter.ai/).
 
-Built by Brad Bonanno — I make content about building with AI on [YouTube (@bradbonanno)](https://www.youtube.com/@bradbonanno), and build AI operating systems for businesses at [Solaris Automation](https://www.solarisautomation.io/). If `/watch` saves you from scrubbing through a video, come say hi on the channel.
+Originally built by Brad Bonanno — he makes content about building with AI on [YouTube (@bradbonanno)](https://www.youtube.com/@bradbonanno), and builds AI operating systems for businesses at [Solaris Automation](https://www.solarisautomation.io/). This fork ([thedirektor/claude-video](https://github.com/thedirektor/claude-video)) re-bases onto Brad's upstream releases and adds the Gemini/OpenRouter backends, scene detection, OCR, local Whisper, and speaker diarization on top. If `/watch` saves you from scrubbing through a video, go say hi to Brad on the channel — the idea and the original implementation are his.
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=bradautomates%2Fclaude-video&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=thedirektor%2Fclaude-video&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=bradautomates/claude-video&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=bradautomates/claude-video&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=bradautomates/claude-video&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=thedirektor/claude-video&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=thedirektor/claude-video&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=thedirektor/claude-video&type=date&legend=top-left" />
  </picture>
 </a>
 
 ---
 
-[github.com/bradautomates/claude-video](https://github.com/bradautomates/claude-video) · [@bradbonanno](https://www.youtube.com/@bradbonanno) · [Solaris Automation](https://www.solarisautomation.io/) · [LICENSE](LICENSE)
+[github.com/thedirektor/claude-video](https://github.com/thedirektor/claude-video) · [@bradbonanno](https://www.youtube.com/@bradbonanno) · [Solaris Automation](https://www.solarisautomation.io/) · [LICENSE](LICENSE)
