@@ -395,6 +395,28 @@ def extract_at_timestamps(
     return out, meta
 
 
+def reextract_frame(video_path: str, out_path: Path, timestamp_seconds: float, resolution: int) -> bool:
+    """Re-extract a single frame at higher resolution (OCR hi-res upgrade).
+
+    Seeks to the specified timestamp and extracts one frame at the given resolution.
+    Returns True if successful, False if the timestamp is out of bounds or extraction fails.
+    """
+    resolved = str(Path(video_path).resolve())
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{timestamp_seconds:.3f}", "-i", resolved,
+        "-frames:v", "1", "-vf", _scale_filter(resolution),
+        "-q:v", "2", "-y", str(out_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        if proc.stderr:
+            print(f"[frames] re-extract failed at {timestamp_seconds:.1f}s: {proc.stderr.strip()}",
+                  file=sys.stderr)
+        return False
+    return True
+
+
 def _even_sample(candidates: list[dict], n: int) -> list[dict]:
     """Pick ``n`` evenly-spaced candidates (always including first and last),
     delete the JPEGs we drop, and reindex the survivors 0..len-1.
