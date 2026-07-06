@@ -519,6 +519,74 @@ def main() -> int:
         transcript_segments = filter_range(transcript_segments, start_sec, end_sec)
         transcript_text = format_transcript(transcript_segments)
 
+    # Transcript-first: finish resolving the transcript (download-discovered captions,
+    # then the Whisper fallback) BEFORE frame extraction so the two-pass gate below
+    # sees Whisper transcripts too — local files and caption-less URLs — not just the
+    # captions available pre-frames. A failed Whisper call falls through, leaving the
+    # frame pipeline (without two-pass) to run exactly as it would with no transcript.
+    if not transcript_segments and dl.get("subtitle_path") and audio_override is None:
+        try:
+            all_segments = parse_vtt(dl["subtitle_path"])
+            transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+            transcript_text = format_transcript(transcript_segments)
+            transcript_source = "captions"
+        except Exception as exc:
+            print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
+
+    # Whisper fallback: resolve_backend now spans local / groq / openai / assemblyai
+    # and reports a hint when nothing is usable. --audio, when present, supplies an
+    # external track and bypasses the video's own has_audio check.
+    whisper_ready = bool(audio_override) or (video_path is not None and meta.get("has_audio"))
+    if not transcript_segments and not args.no_whisper and whisper_ready:
+        backend, api_key, error_hint = resolve_backend(args.whisper)
+        if backend:
+            whisper_input = str(audio_override) if audio_override else video_path
+            audio_out = work / ("audio_override.mp3" if audio_override else "audio.mp3")
+            try:
+                if audio_override:
+                    print(
+                        f"[watch] transcribing separate audio file via {backend}: "
+                        f"{audio_override.name}",
+                        file=sys.stderr,
+                    )
+                all_segments, used_backend = transcribe_video(
+                    whisper_input,
+                    audio_out,
+                    backend=backend,
+                    api_key=api_key,
+                    model_name=args.whisper_model if backend == "local" else None,
+                    enable_diarization=args.diarize if backend == "assemblyai" else False,
+                )
+                transcript_segments = (
+                    filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+                )
+                transcript_text = format_transcript(transcript_segments)
+                # Fold per-backend extras into a single label so the transcript header
+                # says exactly what produced it: "local, large-v3", "assemblyai,
+                # diarized", plain "groq", and a "--audio" suffix for external tracks.
+                if used_backend == "local":
+                    backend_label = f"local, {args.whisper_model}"
+                elif used_backend == "assemblyai":
+                    backend_label = "assemblyai, diarized" if args.diarize else "assemblyai"
+                else:
+                    backend_label = used_backend
+                transcript_source = (
+                    f"whisper ({backend_label}, --audio)"
+                    if audio_override
+                    else f"whisper ({backend_label})"
+                )
+            except SystemExit as exc:
+                print(f"[watch] whisper transcription failed: {exc}", file=sys.stderr)
+        else:
+            hint = error_hint or "no subtitles and no Whisper backend available"
+            setup_py = SCRIPT_DIR / "setup.py"
+            print(
+                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
+                file=sys.stderr,
+            )
+    elif not transcript_segments and video_path and not meta.get("has_audio") and not audio_override:
+        print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
+
     scope = (
         f"{format_time(effective_start)}-{format_time(effective_end)} ({effective_duration:.1f}s)"
         if focused else f"full {effective_duration:.1f}s"
@@ -550,7 +618,7 @@ def main() -> int:
     detail_budget = max_frames if max_frames is None else max(0, max_frames - len(cue_frames))
 
     # Two-pass sampling grafts in ABOVE the detail engines: when a timed transcript
-    # is already in hand (captions, available before frame extraction), distribute
+    # is already in hand (captions or Whisper, now resolved before frame extraction), distribute
     # the frame budget 70/30 across speech vs silent windows instead of running the
     # scene/keyframe engine. Precedence: cue frames (pinned) → two-pass → detail
     # engines → uniform fps. An explicit --fps override disables it (that flag means
@@ -664,69 +732,6 @@ def main() -> int:
 
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
-
-    if not transcript_segments and dl.get("subtitle_path") and audio_override is None:
-        try:
-            all_segments = parse_vtt(dl["subtitle_path"])
-            transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-            transcript_text = format_transcript(transcript_segments)
-            transcript_source = "captions"
-        except Exception as exc:
-            print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
-
-    # Whisper fallback: resolve_backend now spans local / groq / openai / assemblyai
-    # and reports a hint when nothing is usable. --audio, when present, supplies an
-    # external track and bypasses the video's own has_audio check.
-    whisper_ready = bool(audio_override) or (video_path is not None and meta.get("has_audio"))
-    if not transcript_segments and not args.no_whisper and whisper_ready:
-        backend, api_key, error_hint = resolve_backend(args.whisper)
-        if backend:
-            whisper_input = str(audio_override) if audio_override else video_path
-            audio_out = work / ("audio_override.mp3" if audio_override else "audio.mp3")
-            try:
-                if audio_override:
-                    print(
-                        f"[watch] transcribing separate audio file via {backend}: "
-                        f"{audio_override.name}",
-                        file=sys.stderr,
-                    )
-                all_segments, used_backend = transcribe_video(
-                    whisper_input,
-                    audio_out,
-                    backend=backend,
-                    api_key=api_key,
-                    model_name=args.whisper_model if backend == "local" else None,
-                    enable_diarization=args.diarize if backend == "assemblyai" else False,
-                )
-                transcript_segments = (
-                    filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-                )
-                transcript_text = format_transcript(transcript_segments)
-                # Fold per-backend extras into a single label so the transcript header
-                # says exactly what produced it: "local, large-v3", "assemblyai,
-                # diarized", plain "groq", and a "--audio" suffix for external tracks.
-                if used_backend == "local":
-                    backend_label = f"local, {args.whisper_model}"
-                elif used_backend == "assemblyai":
-                    backend_label = "assemblyai, diarized" if args.diarize else "assemblyai"
-                else:
-                    backend_label = used_backend
-                transcript_source = (
-                    f"whisper ({backend_label}, --audio)"
-                    if audio_override
-                    else f"whisper ({backend_label})"
-                )
-            except SystemExit as exc:
-                print(f"[watch] whisper transcription failed: {exc}", file=sys.stderr)
-        else:
-            hint = error_hint or "no subtitles and no Whisper backend available"
-            setup_py = SCRIPT_DIR / "setup.py"
-            print(
-                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
-                file=sys.stderr,
-            )
-    elif not transcript_segments and video_path and not meta.get("has_audio") and not audio_override:
-        print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
 
     # OCR pass runs on the FINAL frame list (post merge_frames). Frames whose text is
     # significant get re-extracted at HIRES_WIDTH so the on-screen text is legible when
