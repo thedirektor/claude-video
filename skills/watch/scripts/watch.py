@@ -35,9 +35,9 @@ from frames import (  # noqa: E402
 )
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
-from scenes import DEFAULT_THRESHOLD, detect_scenes, pick_midpoints  # noqa: E402
+from scenes import DEFAULT_THRESHOLD, detect_scenes  # noqa: E402
 from speech import DEFAULT_SPEECH_SHARE, compute_speech_windows, format_windows, two_pass_sample  # noqa: E402
-from whisper import extract_audio, load_api_key, resolve_backend, transcribe_video  # noqa: E402
+from whisper import extract_audio, resolve_backend, transcribe_video  # noqa: E402
 from whisper_local import DEFAULT_MODEL as WHISPER_LOCAL_DEFAULT_MODEL  # noqa: E402
 from whisper_local import VALID_MODELS as WHISPER_LOCAL_MODELS  # noqa: E402
 from gemini import DEFAULT_MODEL as GEMINI_DEFAULT_MODEL  # noqa: E402
@@ -616,6 +616,9 @@ def main() -> int:
             )
 
     detail_budget = max_frames if max_frames is None else max(0, max_frames - len(cue_frames))
+    # Overridden below when two-pass runs, so the final report's cap reflects the
+    # budget actually applied (duration-scaled target) instead of the flat detail cap.
+    report_cap = detail_budget
 
     # Two-pass sampling grafts in ABOVE the detail engines: when a timed transcript
     # is already in hand (captions or Whisper, now resolved before frame extraction), distribute
@@ -656,9 +659,13 @@ def main() -> int:
                     "[watch] no scene cuts detected; two-pass will use even spacing",
                     file=sys.stderr,
                 )
-        # two_pass_sample needs a concrete cap; token-burner's uncapped None falls
-        # back to the 100-frame safety ceiling.
-        two_pass_budget = detail_budget if detail_budget is not None else budget_cap
+        # two_pass_sample needs a concrete cap: use the duration-scaled auto_fps
+        # target (not the flat detail cap) so two-pass honors the same ~2fps
+        # invariant as every other engine. min() still respects a detail_budget
+        # that cue frames have shrunk below the target, and token-burner's
+        # uncapped None falls back to the target itself (no cap to intersect).
+        two_pass_budget = min(target, detail_budget) if detail_budget is not None else target
+        report_cap = two_pass_budget
         plan = two_pass_sample(
             effective_start,
             effective_end,
@@ -774,7 +781,7 @@ def main() -> int:
     print(f"- **Detail:** {detail}")
     detail_count = frame_meta.get("selected_count", 0)
     if detail != "transcript":
-        cap_label = "unlimited" if detail_budget is None else str(detail_budget)
+        cap_label = "unlimited" if report_cap is None else str(report_cap)
         engine = frame_meta.get("engine", "scene")
         fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
         deduped = frame_meta.get("deduped_count", 0)

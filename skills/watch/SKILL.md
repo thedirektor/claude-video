@@ -119,7 +119,7 @@ Within a single session, you can skip Step 0 on follow-up `/watch` calls — onc
   - `transcript` → no frames
   - `efficient` → up to **50** (keyframes)
   - `balanced` (default) → up to **100** (scene-aware)
-  - `token-burner` → **uncapped** (scene-aware; a soft warning prints past 250 frames)
+  - `token-burner` → **uncapped** (scene-aware; a soft warning prints past 250 frames) — except under two-pass sampling (see below), where the budget is always the duration-scaled auto-fps target
   - `--max-frames N` overrides whichever cap the mode would otherwise use.
 - **Full-video frame budget by duration.** Token cost grows with frame count, so the script targets a budget by duration. This budget sets the fps and the uniform-sampling fallback; scene-aware selection can fill up to the detail cap above, whichever is lower:
   - ≤30s → ~12-30 frames
@@ -160,7 +160,7 @@ Optional flags:
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
 - `--no-scene-detect` — skip PySceneDetect (`scenes.py`) when computing scene boundaries for two-pass sampling; falls back to even spacing across speech/silent windows instead. This only affects two-pass — the `balanced`/`token-burner` detail engines run their own independent ffmpeg scene-cut detection regardless of this flag.
 - `--scene-threshold F` — PySceneDetect `ContentDetector` threshold used by two-pass (default `27.0`). Lower = more cuts detected. Bump to `35-40` for low-cut talking heads, drop to `20` for fast-cut promo content.
-- `--two-pass` / `--no-two-pass` — distribute the frame budget proportionally to speech windows from the transcript (70% inside speech, 30% outside), using scene cuts (unless `--no-scene-detect`) to pick good frames within each window. **Default ON** whenever a timed transcript is available — captions or Whisper, for local files just as much as caption-bearing URLs, since the transcript is now fully resolved before frame extraction runs (see "Transcription" below). Automatically inert when `--detail transcript` is used, `--fps` is set, or no transcript is available.
+- `--two-pass` / `--no-two-pass` — distribute the frame budget proportionally to speech windows from the transcript (70% inside speech, 30% outside), using scene cuts (unless `--no-scene-detect`) to pick good frames within each window. **Default ON** whenever a timed transcript is available — captions or Whisper, for local files just as much as caption-bearing URLs, since the transcript is now fully resolved before frame extraction runs (see "Transcription" below). Automatically inert when `--detail transcript` is used, `--fps` is set, or no transcript is available. Under two-pass the budget is always the duration-scaled auto-fps target, not the flat detail cap — so `token-burner`'s "uncapped" promise is finite here too. Pass `--no-two-pass` if you want `token-burner`'s uncapped scene dump instead.
 
 **Audio / transcription**
 - `--audio FILE` — separate audio file (mp3/wav/m4a) to transcribe instead of the video's own audio track. Use when the video is muted and the voiceover ships as a separate ElevenLabs/recorded file. Implies Whisper transcription of that file; cannot combine with `--no-whisper`.
@@ -268,7 +268,7 @@ At `efficient` detail, the script downloads the video and extracts **keyframes o
 
 At `balanced` / `token-burner` detail, the script extracts **scene-aware** frames: ffmpeg scene-change selection first, falling back to uniform sampling only when the video is effectively static. `balanced` caps at 100 frames; `token-burner` is uncapped. Frame report lines include both timestamp and selection reason. Extracted images are clamped to a maximum 1998px height for Claude Read compatibility.
 
-When a timed transcript is available, two-pass sampling (see "Frame sampling" above) takes over from the detail engine described here and distributes the same budget across speech vs. silent windows instead.
+When a timed transcript is available, two-pass sampling (see "Frame sampling" above) takes over from the detail engine described here and distributes the duration-scaled auto-fps budget across speech vs. silent windows instead — not the flat detail cap, so `token-burner` is finite (not uncapped) whenever two-pass runs. Pass `--no-two-pass` for the uncapped scene dump.
 
 ## Transcript-cue frames
 
