@@ -17,9 +17,33 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from config import frame_cap, get_config  # noqa: E402
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import (  # noqa: E402
+    MAX_FPS,
+    auto_fps,
+    auto_fps_focus,
+    dedupe_perceptual,
+    extract,
+    extract_at_timestamps,
+    extract_keyframes,
+    extract_scene_or_uniform,
+    format_time,
+    get_metadata,
+    merge_frames,
+    parse_time,
+    parse_timestamps,
+    reextract_frame,
+)
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
-from whisper import load_api_key, transcribe_video  # noqa: E402
+from ocr import is_significant, run_ocr  # noqa: E402
+from scenes import DEFAULT_THRESHOLD, detect_scenes, pick_midpoints  # noqa: E402
+from speech import DEFAULT_SPEECH_SHARE, compute_speech_windows, format_windows, two_pass_sample  # noqa: E402
+from whisper import extract_audio, load_api_key, resolve_backend, transcribe_video  # noqa: E402
+from whisper_local import DEFAULT_MODEL as WHISPER_LOCAL_DEFAULT_MODEL  # noqa: E402
+from whisper_local import VALID_MODELS as WHISPER_LOCAL_MODELS  # noqa: E402
+from gemini import DEFAULT_MODEL as GEMINI_DEFAULT_MODEL  # noqa: E402
+from gemini import VALID_MODELS as GEMINI_MODELS  # noqa: E402
+from openrouter import DEFAULT_AUDIO_MODEL as OR_AUDIO_DEFAULT  # noqa: E402
+from openrouter import DEFAULT_VISION_MODEL as OR_VISION_DEFAULT  # noqa: E402
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -27,12 +51,266 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):
         pass
 
+
+HIRES_WIDTH = 1024
+
+
+def _run_gemini_backend(args, work: Path) -> int:
+    """Hand the entire video to Gemini for native multimodal analysis.
+
+    Skips frame extraction, Whisper, OCR, scene detection, and two-pass
+    sampling — Gemini ingests the video directly and answers the user's
+    question. For YouTube URLs we pass the URL through to the model
+    (Gemini fetches it server-side); for everything else we download (if
+    needed) and upload to the Gemini Files API.
+    """
+    from gemini import generate_with_video, is_youtube_url
+
+    question = " ".join(args.question).strip()
+    if not question:
+        raise SystemExit(
+            "--backend gemini requires a question. Pass it as the trailing "
+            'positional argument: `watch.py video.mp4 --backend gemini "Describe this video"`'
+        )
+
+    if args.audio:
+        print(
+            "[watch] --audio is ignored for --backend gemini (Gemini transcribes the "
+            "video's own audio track natively).",
+            file=sys.stderr,
+        )
+
+    source = args.source
+    youtube = is_youtube_url(source)
+
+    if youtube:
+        gemini_source = source
+        mode_label = "native YouTube URL (no download)"
+    elif is_url(source):
+        print("[watch] downloading via yt-dlp before Gemini upload…", file=sys.stderr)
+        dl = download(source, work / "download")
+        gemini_source = dl["video_path"]
+        mode_label = "yt-dlp download → Gemini Files API upload"
+    else:
+        gemini_source = source
+        mode_label = "local file → Gemini Files API upload"
+
+    response_text = generate_with_video(
+        source=gemini_source,
+        question=question,
+        model_name=args.gemini_model,
+        is_youtube=youtube,
+    )
+
+    print()
+    print("# watch: video report (Gemini backend)")
+    print()
+    print(f"- **Source:** {source}")
+    print(f"- **Backend:** Gemini ({args.gemini_model})")
+    print(f"- **Mode:** {mode_label}")
+    print(f"- **Question:** {question}")
+    print()
+    print("## Gemini response")
+    print()
+    print(response_text)
+    print()
+    print("---")
+    print(f"_Work dir: `{work}` — delete when done._")
+    return 0
+
+
+def _run_openrouter_backend(args, work: Path) -> int:
+    """Extract frames, transcribe via OpenRouter audio, then query OpenRouter vision.
+
+    Follows the same download → transcript → extract pipeline as the claude
+    backend, but instead of printing frame paths for Claude to Read, encodes
+    all frames as base64 and POSTs them together with the transcript and
+    question to the OpenRouter chat completions endpoint.
+    """
+    from openrouter import analyze_with_frames, transcribe_audio
+
+    question = " ".join(args.question).strip()
+    if not question:
+        raise SystemExit(
+            "--backend openrouter requires a question. Pass it as the trailing "
+            'positional argument: `watch.py video.mp4 --backend openrouter "Describe this video"`'
+        )
+
+    if args.audio:
+        print(
+            "[watch] --audio is ignored for --backend openrouter (use the default audio "
+            "pipeline which extracts audio from the video).",
+            file=sys.stderr,
+        )
+
+    print(
+        "[watch] downloading via yt-dlp…" if is_url(args.source) else "[watch] using local file…",
+        file=sys.stderr,
+    )
+    dl = download(args.source, work / "download")
+    video_path = dl["video_path"]
+
+    meta = get_metadata(video_path)
+    full_duration = meta["duration_seconds"]
+    start_sec = parse_time(args.start)
+    end_sec = parse_time(args.end)
+    effective_start = start_sec if start_sec is not None else 0.0
+    effective_end = end_sec if end_sec is not None else full_duration
+    effective_duration = max(0.0, effective_end - effective_start)
+    focused = start_sec is not None or end_sec is not None
+
+    max_frames = min(args.max_frames if args.max_frames is not None else 80, 100)
+    if focused:
+        fps, target = auto_fps_focus(effective_duration, max_frames=max_frames)
+    else:
+        fps, target = auto_fps(effective_duration, max_frames=max_frames)
+    if args.fps is not None:
+        fps = min(args.fps, MAX_FPS)
+        target = max(1, int(round(fps * effective_duration)))
+
+    # Transcript: captions first, then OpenRouter audio model
+    transcript_segments: list[dict] = []
+    transcript_text: str | None = None
+    transcript_source: str | None = None
+
+    if dl.get("subtitle_path"):
+        try:
+            all_segs = parse_vtt(dl["subtitle_path"])
+            transcript_segments = filter_range(all_segs, start_sec, end_sec) if focused else all_segs
+            transcript_text = format_transcript(transcript_segments)
+            transcript_source = "captions"
+        except Exception as exc:
+            print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
+
+    if not transcript_segments and not args.no_whisper:
+        audio_out = work / "audio.mp3"
+        print(
+            f"[watch] extracting audio for OpenRouter ({args.openrouter_audio_model})…",
+            file=sys.stderr,
+        )
+        try:
+            audio_path = extract_audio(video_path, audio_out)
+            size_kb = audio_path.stat().st_size / 1024
+            print(
+                f"[watch] audio: {size_kb:.0f} kB — transcribing via OpenRouter…",
+                file=sys.stderr,
+            )
+            transcript_segments = transcribe_audio(audio_path, model=args.openrouter_audio_model)
+            if focused:
+                transcript_segments = filter_range(transcript_segments, start_sec, end_sec)
+            transcript_text = format_transcript(transcript_segments)
+            transcript_source = f"openrouter ({args.openrouter_audio_model})"
+            print(
+                f"[watch] transcribed {len(transcript_segments)} segments via OpenRouter",
+                file=sys.stderr,
+            )
+        except SystemExit as exc:
+            print(f"[watch] OpenRouter audio transcription failed: {exc}", file=sys.stderr)
+
+    # Frame extraction (uniform + fps, mirroring the fork's OpenRouter path)
+    print(f"[watch] extracting ~{target} frames at {fps:.3f} fps…", file=sys.stderr)
+    frames = extract(
+        video_path,
+        work / "frames",
+        fps=fps,
+        resolution=args.resolution,
+        max_frames=max_frames,
+        start_seconds=start_sec,
+        end_seconds=end_sec,
+    )
+
+    frame_paths = [f["path"] for f in frames]
+    print(
+        f"[watch] sending {len(frame_paths)} frames to OpenRouter ({args.openrouter_vision_model})…",
+        file=sys.stderr,
+    )
+
+    response_text = analyze_with_frames(
+        frame_paths=frame_paths,
+        transcript_text=transcript_text,
+        question=question,
+        vision_model=args.openrouter_vision_model,
+    )
+
+    info = dl.get("info") or {}
+    scope = (
+        f"{format_time(effective_start)}–{format_time(effective_end)}"
+        if focused
+        else "full"
+    )
+
+    print()
+    print("# watch: video report (OpenRouter backend)")
+    print()
+    print(f"- **Source:** {args.source}")
+    if info.get("title"):
+        print(f"- **Title:** {info['title']}")
+    if info.get("uploader"):
+        print(f"- **Uploader:** {info['uploader']}")
+    print(f"- **Duration:** {format_time(full_duration)} ({full_duration:.1f}s)")
+    if focused:
+        print(f"- **Focus:** {scope}")
+    print(f"- **Vision model:** {args.openrouter_vision_model}")
+    print(f"- **Frames:** {len(frame_paths)} @ {fps:.3f} fps ({scope})")
+    if transcript_segments:
+        print(f"- **Transcript:** {len(transcript_segments)} segments (via {transcript_source})")
+    else:
+        print("- **Transcript:** none")
+    print(f"- **Question:** {question}")
+    print()
+    print("## OpenRouter response")
+    print()
+    print(response_text)
+    print()
+    print("---")
+    print(f"_Work dir: `{work}` — delete when done._")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="watch",
         description="Download a video, extract auto-scaled frames, and surface the transcript.",
     )
     ap.add_argument("source", help="Video URL or local file path")
+    ap.add_argument(
+        "question",
+        nargs="*",
+        default=[],
+        help="Optional trailing question. Required for --backend gemini / openrouter "
+        "(passed to the model as the prompt). Ignored for --backend claude — "
+        "Claude handles the question via its own conversation context.",
+    )
+    ap.add_argument(
+        "--backend",
+        choices=["claude", "gemini", "openrouter"],
+        default="claude",
+        help="claude (default): extract frames + transcript locally so Claude can `Read` them. "
+        "gemini: skip frame extraction and Whisper, hand the whole video to Gemini's "
+        "native multimodal model and print its response. "
+        "openrouter: extract frames, transcribe via OpenRouter audio model, then POST "
+        "everything to an OpenRouter vision model and print its response.",
+    )
+    ap.add_argument(
+        "--gemini-model",
+        choices=list(GEMINI_MODELS),
+        default=GEMINI_DEFAULT_MODEL,
+        help=f"Gemini model for --backend gemini (default {GEMINI_DEFAULT_MODEL}). "
+        "Ignored for --backend claude / openrouter.",
+    )
+    ap.add_argument(
+        "--openrouter-vision-model",
+        default=OR_VISION_DEFAULT,
+        help=f"OpenRouter model for vision/chat analysis (default {OR_VISION_DEFAULT}). "
+        "Only applies to --backend openrouter.",
+    )
+    ap.add_argument(
+        "--openrouter-audio-model",
+        default=OR_AUDIO_DEFAULT,
+        help=f"OpenRouter model for audio transcription (default {OR_AUDIO_DEFAULT}). "
+        "Used when no captions are found and --no-whisper is not set. "
+        "Only applies to --backend openrouter.",
+    )
     ap.add_argument("--max-frames", type=int, default=None, help="Override frame cap")
     ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
     ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
@@ -55,15 +333,63 @@ def main() -> int:
     ap.add_argument("--end", type=str, default=None, help="Range end (SS, MM:SS, or HH:MM:SS)")
     ap.add_argument("--out-dir", type=str, default=None, help="Working directory (default: tmp)")
     ap.add_argument(
+        "--audio",
+        type=str,
+        default=None,
+        help="Separate audio file (mp3/wav/m4a) to transcribe instead of the video's audio track. "
+        "Useful when the video is muted and the VO ships as a separate file.",
+    )
+    ap.add_argument(
         "--no-whisper",
         action="store_true",
         help="Disable Whisper fallback. Report frames-only if no captions available.",
     )
     ap.add_argument(
+        "--no-ocr",
+        action="store_true",
+        help="Disable OCR pass. Skips text detection on frames and the high-res re-extract.",
+    )
+    ap.add_argument(
+        "--no-scene-detect",
+        action="store_true",
+        help="Skip PySceneDetect when informing two-pass sampling (use even spacing instead).",
+    )
+    ap.add_argument(
+        "--scene-threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help=f"ContentDetector threshold (default {DEFAULT_THRESHOLD}). Lower = more cuts.",
+    )
+    ap.add_argument(
+        "--two-pass",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Distribute frame budget proportionally to speech windows from the transcript "
+        "(70%% inside speech, 30%% outside). Default ON when a timed transcript is available.",
+    )
+    ap.add_argument(
         "--whisper",
-        choices=["groq", "openai"],
+        choices=["groq", "openai", "local", "assemblyai"],
         default=None,
-        help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+        help="Force a specific Whisper backend. 'local' runs faster-whisper on the GPU "
+        "(needs faster-whisper + CUDA). 'assemblyai' is paid and adds automatic speaker "
+        "labels to the transcript. Default: auto-pick local if available, else Groq, else "
+        "OpenAI. AssemblyAI is never auto-picked — request it explicitly for diarization.",
+    )
+    ap.add_argument(
+        "--whisper-model",
+        choices=list(WHISPER_LOCAL_MODELS),
+        default=WHISPER_LOCAL_DEFAULT_MODEL,
+        help=f"faster-whisper model for the local backend (default {WHISPER_LOCAL_DEFAULT_MODEL}). "
+        "Smaller models are faster but less accurate. Ignored for groq / openai / assemblyai.",
+    )
+    ap.add_argument(
+        "--diarize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Request speaker diarization when the backend supports it (currently AssemblyAI). "
+        "Default ON. Pass --no-diarize to skip speaker labels. "
+        "Ignored for local / groq / openai (none of those expose diarization here).",
     )
     ap.add_argument(
         "--no-dedup",
@@ -71,7 +397,11 @@ def main() -> int:
         help="Disable near-duplicate frame removal. Keeps visually identical "
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
-    args = ap.parse_args()
+    # parse_intermixed_args (not parse_args) so a trailing question survives options
+    # placed after it, e.g. `watch.py video.mp4 --backend gemini "Describe this"`.
+    # Plain parse_args rejects that ("unrecognized arguments") because the nargs="*"
+    # question positional can't span an interleaved optional.
+    args = ap.parse_intermixed_args()
 
     config = get_config()
     detail = args.detail or str(config["detail"])
@@ -92,6 +422,24 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     print(f"[watch] working dir: {work}", file=sys.stderr)
 
+    if args.backend == "gemini":
+        return _run_gemini_backend(args, work)
+    if args.backend == "openrouter":
+        return _run_openrouter_backend(args, work)
+
+    # --audio supplies an external voice-over track to transcribe in place of the
+    # video's own audio; it implies Whisper, so it cannot combine with --no-whisper.
+    if args.audio and args.no_whisper:
+        raise SystemExit(
+            "--audio implies Whisper transcription of that file; cannot combine with --no-whisper. "
+            "Drop one of the two flags."
+        )
+    audio_override: Path | None = None
+    if args.audio:
+        audio_override = Path(args.audio).expanduser().resolve()
+        if not audio_override.exists():
+            raise SystemExit(f"--audio file not found: {audio_override}")
+
     url_source = is_url(args.source)
     dl: dict = {"subtitle_path": None, "info": {}, "downloaded": False}
     transcript_segments: list[dict] = []
@@ -102,7 +450,9 @@ def main() -> int:
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
         dl = fetch_captions(args.source, work / "download")
-        if dl.get("subtitle_path"):
+        # --audio supplies an external track that must win over the video's own
+        # captions, so skip caption parsing entirely when it is set.
+        if dl.get("subtitle_path") and audio_override is None:
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
                 transcript_text = format_transcript(transcript_segments)
@@ -198,7 +548,90 @@ def main() -> int:
             )
 
     detail_budget = max_frames if max_frames is None else max(0, max_frames - len(cue_frames))
-    if detail != "transcript" and video_path and detail_budget != 0:
+
+    # Two-pass sampling grafts in ABOVE the detail engines: when a timed transcript
+    # is already in hand (captions, available before frame extraction), distribute
+    # the frame budget 70/30 across speech vs silent windows instead of running the
+    # scene/keyframe engine. Precedence: cue frames (pinned) → two-pass → detail
+    # engines → uniform fps. An explicit --fps override disables it (that flag means
+    # "sample at this rate", not "let the transcript drive the picks").
+    speech_windows: list[tuple[float, float]] = []
+    two_pass_eligible = (
+        args.two_pass
+        and bool(transcript_segments)
+        and video_path is not None
+        and detail != "transcript"
+        and args.fps is None
+        and detail_budget != 0
+    )
+    if two_pass_eligible:
+        speech_windows = compute_speech_windows(
+            transcript_segments, range_start=effective_start, range_end=effective_end
+        )
+    use_two_pass = two_pass_eligible and bool(speech_windows)
+
+    if use_two_pass:
+        scene_spans: list[tuple[float, float]] = []
+        if not args.no_scene_detect:
+            print(
+                f"[watch] detecting scenes (threshold={args.scene_threshold}) to inform two-pass…",
+                file=sys.stderr,
+            )
+            scene_spans = detect_scenes(
+                video_path,
+                threshold=args.scene_threshold,
+                start_seconds=start_sec,
+                end_seconds=end_sec,
+            )
+            if not scene_spans:
+                print(
+                    "[watch] no scene cuts detected; two-pass will use even spacing",
+                    file=sys.stderr,
+                )
+        # two_pass_sample needs a concrete cap; token-burner's uncapped None falls
+        # back to the 100-frame safety ceiling.
+        two_pass_budget = detail_budget if detail_budget is not None else budget_cap
+        plan = two_pass_sample(
+            effective_start,
+            effective_end,
+            speech_windows,
+            scene_spans,
+            two_pass_budget,
+            speech_share=DEFAULT_SPEECH_SHARE,
+        )
+        timestamps = plan["timestamps"]
+        print(
+            f"[watch] two-pass sampling: {plan['speech_count']} frame(s) in speech windows, "
+            f"{plan['non_speech_count']} outside (cap {two_pass_budget})…",
+            file=sys.stderr,
+        )
+        # extract_at_timestamps wipes cue_*.jpg in its out_dir, so when cue frames are
+        # already pinned in work/frames we route two-pass picks to a sibling directory
+        # to avoid clobbering them; absolute paths in the report keep both readable.
+        two_pass_dir = (work / "frames_two_pass") if cue_frames else (work / "frames")
+        frames, _ts_meta = extract_at_timestamps(
+            video_path,
+            two_pass_dir,
+            timestamps,
+            resolution=args.resolution,
+            max_frames=detail_budget,
+            start_seconds=start_sec,
+            end_seconds=end_sec,
+        )
+        deduped_count = 0
+        if not args.no_dedup:
+            frames, deduped_count = dedupe_perceptual(frames)
+        for f in frames:
+            f["reason"] = "two-pass"
+        frame_meta = {
+            "engine": "two-pass",
+            "candidate_count": len(timestamps),
+            "selected_count": len(frames),
+            "fallback": False,
+        }
+        if deduped_count:
+            frame_meta["deduped_count"] = deduped_count
+    elif detail != "transcript" and video_path and detail_budget != 0:
         cap_label = "unlimited" if detail_budget is None else str(detail_budget)
         engine_label = "keyframes" if detail == "efficient" else "scene-aware frames"
         print(
@@ -232,7 +665,7 @@ def main() -> int:
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
 
-    if not transcript_segments and dl.get("subtitle_path"):
+    if not transcript_segments and dl.get("subtitle_path") and audio_override is None:
         try:
             all_segments = parse_vtt(dl["subtitle_path"])
             transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
@@ -241,34 +674,78 @@ def main() -> int:
         except Exception as exc:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
-    if not transcript_segments and not args.no_whisper and video_path and meta.get("has_audio"):
-        backend, api_key = load_api_key(args.whisper)
-        if backend and api_key:
+    # Whisper fallback: resolve_backend now spans local / groq / openai / assemblyai
+    # and reports a hint when nothing is usable. --audio, when present, supplies an
+    # external track and bypasses the video's own has_audio check.
+    whisper_ready = bool(audio_override) or (video_path is not None and meta.get("has_audio"))
+    if not transcript_segments and not args.no_whisper and whisper_ready:
+        backend, api_key, error_hint = resolve_backend(args.whisper)
+        if backend:
+            whisper_input = str(audio_override) if audio_override else video_path
+            audio_out = work / ("audio_override.mp3" if audio_override else "audio.mp3")
             try:
+                if audio_override:
+                    print(
+                        f"[watch] transcribing separate audio file via {backend}: "
+                        f"{audio_override.name}",
+                        file=sys.stderr,
+                    )
                 all_segments, used_backend = transcribe_video(
-                    video_path,
-                    work / "audio.mp3",
+                    whisper_input,
+                    audio_out,
                     backend=backend,
                     api_key=api_key,
+                    model_name=args.whisper_model if backend == "local" else None,
+                    enable_diarization=args.diarize if backend == "assemblyai" else False,
                 )
-                transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+                transcript_segments = (
+                    filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+                )
                 transcript_text = format_transcript(transcript_segments)
-                transcript_source = f"whisper ({used_backend})"
+                # Fold per-backend extras into a single label so the transcript header
+                # says exactly what produced it: "local, large-v3", "assemblyai,
+                # diarized", plain "groq", and a "--audio" suffix for external tracks.
+                if used_backend == "local":
+                    backend_label = f"local, {args.whisper_model}"
+                elif used_backend == "assemblyai":
+                    backend_label = "assemblyai, diarized" if args.diarize else "assemblyai"
+                else:
+                    backend_label = used_backend
+                transcript_source = (
+                    f"whisper ({backend_label}, --audio)"
+                    if audio_override
+                    else f"whisper ({backend_label})"
+                )
             except SystemExit as exc:
-                print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
+                print(f"[watch] whisper transcription failed: {exc}", file=sys.stderr)
         else:
-            hint = (
-                f"--whisper {args.whisper} was set but the matching API key is missing"
-                if args.whisper else
-                "no subtitles and no Whisper API key found"
-            )
+            hint = error_hint or "no subtitles and no Whisper backend available"
             setup_py = SCRIPT_DIR / "setup.py"
             print(
                 f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
                 file=sys.stderr,
             )
-    elif not transcript_segments and video_path and not meta.get("has_audio"):
+    elif not transcript_segments and video_path and not meta.get("has_audio") and not audio_override:
         print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
+
+    # OCR pass runs on the FINAL frame list (post merge_frames). Frames whose text is
+    # significant get re-extracted at HIRES_WIDTH so the on-screen text is legible when
+    # Claude Reads them. run_ocr degrades to {} when pytesseract/tesseract is missing,
+    # so this is a no-op (and invisible in the report) on hosts without OCR installed.
+    ocr_text: dict[str, str] = {}
+    if not args.no_ocr and frames:
+        print(f"[watch] running OCR on {len(frames)} frame(s) (lang=spa+eng)…", file=sys.stderr)
+        raw_ocr = run_ocr([f["path"] for f in frames])
+        for f in frames:
+            text = raw_ocr.get(f["path"], "")
+            if is_significant(text) and args.resolution < HIRES_WIDTH:
+                hires = Path(f["path"]).with_name(Path(f["path"]).stem + "_hires.jpg")
+                if reextract_frame(video_path, hires, f["timestamp_seconds"], HIRES_WIDTH):
+                    f["path"] = str(hires)
+            if text.strip():
+                # Key by the FINAL path so the report loop's ocr_text.get(frame["path"])
+                # still matches after any hi-res re-extract swapped the path.
+                ocr_text[f["path"]] = text
 
     info = dl.get("info") or {}
 
@@ -312,12 +789,27 @@ def main() -> int:
         )
     if frames:
         print(f"- **Frame size:** max {args.resolution}px wide, max 1998px tall")
+    # OCR status: report "disabled" only when the user asked, and a count only when
+    # OCR actually produced text. Staying silent when OCR ran but found nothing (or
+    # was unavailable) keeps the default zero-fork-flags output byte-equivalent.
+    if args.no_ocr:
+        print("- **OCR:** disabled (`--no-ocr`)")
+    elif ocr_text:
+        text_frames = sum(1 for v in ocr_text.values() if v.strip())
+        print(f"- **OCR:** {text_frames}/{len(frames)} frame(s) had detected text (lang=spa+eng)")
     if transcript_segments:
         in_range = " in range" if focused else ""
         print(
             f"- **Transcript:** {len(transcript_segments)} segments{in_range} "
             f"(via {transcript_source or 'captions'})"
         )
+        if use_two_pass and speech_windows:
+            speech_total = sum(e - s for s, e in speech_windows)
+            denom = effective_duration if focused else full_duration
+            print(
+                f"- **Speech windows:** "
+                f"{format_windows(speech_windows, speech_total=speech_total, full_duration=denom)}"
+            )
     else:
         print("- **Transcript:** none available")
 
@@ -348,12 +840,28 @@ def main() -> int:
             "**Read each frame path below with the Read tool to view the image.** "
             "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video."
         )
-        print()
-        for frame in frames:
+        if ocr_text:
+            print()
             print(
+                "Frame lines include any OCR-detected text (Spanish + English). "
+                f"Frames with significant text were re-extracted at {HIRES_WIDTH}px for legibility."
+            )
+        print()
+        # Under two-pass, tag each frame [speech]/[silent] by speech-window membership;
+        # keep upstream's reason= annotation and append inline OCR text when present.
+        speech_set = list(speech_windows) if use_two_pass else []
+        for frame in frames:
+            line = (
                 f"- `{frame['path']}` "
                 f"(t={format_time(frame['timestamp_seconds'])}, reason={frame.get('reason', 'selected')})"
             )
+            if speech_set:
+                in_speech = any(s <= frame["timestamp_seconds"] <= e for s, e in speech_set)
+                line += " [speech]" if in_speech else " [silent]"
+            text = ocr_text.get(frame["path"], "").strip() if ocr_text else ""
+            if text:
+                line += f" — OCR: {' '.join(text.split())}"
+            print(line)
     else:
         print("_No frames extracted._")
 
