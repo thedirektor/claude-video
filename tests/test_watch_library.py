@@ -35,6 +35,10 @@ def _record_save(monkeypatch):
 
 
 def test_writes_report_and_saves_by_default(cut_clip: Path, monkeypatch, tmp_path):
+    # conftest sets WATCH_NO_SAVE=1 for session-wide isolation; this test
+    # exercises the default-save path explicitly, and is safe because
+    # save_artifacts is mocked below (never touches the real library).
+    monkeypatch.delenv("WATCH_NO_SAVE", raising=False)
     calls = _record_save(monkeypatch)
     argv = [
         "watch.py", str(cut_clip), "--no-whisper", "--no-scene-detect",

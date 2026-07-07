@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -1071,7 +1072,11 @@ def main() -> int:
 
     (work / "report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
-    if not args.no_save:
+    # WATCH_NO_SAVE (any non-empty, non-"0"/"false" value) force-disables library
+    # saving even without --no-save. The test suite sets it so e2e runs never
+    # upload fixtures to the real Immich/Nextcloud/Paperless library.
+    env_no_save = os.environ.get("WATCH_NO_SAVE", "").strip().lower() not in ("", "0", "false", "no")
+    if not args.no_save and not env_no_save:
         video_id = info.get("id") or hashlib.sha1(args.source.encode("utf-8")).hexdigest()[:8]
         title = info.get("title") or Path(args.source).name
         try:
