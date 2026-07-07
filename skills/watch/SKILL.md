@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.3.0"
+version: "0.4.0"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -155,6 +155,12 @@ Optional flags:
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
 - `--fps F` — override auto-fps (clamped to 2 fps max). Disables two-pass speech-aware sampling, which relies on the auto-fps-informed budget — the `balanced`/`token-burner` detail engines' own scene-aware extraction still runs, just at the forced rate.
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
+
+**Download / resume**
+- `--sub-lang CSV` — subtitle language preference for yt-dlp (default `es,es-419,es-ES,en,en-US,en-GB,*-orig`). The report uses the first available track in this order. Never pass `all`.
+- `--cookies-from-browser BROWSER` — load yt-dlp cookies from a browser profile (`chrome|firefox|edge|brave|safari|...`) for login-walled or age-gated sources. Off by default.
+- `--cookies FILE` — path to a Netscape `cookies.txt` for yt-dlp. Off by default.
+- `--fresh` — with `--out-dir`, ignore any saved resume state and re-run every stage from scratch (also bypasses the Whisper chunk cache).
 
 **Frame sampling**
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
@@ -384,6 +390,16 @@ Speed numbers are approximate ratios — actual realtime multiplier depends heav
 - faster-whisper / ctranslate2 not installed → falls through to Groq/OpenAI in auto mode; hard-errors when forced.
 - CUDA DLLs missing → same fall-through behavior; the install hint with the pip command is printed.
 - Model fails to load (OOM, corrupted cache) → re-download by deleting the model directory under `~/.cache/huggingface/hub`, or pick a smaller `--whisper-model`.
+
+## Resume and caching
+
+Whisper chunk transcripts are cached at `~/.cache/watch/transcripts/`
+(`sha256(audio bytes + model)`), so re-asking about the same video — or resuming
+after a crash — never re-uploads chunks it already transcribed. When you pass
+`--out-dir DIR`, the download and transcript stages also persist there; a re-run
+with the same source and options resumes past them. Pass `--fresh` to ignore all
+of this and start clean. With `--start/--end`, only that time window's audio is
+transcribed, so focusing on a section costs nothing outside it.
 
 ## Failure modes and handling
 

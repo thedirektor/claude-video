@@ -2,6 +2,30 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.0] — 2026-07-07
+
+### Added
+- **YouTube reliability.** yt-dlp now runs a `player_client=default,android,mweb`
+  fallback chain with anti-bot retry/jitter by default, so SABR/403 blocks on
+  public videos self-heal without cookies. New `--cookies-from-browser <browser>`
+  and `--cookies <file>` flags unlock login-walled sources (off by default).
+- **Spanish-first subtitles.** Default subtitle preference is now
+  `es,es-419,es-ES,en,en-US,en-GB,*-orig`; override with `--sub-lang <csv>`. The
+  report picks the first available track in that order. Never requests `all`.
+- **Whisper chunk cache.** Transcribed audio chunks are cached at
+  `~/.cache/watch/transcripts/` keyed by `sha256(bytes + model)`, so re-runs and
+  crash-resumes skip already-uploaded chunks instead of re-spending quota.
+- **Windowed transcription.** With `--start/--end`, only that audio window is
+  extracted and transcribed (not the full track), then stitched back to source
+  time — zero Whisper spend outside the requested range.
+- **Crash resume.** With `--out-dir`, the download and transcript stages persist
+  to `stage_*.json` and a matching re-run resumes past them. `--fresh` forces a
+  full re-run and bypasses the chunk cache.
+
+### Changed
+- Chunk-level Whisper retries remain capped (no infinite 5xx quota burn); now
+  covered by a regression test.
+
 ## [0.3.0] — 2026-07-06
 
 ### Changed
