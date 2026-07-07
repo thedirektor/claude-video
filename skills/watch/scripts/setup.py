@@ -66,6 +66,9 @@ OPENAI_API_KEY=
 # Optional: OpenRouter backend (--backend openrouter) and audio transcription.
 # OPENROUTER_API_KEY=
 
+# TranscriptAPI (transcriptapi.com) — YouTube transcripts that beat the bot-gate
+# TRANSCRIPTAPI_API_KEY=
+
 # Default watch behavior (the /watch first-run wizard sets this for you).
 # Allowed values: transcript | efficient | balanced | token-burner
 # Keep the value on its own line with no trailing comment.
@@ -133,6 +136,11 @@ def _have_api_key() -> tuple[bool, str | None]:
     if _read_env_key("OPENAI_API_KEY"):
         return True, "openai"
     return False, None
+
+
+def _have_transcriptapi_key() -> bool:
+    """True if TRANSCRIPTAPI_API_KEY is set (optional YouTube-transcript backend)."""
+    return bool(_read_env_key("TRANSCRIPTAPI_API_KEY"))
 
 
 def is_first_run() -> bool:
@@ -242,6 +250,7 @@ def _status() -> dict:
     """
     missing = _check_binaries()
     has_key, backend = _have_api_key()
+    has_transcriptapi_key = _have_transcriptapi_key()
     setup_complete = not is_first_run()
 
     if not missing and has_key:
@@ -264,6 +273,7 @@ def _status() -> dict:
         "missing_binaries": missing,
         "whisper_backend": backend,
         "has_api_key": has_key,
+        "has_transcriptapi_key": has_transcriptapi_key,
         "config_file": str(CONFIG_FILE),
         "watch_detail": cfg["detail"],
         "platform": platform.system(),
@@ -344,6 +354,14 @@ def cmd_install() -> int:
         print(f"[setup] created config: {CONFIG_FILE}")
     else:
         print(f"[setup] config exists: {CONFIG_FILE}")
+
+    if _have_transcriptapi_key():
+        print("[setup] TranscriptAPI: configured (YouTube transcripts try it first)")
+    else:
+        print(
+            "[setup] TranscriptAPI: not configured (optional — set TRANSCRIPTAPI_API_KEY "
+            "for YouTube transcripts that beat the bot-gate; falls back to captions/Whisper)"
+        )
 
     has_key, backend = _have_api_key()
     if has_key:

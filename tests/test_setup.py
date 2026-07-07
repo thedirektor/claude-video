@@ -87,5 +87,5 @@ def test_scaffolded_env_mentions_all_backends(tmp_path):
     assert env_file.exists(), f"scaffolded env file does not exist at {env_file}"
     content = env_file.read_text(encoding="utf-8")
     for key in ("GROQ_API_KEY", "OPENAI_API_KEY", "ASSEMBLYAI_API_KEY",
-                "GEMINI_API_KEY", "OPENROUTER_API_KEY"):
+                "GEMINI_API_KEY", "OPENROUTER_API_KEY", "TRANSCRIPTAPI_API_KEY"):
         assert key in content, f"missing {key} stanza in scaffolded .env"

@@ -1,6 +1,6 @@
 {
   "name": "watch",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Let Claude watch a video with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls captions or falls back to Whisper (local GPU, Groq, OpenAI, or AssemblyAI diarization), and hands frames + transcript to Claude so it can answer questions about the video.",
   "author": {
     "name": "thedirektor"

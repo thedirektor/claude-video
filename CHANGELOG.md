@@ -2,6 +2,19 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.2] — 2026-07-07
+
+### Added
+- **TranscriptAPI YouTube backend.** YouTube URLs now fetch their transcript
+  from [TranscriptAPI](https://transcriptapi.com) before falling back to yt-dlp
+  captions → Whisper. Their servers clear YouTube's bot-gate / PO-token / nsig
+  walls that block yt-dlp from datacenter IPs, so a Spanish (or any-language)
+  YouTube video yields a caption-quality transcript with zero Whisper spend and
+  no video download for `--detail transcript`. New pure-stdlib `transcriptapi.py`
+  backend, `TRANSCRIPTAPI_API_KEY` env/config key, and a `--no-transcriptapi`
+  opt-out. Language preference follows `--sub-lang`. Best-effort: any miss (no
+  key, no credits, no transcript, network) falls through with a logged reason.
+
 ## [0.4.1] — 2026-07-07
 
 ### Fixed
