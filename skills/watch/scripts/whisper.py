@@ -10,6 +10,7 @@ Pure stdlib — no `pip install groq` or `pip install openai` needed.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -40,6 +41,42 @@ OPENAI_MODEL = "whisper-1"
 # Both Groq's free tier and OpenAI whisper-1 cap uploads at 25 MB. We target a
 # margin under that so multipart framing overhead never pushes a chunk over.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+
+# Content-addressed chunk-transcript cache. Keyed by sha256(chunk bytes + model),
+# so a re-run (crash resume, repeated question) reuses already-uploaded chunks
+# instead of burning the hourly Whisper quota again. Best-effort: any cache I/O
+# failure is swallowed and the chunk simply re-uploads. Source: PR #10.
+TRANSCRIPT_CACHE_DIR = Path.home() / ".cache" / "watch" / "transcripts"
+
+
+def _chunk_cache_key(audio_path: Path, model: str) -> str:
+    h = hashlib.sha256()
+    h.update(audio_path.read_bytes())
+    h.update(b"\x00")
+    h.update(model.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _cache_load(key: str) -> list[dict] | None:
+    path = TRANSCRIPT_CACHE_DIR / f"{key}.json"
+    if not path.exists():
+        return None
+    try:
+        blob = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    segments = blob.get("segments")
+    return segments if isinstance(segments, list) else None
+
+
+def _cache_save(key: str, segments: list[dict], model: str) -> None:
+    try:
+        TRANSCRIPT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (TRANSCRIPT_CACHE_DIR / f"{key}.json").write_text(
+            json.dumps({"model": model, "segments": segments}), encoding="utf-8"
+        )
+    except OSError:
+        pass  # cache is best-effort; never fail transcription over it
 
 
 def plan_chunks(
@@ -493,15 +530,29 @@ def transcribe_chunks(
     return segments
 
 
-def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]:
-    """Upload one audio file and return its 0-based segments."""
+def _transcribe_file(
+    backend: str, api_key: str, audio_path: Path, use_cache: bool = True
+) -> list[dict]:
+    """Upload one audio file and return its 0-based segments, with an optional cache."""
     if backend == "groq":
-        response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
+        endpoint, model = GROQ_ENDPOINT, GROQ_MODEL
     elif backend == "openai":
-        response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
+        endpoint, model = OPENAI_ENDPOINT, OPENAI_MODEL
     else:
         raise SystemExit(f"Unknown whisper backend: {backend}")
-    return _segments_from_response(response)
+
+    key = _chunk_cache_key(audio_path, model) if use_cache else None
+    if key is not None:
+        cached = _cache_load(key)
+        if cached is not None:
+            print(f"[watch] cache hit for {audio_path.name} ({model})", file=sys.stderr)
+            return cached
+
+    response = _post_whisper(endpoint, api_key, model, audio_path)
+    segments = _segments_from_response(response)
+    if key is not None:
+        _cache_save(key, segments, model)
+    return segments
 
 
 def transcribe_video(
@@ -511,6 +562,7 @@ def transcribe_video(
     api_key: str | None = None,
     model_name: str | None = None,
     enable_diarization: bool = False,
+    use_cache: bool = True,
 ) -> tuple[list[dict], str]:
     """Run the full flow: extract audio → transcribe (local/API) → parse segments.
 
@@ -571,7 +623,7 @@ def transcribe_video(
     audio_bytes = audio_path.stat().st_size
 
     def transcribe_one(path: Path) -> list[dict]:
-        return _transcribe_file(backend, api_key, path)
+        return _transcribe_file(backend, api_key, path, use_cache=use_cache)
 
     if audio_bytes <= MAX_UPLOAD_BYTES:
         print(
