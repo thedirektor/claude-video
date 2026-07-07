@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from config import frame_cap, get_config  # noqa: E402
-from download import download, fetch_captions, is_url  # noqa: E402
+from download import DEFAULT_SUB_LANGS, download, fetch_captions, is_url  # noqa: E402
 from frames import (  # noqa: E402
     MAX_FPS,
     auto_fps,
@@ -353,6 +353,14 @@ def main() -> int:
         help="Path to a Netscape cookies.txt for yt-dlp. Off by default.",
     )
     ap.add_argument(
+        "--sub-lang",
+        type=str,
+        default=None,
+        help="Comma-separated subtitle language preference for yt-dlp "
+        f"(default: {DEFAULT_SUB_LANGS}). yt-dlp fetches every match; the report "
+        "uses the first available in this order. Never pass 'all'.",
+    )
+    ap.add_argument(
         "--no-whisper",
         action="store_true",
         help="Disable Whisper fallback. Report frames-only if no captions available.",
@@ -465,6 +473,7 @@ def main() -> int:
         dl = fetch_captions(
             args.source,
             work / "download",
+            sub_langs=args.sub_lang or DEFAULT_SUB_LANGS,
             cookies_from_browser=args.cookies_from_browser,
             cookies_file=args.cookies,
         )
@@ -495,6 +504,7 @@ def main() -> int:
                 args.source,
                 work / "download",
                 audio_only=audio_only,
+                sub_langs=args.sub_lang or DEFAULT_SUB_LANGS,
                 cookies_from_browser=args.cookies_from_browser,
                 cookies_file=args.cookies,
             )

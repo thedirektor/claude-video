@@ -21,6 +21,14 @@ for _stream in (sys.stdout, sys.stderr):
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 
+# Default subtitle language preference. Spanish first (owner's primary content),
+# then English, then any original-language track. yt-dlp tries each in order and
+# writes every match; _pick_subtitle then selects by this same preference.
+# `*-orig` catches the uploader's original auto-caption track when localized
+# tracks are absent. Never "all" — that pulls YouTube's hundreds of
+# auto-translated tracks and stalls the run. Sources: PRs #12, #26, #30.
+DEFAULT_SUB_LANGS = "es,es-419,es-ES,en,en-US,en-GB,*-orig"
+
 # yt-dlp hardening. YouTube's SABR/403 rollout breaks the default `web` client;
 # a player_client fallback chain (tried in order) keeps most public videos
 # reachable without cookies. Anti-bot retry + request jitter absorb transient
@@ -70,15 +78,26 @@ def resolve_local(path: str) -> dict:
     }
 
 
-def _pick_subtitle(out_dir: Path) -> Path | None:
+def _pick_subtitle(out_dir: Path, sub_langs: str = DEFAULT_SUB_LANGS) -> Path | None:
     candidates = sorted(out_dir.glob("video*.vtt"))
     if not candidates:
         return None
-    preferred = [
-        c for c in candidates
-        if any(marker in c.name for marker in (".en.", ".en-US.", ".en-GB.", ".en-orig."))
-    ]
-    return preferred[0] if preferred else candidates[0]
+    # Preference follows the requested language order. For "es,en,*-orig" we look
+    # for video.es.vtt, then video.en.vtt, then any *-orig track, then anything.
+    markers: list[str] = []
+    for lang in sub_langs.split(","):
+        lang = lang.strip()
+        if not lang:
+            continue
+        if lang.endswith("-orig"):
+            markers.append("-orig.")
+        else:
+            markers.append(f".{lang}.")
+    for marker in markers:
+        for c in candidates:
+            if marker in c.name:
+                return c
+    return candidates[0]
 
 
 def _pick_video(out_dir: Path) -> Path | None:
@@ -94,6 +113,7 @@ def _pick_video(out_dir: Path) -> Path | None:
 def fetch_captions(
     url: str,
     out_dir: Path,
+    sub_langs: str = DEFAULT_SUB_LANGS,
     cookies_from_browser: str | None = None,
     cookies_file: str | None = None,
 ) -> dict:
@@ -109,7 +129,7 @@ def fetch_captions(
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*",
+        "--sub-langs", sub_langs,
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
@@ -121,7 +141,7 @@ def fetch_captions(
         url,
     ]
     subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
-    subtitle = _pick_subtitle(out_dir)
+    subtitle = _pick_subtitle(out_dir, sub_langs)
     info = _read_info(out_dir / "video.info.json", url)
     return {
         "video_path": None,
@@ -152,6 +172,7 @@ def download_url(
     url: str,
     out_dir: Path,
     audio_only: bool = False,
+    sub_langs: str = DEFAULT_SUB_LANGS,
     cookies_from_browser: str | None = None,
     cookies_file: str | None = None,
 ) -> dict:
@@ -170,7 +191,7 @@ def download_url(
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*",
+        "--sub-langs", sub_langs,
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
@@ -191,7 +212,7 @@ def download_url(
             f"yt-dlp did not produce a video file in {out_dir} (exit {result.returncode})"
         )
 
-    subtitle = _pick_subtitle(out_dir)
+    subtitle = _pick_subtitle(out_dir, sub_langs)
     info = _read_info(out_dir / "video.info.json", url)
 
     return {
@@ -206,6 +227,7 @@ def download(
     source: str,
     out_dir: Path,
     audio_only: bool = False,
+    sub_langs: str = DEFAULT_SUB_LANGS,
     cookies_from_browser: str | None = None,
     cookies_file: str | None = None,
 ) -> dict:
@@ -214,6 +236,7 @@ def download(
             source,
             out_dir,
             audio_only=audio_only,
+            sub_langs=sub_langs,
             cookies_from_browser=cookies_from_browser,
             cookies_file=cookies_file,
         )
