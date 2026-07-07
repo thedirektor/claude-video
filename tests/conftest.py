@@ -1,6 +1,7 @@
 """Shared pytest fixtures: ffmpeg-synthesized clips and scripts/ on sys.path."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,21 @@ import pytest
 # Make the bundled scripts importable (mirrors watch.py's sys.path insert).
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
+
+# Test isolation — NEVER touch the real library (Immich/Nextcloud/Paperless).
+# watch.py auto-saves after every run unless --no-save, so the e2e subprocess
+# tests would otherwise upload their ffmpeg fixtures (cuts.mp4/static.mp4/…) to
+# the user's real services. WATCH_NO_SAVE force-disables saving for the whole
+# session (honored by watch.py and inherited by every subprocess it spawns);
+# stripping the creds from the environment is defense-in-depth for any
+# in-process load_config() fallback.
+os.environ["WATCH_NO_SAVE"] = "1"
+for _k in (
+    "IMMICH_API_KEY", "IMMICH_BASE_URL",
+    "NEXTCLOUD_URL", "NEXTCLOUD_USER", "NEXTCLOUD_PASS",
+    "PAPERLESS_URL", "PAPERLESS_TOKEN",
+):
+    os.environ.pop(_k, None)
 
 # 14 visually distinct fills → 14 abrupt cuts → x264 emits a keyframe per cut.
 COLORS = [
