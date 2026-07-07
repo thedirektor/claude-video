@@ -97,9 +97,9 @@ def languages_from_sub_langs(sub_langs: str) -> str:
         base = tok.split("-")[0]
         if base and base not in out:
             out.append(base)
-    if "asr" not in out:
-        out.append("asr")
-    return ",".join(out[:10])
+    if "asr" in out:
+        return ",".join(out[:10])
+    return ",".join(out[:9] + ["asr"])
 
 
 def _retry_after(exc: urllib.error.HTTPError) -> float | None:
@@ -126,8 +126,12 @@ def _get(path: str, params: dict) -> tuple[int, dict | None]:
         request = Request(url, headers=headers, method="GET")
         try:
             with urlopen(request, timeout=60, context=context) as response:
+                status = getattr(response, "status", 200)
                 body = response.read().decode("utf-8", errors="replace")
-                return getattr(response, "status", 200), json.loads(body or "{}")
+            try:
+                return status, json.loads(body or "{}")
+            except (json.JSONDecodeError, ValueError):
+                return 0, None
         except urllib.error.HTTPError as exc:
             if exc.code in RETRYABLE and attempt < MAX_ATTEMPTS - 1:
                 time.sleep(_retry_after(exc) or 2.0 * (attempt + 1))
@@ -167,11 +171,16 @@ def fetch_transcript(
     if status == 200 and isinstance(data, dict):
         segments: list[dict] = []
         for item in data.get("transcript") or []:
+            if not isinstance(item, dict):
+                continue
             text = (item.get("text") or "").strip()
             if not text:
                 continue
-            start = round(float(item.get("start") or 0.0), 2)
-            duration = float(item.get("duration") or 0.0)
+            try:
+                start = round(float(item.get("start") or 0.0), 2)
+                duration = float(item.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                continue
             segments.append({"start": start, "end": round(start + duration, 2), "text": text})
         if segments:
             return segments, str(data.get("language") or language or "")
