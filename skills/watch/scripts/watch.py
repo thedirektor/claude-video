@@ -504,6 +504,18 @@ def main() -> int:
     transcript_source: str | None = None
     video_path: str | None = None
 
+    # Resume: reuse a previously-resolved transcript BEFORE any (paid) TranscriptAPI
+    # call or caption parse, so a matching --out-dir re-run costs nothing.
+    cached_tx = state.load_stage(work, "transcript", resume_sig) if resume else None
+    if cached_tx and cached_tx.get("segments"):
+        transcript_segments = cached_tx["segments"]
+        transcript_source = cached_tx.get("source") or "captions"
+        transcript_text = format_transcript(transcript_segments)
+        print(
+            f"[watch] resume: reusing transcript ({len(transcript_segments)} segments)",
+            file=sys.stderr,
+        )
+
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
         dl = fetch_captions(
@@ -521,7 +533,8 @@ def main() -> int:
         # no credits, no transcript, network) falls through to yt-dlp captions /
         # Whisper. Skipped for --audio (that external VO is not the video's own).
         if (
-            not args.no_transcriptapi
+            not transcript_segments
+            and not args.no_transcriptapi
             and audio_override is None
             and transcriptapi.is_youtube_url(args.source)
         ):
@@ -552,6 +565,18 @@ def main() -> int:
             except Exception as exc:
                 print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
                 transcript_segments = []
+
+    # Persist a pre-download transcript (TranscriptAPI / captions) now, so a later
+    # gated video-download failure doesn't discard it and a resume reuses it without
+    # re-billing TranscriptAPI. The post-Whisper save below still covers the
+    # local-file / caption-less path.
+    if args.out_dir and transcript_segments:
+        state.save_stage(
+            work,
+            "transcript",
+            {"segments": transcript_segments, "source": transcript_source},
+            resume_sig,
+        )
 
     # --timestamps needs the video for frame grabs, so it overrides the
     # transcript-mode download skip (and forces a full, not audio-only, fetch).
@@ -630,15 +655,6 @@ def main() -> int:
     # sees Whisper transcripts too — local files and caption-less URLs — not just the
     # captions available pre-frames. A failed Whisper call falls through, leaving the
     # frame pipeline (without two-pass) to run exactly as it would with no transcript.
-    cached_tx = state.load_stage(work, "transcript", resume_sig) if resume else None
-    if cached_tx and cached_tx.get("segments"):
-        transcript_segments = cached_tx["segments"]
-        transcript_source = cached_tx.get("source") or "captions"
-        transcript_text = format_transcript(transcript_segments)
-        print(
-            f"[watch] resume: reusing transcript ({len(transcript_segments)} segments)",
-            file=sys.stderr,
-        )
     if not transcript_segments and dl.get("subtitle_path") and audio_override is None:
         try:
             all_segments = parse_vtt(dl["subtitle_path"])
