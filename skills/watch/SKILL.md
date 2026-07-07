@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.4.4"
+version: "0.4.5"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -420,6 +420,8 @@ Artifacts are routed by content type, split by who consumes them:
 - **`report.md` (+ any other non-media artifact) → a Paperless-ngx document** (additive with Nextcloud), titled `<title> (<video-id>)`, tagged `watch`. This is the **searchable** copy: Nextcloud stores the report, Paperless *indexes* it, so a no-vision agent can answer "did I already watch something about X?" with one `GET /api/documents/?query=X` across every report ever saved — turning the library from passive archive into queryable memory. Needs Paperless's Tika/Gotenberg pipeline (which ingests markdown as text). Re-runs rely on Paperless's own content-hash dedup: an identical `report.md` is auto-rejected as a duplicate (the original survives). The uploader never deletes — Paperless keeps deleted docs in a 30-day trash whose content hash would otherwise block the re-upload, so a delete-then-reupload of identical bytes would leave *zero* active docs. A materially changed `report.md` (different frames/transcript) creates a second document with the same title.
 
 The video itself is only uploaded when a real download happened — it's skipped for TranscriptAPI-only YouTube runs and for `--detail transcript`. A transcript-only run simply uploads `report.md` to Nextcloud + Paperless and does nothing on Immich.
+
+**Reading it back later.** The `/watch-recall <topic-or-title>` command is the read side of this library: from any later session it full-text-searches Paperless (falling back to Nextcloud folder titles) and returns the saved `report.md` so an agent can learn from a video it never watched, pointing at the Immich album when frames are actually needed. See the `watch-recall` skill.
 
 **Representative frame cap.** The library uploads a further-reduced subset of frames, not the full extracted set, so Immich isn't flooded with every sampled frame — `WATCH_SAVE_FRAME_CAP` (default **20**, `0` = upload all). Selection priority: OCR-significant frames first (on-screen text — critical for tutorials/code/debugging), then transcript-cue frames, then scene-representative frames, then even time-spacing fill if still under the cap.
 
