@@ -95,10 +95,8 @@ def languages_from_sub_langs(sub_langs: str) -> str:
         if not tok or tok == "all" or tok.endswith("-orig") or not tok[0].isalpha():
             continue
         base = tok.split("-")[0]
-        if base and base not in out:
+        if base and base != "asr" and base not in out:
             out.append(base)
-    if "asr" in out:
-        return ",".join(out[:10])
     return ",".join(out[:9] + ["asr"])
 
 
@@ -170,18 +168,21 @@ def fetch_transcript(
 
     if status == 200 and isinstance(data, dict):
         segments: list[dict] = []
-        for item in data.get("transcript") or []:
-            if not isinstance(item, dict):
-                continue
-            text = (item.get("text") or "").strip()
-            if not text:
-                continue
-            try:
+        try:
+            raw = data.get("transcript")
+            for item in (raw if isinstance(raw, list) else []):
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                text = text.strip() if isinstance(text, str) else ""
+                if not text:
+                    continue
                 start = round(float(item.get("start") or 0.0), 2)
                 duration = float(item.get("duration") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            segments.append({"start": start, "end": round(start + duration, 2), "text": text})
+                segments.append({"start": start, "end": round(start + duration, 2), "text": text})
+        except (TypeError, ValueError, AttributeError):
+            print("[watch] TranscriptAPI returned an unexpected payload — falling back", file=sys.stderr)
+            return None
         if segments:
             return segments, str(data.get("language") or language or "")
         print("[watch] TranscriptAPI returned an empty transcript — falling back", file=sys.stderr)
