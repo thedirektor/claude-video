@@ -35,6 +35,7 @@ from frames import (  # noqa: E402
     reextract_frame,
 )
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
+import transcriptapi  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
 from scenes import DEFAULT_THRESHOLD, detect_scenes  # noqa: E402
 from speech import DEFAULT_SPEECH_SHARE, compute_speech_windows, format_windows, two_pass_sample  # noqa: E402
@@ -373,6 +374,13 @@ def main() -> int:
         help="Disable Whisper fallback. Report frames-only if no captions available.",
     )
     ap.add_argument(
+        "--no-transcriptapi",
+        action="store_true",
+        help="Disable the TranscriptAPI YouTube-transcript backend (transcriptapi.com). "
+        "By default, YouTube URLs fetch their transcript from TranscriptAPI first "
+        "(needs TRANSCRIPTAPI_API_KEY); this forces the yt-dlp caption / Whisper path.",
+    )
+    ap.add_argument(
         "--no-ocr",
         action="store_true",
         help="Disable OCR pass. Skips text detection on frames and the high-res re-extract.",
@@ -505,9 +513,38 @@ def main() -> int:
             cookies_from_browser=args.cookies_from_browser,
             cookies_file=args.cookies,
         )
+        # TranscriptAPI first (YouTube URLs): fetch the transcript from
+        # transcriptapi.com, whose servers clear YouTube's bot-gate / PO-token /
+        # nsig walls that block yt-dlp caption fetch from a datacenter IP. Runs
+        # BEFORE the caption parse + the download decision below, so transcript
+        # mode skips the (gated) audio download. Best-effort — any miss (no key,
+        # no credits, no transcript, network) falls through to yt-dlp captions /
+        # Whisper. Skipped for --audio (that external VO is not the video's own).
+        if (
+            not args.no_transcriptapi
+            and audio_override is None
+            and transcriptapi.is_youtube_url(args.source)
+        ):
+            ta_key = transcriptapi.load_api_key()
+            if ta_key:
+                ta_langs = transcriptapi.languages_from_sub_langs(args.sub_lang or DEFAULT_SUB_LANGS)
+                print(f"[watch] fetching transcript via TranscriptAPI (lang: {ta_langs})…", file=sys.stderr)
+                ta_result = transcriptapi.fetch_transcript(args.source, ta_key, language=ta_langs)
+                if ta_result is not None:
+                    transcript_segments, _resolved_lang = ta_result
+                    transcript_text = format_transcript(transcript_segments)
+                    transcript_source = (
+                        f"transcriptapi ({_resolved_lang})" if _resolved_lang else "transcriptapi"
+                    )
+                    print(
+                        f"[watch] TranscriptAPI: {len(transcript_segments)} segments ({_resolved_lang})",
+                        file=sys.stderr,
+                    )
+            else:
+                print("[watch] no TRANSCRIPTAPI_API_KEY set — skipping TranscriptAPI", file=sys.stderr)
         # --audio supplies an external track that must win over the video's own
         # captions, so skip caption parsing entirely when it is set.
-        if dl.get("subtitle_path") and audio_override is None:
+        if dl.get("subtitle_path") and audio_override is None and not transcript_segments:
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
                 transcript_text = format_transcript(transcript_segments)
