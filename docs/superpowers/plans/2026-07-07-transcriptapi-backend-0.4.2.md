@@ -511,46 +511,72 @@ Add the argparse flag after the `--no-whisper` block:
     )
 ```
 
-- [ ] **Step 4: Resolve TranscriptAPI before captions/Whisper**
+- [ ] **Step 4: Resolve TranscriptAPI early — BEFORE the download decision**
 
-`watch.py`'s transcript resolution (the caption re-parse block near the `if not transcript_segments and dl.get("subtitle_path")` line, ~line 555 at v0.4.1) is where captions are parsed and, below it, Whisper. Insert a TranscriptAPI attempt **immediately before** that region so it wins for YouTube URLs. It sets `transcript_segments`, which short-circuits the existing `if not transcript_segments` guards (captions + Whisper) — do NOT rewrite those guards.
+**Critical ordering:** in `--detail transcript` mode, `watch.py` decides whether to download the video/audio (around `audio_only = detail == "transcript" and not cue_timestamps` → `if detail == "transcript" and transcript_segments and not cue_timestamps: video_path = None` else download) BEFORE the later caption-reparse/Whisper region. If TranscriptAPI ran there, transcript-mode would already have attempted the (bot-gated) audio download. So TranscriptAPI must set `transcript_segments` **inside the `if url_source:` block, right after `dl = fetch_captions(...)` and before the yt-dlp caption parse** — early enough that the download decision sees the transcript and skips the download.
 
-Insert (place it right after the resume `cached_tx` block if present, else right before the caption re-parse block):
+Read the `if url_source:` block (roughly lines 499–517 at v0.4.1). It is:
 ```python
-    # TranscriptAPI: for YouTube URLs, fetch the transcript from transcriptapi.com
-    # (their servers clear YouTube's bot-gate / PO-token / nsig walls that block
-    # yt-dlp caption fetch from a datacenter IP). Highest precedence; best-effort —
-    # any miss falls through to the yt-dlp captions / Whisper path below. Skipped
-    # when --audio supplies an external track (that VO is not the video's own).
-    if (
-        not transcript_segments
-        and not args.no_transcriptapi
-        and audio_override is None
-        and url_source
-        and transcriptapi.is_youtube_url(args.source)
-    ):
-        ta_key = transcriptapi.load_api_key()
-        if ta_key:
-            ta_langs = transcriptapi.languages_from_sub_langs(args.sub_lang or DEFAULT_SUB_LANGS)
-            print(f"[watch] fetching transcript via TranscriptAPI (lang: {ta_langs})…", file=sys.stderr)
-            ta_result = transcriptapi.fetch_transcript(args.source, ta_key, language=ta_langs)
-            if ta_result is not None:
-                all_segments, resolved_lang = ta_result
-                transcript_segments = (
-                    filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-                )
+    if url_source:
+        print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
+        dl = fetch_captions( ... )
+        if dl.get("subtitle_path") and audio_override is None:
+            try:
+                transcript_segments = parse_vtt(dl["subtitle_path"])
                 transcript_text = format_transcript(transcript_segments)
-                transcript_source = f"transcriptapi ({resolved_lang})" if resolved_lang else "transcriptapi"
-                print(f"[watch] TranscriptAPI: {len(transcript_segments)} segments ({resolved_lang})", file=sys.stderr)
-        else:
-            print("[watch] no TRANSCRIPTAPI_API_KEY set — skipping TranscriptAPI, using captions/Whisper", file=sys.stderr)
+                transcript_source = "captions"
+            except Exception as exc:
+                print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
+                transcript_segments = []
 ```
 
-Note: `start_sec`, `end_sec`, `focused`, `url_source`, `audio_override`, `args.sub_lang`, `DEFAULT_SUB_LANGS`, `filter_range`, `format_transcript` are all already in scope at that point (verify by reading the surrounding lines). If the resume `cached_tx` reuse block exists just above, place this AFTER it so a resumed transcript still wins and this becomes a no-op (its `if not transcript_segments` guard is false).
+Make two edits:
 
-- [ ] **Step 5: Save resumed TranscriptAPI transcript too**
+(a) Insert the TranscriptAPI attempt immediately after the `dl = fetch_captions(...)` call, before the caption-parse `if`. Do NOT filter by range here — `focused`/`start_sec`/`end_sec` are not computed until later, and the existing `if transcript_segments and focused: transcript_segments = filter_range(...)` block downstream handles focus filtering. Set the full (unfiltered) transcript:
+```python
+        # TranscriptAPI first (YouTube URLs): fetch the transcript from
+        # transcriptapi.com, whose servers clear YouTube's bot-gate / PO-token /
+        # nsig walls that block yt-dlp caption fetch from a datacenter IP. Runs
+        # BEFORE the caption parse + the download decision below, so transcript
+        # mode skips the (gated) audio download. Best-effort — any miss (no key,
+        # no credits, no transcript, network) falls through to yt-dlp captions /
+        # Whisper. Skipped for --audio (that external VO is not the video's own).
+        if (
+            not args.no_transcriptapi
+            and audio_override is None
+            and transcriptapi.is_youtube_url(args.source)
+        ):
+            ta_key = transcriptapi.load_api_key()
+            if ta_key:
+                ta_langs = transcriptapi.languages_from_sub_langs(args.sub_lang or DEFAULT_SUB_LANGS)
+                print(f"[watch] fetching transcript via TranscriptAPI (lang: {ta_langs})…", file=sys.stderr)
+                ta_result = transcriptapi.fetch_transcript(args.source, ta_key, language=ta_langs)
+                if ta_result is not None:
+                    transcript_segments, _resolved_lang = ta_result
+                    transcript_text = format_transcript(transcript_segments)
+                    transcript_source = (
+                        f"transcriptapi ({_resolved_lang})" if _resolved_lang else "transcriptapi"
+                    )
+                    print(
+                        f"[watch] TranscriptAPI: {len(transcript_segments)} segments ({_resolved_lang})",
+                        file=sys.stderr,
+                    )
+            else:
+                print("[watch] no TRANSCRIPTAPI_API_KEY set — skipping TranscriptAPI", file=sys.stderr)
+```
 
-The resume stage-save (`if args.out_dir and transcript_segments: state.save_stage(... "transcript" ...)`) already runs after the whole transcript region, so a TranscriptAPI transcript is persisted for `--out-dir` resume automatically — confirm it is below this block; no new code needed.
+(b) Guard the existing caption parse so it only runs when TranscriptAPI did NOT already resolve a transcript — change its condition to add `and not transcript_segments`:
+```python
+        if dl.get("subtitle_path") and audio_override is None and not transcript_segments:
+```
+
+That is the ONLY change to the caption-parse block. The later caption-reparse (`if not transcript_segments and dl.get("subtitle_path") …`) and the Whisper-fallback block already guard on `not transcript_segments`, so a TranscriptAPI transcript short-circuits them too — do NOT rewrite those.
+
+Precedence is therefore **TranscriptAPI → yt-dlp captions → Whisper** for YouTube URLs; unchanged for non-YouTube sources.
+
+- [ ] **Step 5: Resume save is automatic**
+
+The resume stage-save (`if args.out_dir and transcript_segments: state.save_stage(work, "transcript", …)`) runs after the whole transcript region, so a TranscriptAPI transcript persists for `--out-dir` resume with no new code — confirm it is below, unchanged.
 
 - [ ] **Step 6: Run tests**
 
