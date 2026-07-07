@@ -103,11 +103,29 @@ def test_fetch_transcript_wrong_shape_returns_none(monkeypatch):
     assert transcriptapi.fetch_transcript("vid", "sk") is None  # non-dict items skipped → empty → None
 
 
+def test_fetch_transcript_non_string_text_returns_none(monkeypatch):
+    monkeypatch.setattr(transcriptapi, "urlopen",
+                        lambda *a, **k: _Resp({"transcript": [{"text": 123, "start": 0, "duration": 1}]}))
+    assert transcriptapi.fetch_transcript("vid", "sk") is None  # non-str text skipped → empty → None
+
+
+def test_fetch_transcript_non_list_transcript_returns_none(monkeypatch):
+    monkeypatch.setattr(transcriptapi, "urlopen",
+                        lambda *a, **k: _Resp({"transcript": 5, "language": "es"}))
+    assert transcriptapi.fetch_transcript("vid", "sk") is None  # non-list transcript → never raises
+
+
 def test_language_mapping_reserves_asr_slot():
     many = ",".join(f"l{i}" for i in range(12))
     out = transcriptapi.languages_from_sub_langs(many).split(",")
     assert out[-1] == "asr"
     assert len(out) <= 10
+
+
+def test_language_mapping_explicit_asr_still_present_at_cap():
+    codes = ",".join(f"l{i}" for i in range(10)) + ",asr"
+    out = transcriptapi.languages_from_sub_langs(codes).split(",")
+    assert out[-1] == "asr" and len(out) <= 10 and out.count("asr") == 1
 
 
 def test_load_api_key_env_and_dotenv(monkeypatch, tmp_path):
