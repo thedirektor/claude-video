@@ -2,6 +2,32 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.3] — 2026-07-07
+
+### Added
+- **Library storage (Immich + Nextcloud).** Every `/watch` run now saves its
+  own artifacts after the report is printed, unless `--no-save` is passed.
+  Artifacts are split by who consumes them: the downloaded video + a capped
+  set of representative frames go to an **Immich** album (`<title>
+  (<video-id>)`), while `report.md` (the full transcript + OCR + frame index)
+  goes to a **Nextcloud** folder (`Watch/<title> (<video-id>)/`) — so a
+  no-vision agent can later learn from a video it never watched by reading
+  `report.md`. New pure-stdlib `library.py`: content-type router, a
+  representative-frame selector (`WATCH_SAVE_FRAME_CAP`, default 20, `0` =
+  all; priority OCR-significant → transcript-cue → scene-representative →
+  even-spacing fill), an Immich uploader (multipart `/api/assets` + album
+  create/reuse, deduped via a stable `deviceAssetId`), and a Nextcloud WebDAV
+  uploader (`MKCOL` + `PUT`, idempotent). New config keys `IMMICH_BASE_URL`,
+  `IMMICH_API_KEY`, `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_PASS`,
+  `WATCH_SAVE_FRAME_CAP` (`NEXTCLOUD_PASS` must be a Nextcloud **app
+  password** — Settings → Security → Devices & Sessions). Best-effort: any
+  failure (missing config, network, bad response) logs a one-line stderr note
+  and skips only that target — it never fails the `/watch` run, and the
+  other target still runs. `setup.py` documents the 6 keys in its env
+  template and reports which targets are configured (`library_targets`,
+  informational only — never gates `can_proceed`, same treatment as
+  TranscriptAPI).
+
 ## [0.4.2] — 2026-07-07
 
 ### Added
