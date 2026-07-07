@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.4.1"
+version: "0.4.2"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -101,7 +101,7 @@ WATCH_DETAIL=balanced
 
 Use the user's selected value. If they skip the question, keep the recommended default. Once dependencies, the API-key choice, and this preference are handled, write or update `SETUP_COMPLETE=true` in the same file. Do not ask this preference question again when `SETUP_COMPLETE=true`.
 
-**Structured mode (optional):** `python3 "${SKILL_DIR}/scripts/setup.py" --json` emits `{status, can_proceed, first_run, setup_complete, missing_binaries, whisper_backend, has_api_key, config_file, watch_detail, platform}` where `status` is one of `ready | needs_install | needs_key | needs_install_and_key`. `status` describes the *ideal* state (a key is encouraged, so a keyless first run reads `needs_key`); `can_proceed` is the operational gate (binaries present AND a key is set OR setup was already completed). Branch on `can_proceed`/`first_run` to decide whether to run; use `status` to decide what to encourage.
+**Structured mode (optional):** `python3 "${SKILL_DIR}/scripts/setup.py" --json` emits `{status, can_proceed, first_run, setup_complete, missing_binaries, whisper_backend, has_api_key, has_transcriptapi_key, config_file, watch_detail, platform}` where `status` is one of `ready | needs_install | needs_key | needs_install_and_key`. `status` describes the *ideal* state (a key is encouraged, so a keyless first run reads `needs_key`); `can_proceed` is the operational gate (binaries present AND a key is set OR setup was already completed). Branch on `can_proceed`/`first_run` to decide whether to run; use `status` to decide what to encourage. `has_transcriptapi_key` reports whether `TRANSCRIPTAPI_API_KEY` is set (optional — TranscriptAPI is best-effort and never gates `can_proceed`).
 
 Within a single session, you can skip Step 0 on follow-up `/watch` calls — once `--check` returned 0, nothing about the environment changes between turns.
 
@@ -179,6 +179,7 @@ Optional flags:
 - `--whisper-model NAME` — faster-whisper model size for the local backend. Choices: `tiny | base | small | medium | large-v2 | large-v3`. Default `large-v3`. Ignored for groq / openai / assemblyai. See the model table under "Local Whisper" below.
 - `--diarize` / `--no-diarize` — request speaker labels when the backend supports them (currently only AssemblyAI). Default ON; pass `--no-diarize` for sentence-level segments without speaker tags. Ignored for local / groq / openai.
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions). Cannot combine with `--audio`.
+- `--no-transcriptapi` — disable the TranscriptAPI YouTube-transcript backend. By default, YouTube URLs fetch their transcript from [TranscriptAPI](https://transcriptapi.com) first (needs `TRANSCRIPTAPI_API_KEY`), which succeeds from server IPs where YouTube blocks yt-dlp; this flag forces the yt-dlp caption / Whisper path instead.
 
 **OCR**
 - `--no-ocr` — disable the OCR pass. By default, after frames are extracted the script runs Tesseract over them (lang=`spa+eng`) and re-extracts text-heavy frames at 1024px so on-screen text stays legible. Disable when text doesn't matter (silent action footage, abstract content) to save a few seconds.
@@ -290,6 +291,10 @@ Behavior:
 - **Honors focus mode.** With `--start/--end`, any cue timestamp outside the window is dropped (reported in the summary). Coordinates are always absolute source time.
 - **Cue-only frames.** `--detail transcript --timestamps …` skips scene/keyframe/two-pass sampling and returns *only* the cue frames (it will download the video to do so, since frames need pixels).
 
+## YouTube transcripts (TranscriptAPI)
+
+For **YouTube URLs**, `/watch` resolves the transcript in this order: **TranscriptAPI → yt-dlp captions → Whisper**. TranscriptAPI (`transcriptapi.com`) runs the extraction on its own servers, so it clears YouTube's "confirm you're not a bot" / PO-token / nsig walls that block yt-dlp from datacenter/VPS IPs — with **zero Whisper spend** and no video download for `--detail transcript`. Set `TRANSCRIPTAPI_API_KEY` in `~/.config/watch/.env` (1 credit per transcript; video metadata is free). Language preference follows `--sub-lang` (default Spanish→English→auto). Pass `--no-transcriptapi` to force the yt-dlp path. YouTube *frames* still require the (often gated) video download — TranscriptAPI covers the transcript only.
+
 ## Transcription
 
 The script gets a timestamped transcript via up to four backends, in priority order, resolved **before** frame extraction runs:
@@ -308,6 +313,7 @@ API keys live in `~/.config/watch/.env`. Auto-selection priority: `local` → `g
 Because the transcript now fully resolves before any frame is extracted — for local files and Whisper-produced transcripts, not just caption-bearing URLs — two-pass speech-aware sampling (see "Frame sampling" above) is available in every one of these cases, not only when captions exist up front.
 
 The report header shows the backend used:
+- `via transcriptapi (lang)` — YouTube-only; fetched from TranscriptAPI before yt-dlp captions were attempted (see "YouTube transcripts (TranscriptAPI)" above)
 - `via captions` — yt-dlp pulled native subs
 - `via whisper (local, large-v3)` — local GPU
 - `via whisper (groq)` / `via whisper (openai)` — API
@@ -471,6 +477,7 @@ This fork has been tested on **Windows 11 + Python 3.14** (and the Bash tool's P
 
 **What this skill does:**
 - Runs `yt-dlp` locally to download the video and pull native captions when the source supports them (public data; the request goes directly to whatever host the URL points at)
+- For **YouTube URLs**, unless `--no-transcriptapi` is passed, sends the video URL to TranscriptAPI (`transcriptapi.com/api/v2`) when `TRANSCRIPTAPI_API_KEY` is set, requesting the transcript before falling back to yt-dlp captions/Whisper — see "YouTube transcripts (TranscriptAPI)" above. No audio or video bytes are sent, only the URL and language preference
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when an API Whisper backend is used, a mono 16 kHz audio clip
 - When `--whisper local` is selected (or auto-picked because a GPU is available), runs faster-whisper / CTranslate2 entirely on the user's machine — no network call, no upload
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set and the local backend isn't used
@@ -488,10 +495,10 @@ This fork has been tested on **Windows 11 + Python 3.14** (and the Bash tool's P
 - Does not upload anything when `--whisper local` is the active backend — the audio stays on disk and is processed entirely on-device
 - The full video only leaves the machine when `--backend gemini` is explicitly selected (Files API upload, or a YouTube URL passed through for Google to fetch server-side); `--backend openrouter` sends extracted frames + audio, never the raw video file
 - Does not access any platform account (no login, no session cookies, no posting)
-- Does not share API keys between providers (Groq → `api.groq.com`, OpenAI → `api.openai.com`, AssemblyAI → `api.assemblyai.com`, Gemini → `generativelanguage.googleapis.com`, OpenRouter → `openrouter.ai`)
+- Does not share API keys between providers (Groq → `api.groq.com`, OpenAI → `api.openai.com`, AssemblyAI → `api.assemblyai.com`, Gemini → `generativelanguage.googleapis.com`, OpenRouter → `openrouter.ai`, TranscriptAPI → `transcriptapi.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory, `~/.config/watch/.env`, and the HuggingFace model cache (when local Whisper is used) — clean up the working directory when you're done (Step 5)
 
-**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/config.py` (shared config — `~/.config/watch/.env`), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction + auto-fps + dedup), `scripts/scenes.py` (PySceneDetect wrapper + midpoint picker), `scripts/speech.py` (speech-window detection + two-pass sampling), `scripts/ocr.py` (Tesseract OCR over frames), `scripts/transcribe.py` (VTT caption parsing + speaker-aware formatting), `scripts/whisper.py` (Groq / OpenAI clients + backend resolver + auto-chunking), `scripts/whisper_local.py` (faster-whisper / GPU client), `scripts/whisper_assemblyai.py` (AssemblyAI client with speaker diarization), `scripts/gemini.py` (Gemini multimodal video client — `--backend gemini`), `scripts/openrouter.py` (OpenRouter vision + audio client — `--backend openrouter`), `scripts/setup.py` (preflight + installer)
+**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/config.py` (shared config — `~/.config/watch/.env`), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction + auto-fps + dedup), `scripts/scenes.py` (PySceneDetect wrapper + midpoint picker), `scripts/speech.py` (speech-window detection + two-pass sampling), `scripts/ocr.py` (Tesseract OCR over frames), `scripts/transcribe.py` (VTT caption parsing + speaker-aware formatting), `scripts/transcriptapi.py` (TranscriptAPI YouTube-transcript client), `scripts/whisper.py` (Groq / OpenAI clients + backend resolver + auto-chunking), `scripts/whisper_local.py` (faster-whisper / GPU client), `scripts/whisper_assemblyai.py` (AssemblyAI client with speaker diarization), `scripts/gemini.py` (Gemini multimodal video client — `--backend gemini`), `scripts/openrouter.py` (OpenRouter vision + audio client — `--backend openrouter`), `scripts/setup.py` (preflight + installer)
 
 Review scripts before first use to verify behavior.
