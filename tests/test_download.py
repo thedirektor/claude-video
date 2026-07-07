@@ -86,3 +86,24 @@ def test_download_url_uses_player_client_chain(monkeypatch, tmp_path):
     argv = calls[0]
     assert _has_flag_value(argv, "--extractor-args", "youtube:player_client=default,android,mweb")
     assert "--sleep-interval" in argv and "--max-sleep-interval" in argv
+
+
+def test_no_cookie_flags_by_default(monkeypatch, tmp_path):
+    calls = _capture_argv(monkeypatch)
+    download.fetch_captions(URL, tmp_path / "download")
+    argv = calls[0]
+    assert "--cookies" not in argv
+    assert "--cookies-from-browser" not in argv
+
+
+def test_cookies_from_browser_passed_through(monkeypatch, tmp_path):
+    calls = _capture_argv(monkeypatch)
+    download.fetch_captions(URL, tmp_path / "download", cookies_from_browser="firefox")
+    assert _has_flag_value(calls[0], "--cookies-from-browser", "firefox")
+
+
+def test_cookies_file_passed_through(monkeypatch, tmp_path):
+    calls = _capture_argv(monkeypatch)
+    with pytest.raises(SystemExit):
+        download.download_url(URL, tmp_path / "download", cookies_file="/tmp/c.txt")
+    assert _has_flag_value(calls[0], "--cookies", "/tmp/c.txt")

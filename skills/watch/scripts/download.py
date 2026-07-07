@@ -36,6 +36,16 @@ HARDENING_ARGS = [
 ]
 
 
+def _cookie_args(cookies_from_browser: str | None, cookies_file: str | None) -> list[str]:
+    """Build the yt-dlp cookie flags. Off by default — both None yields []."""
+    args: list[str] = []
+    if cookies_from_browser:
+        args += ["--cookies-from-browser", cookies_from_browser]
+    if cookies_file:
+        args += ["--cookies", cookies_file]
+    return args
+
+
 def is_url(source: str) -> bool:
     if source.startswith("-"):
         return False
@@ -81,7 +91,12 @@ def _pick_video(out_dir: Path) -> Path | None:
     return None
 
 
-def fetch_captions(url: str, out_dir: Path) -> dict:
+def fetch_captions(
+    url: str,
+    out_dir: Path,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+) -> dict:
     """Fetch metadata and best available VTT captions without downloading video."""
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
@@ -100,6 +115,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         "--no-playlist",
         "--ignore-errors",
         *HARDENING_ARGS,
+        *_cookie_args(cookies_from_browser, cookies_file),
         "-o", output_template,
         "--",
         url,
@@ -136,6 +152,8 @@ def download_url(
     url: str,
     out_dir: Path,
     audio_only: bool = False,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
 ) -> dict:
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
@@ -158,6 +176,7 @@ def download_url(
         "--no-playlist",
         "--ignore-errors",
         *HARDENING_ARGS,
+        *_cookie_args(cookies_from_browser, cookies_file),
         "-o", output_template,
         "--",
         url,
@@ -187,9 +206,17 @@ def download(
     source: str,
     out_dir: Path,
     audio_only: bool = False,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
 ) -> dict:
     if is_url(source):
-        return download_url(source, out_dir, audio_only=audio_only)
+        return download_url(
+            source,
+            out_dir,
+            audio_only=audio_only,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file,
+        )
     return resolve_local(source)
 
 

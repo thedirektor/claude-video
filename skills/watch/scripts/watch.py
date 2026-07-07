@@ -340,6 +340,19 @@ def main() -> int:
         "Useful when the video is muted and the VO ships as a separate file.",
     )
     ap.add_argument(
+        "--cookies-from-browser",
+        type=str,
+        default=None,
+        help="Load yt-dlp cookies from a browser profile (chrome|firefox|edge|brave|safari|...) "
+        "for login-walled or age-gated sources. Off by default.",
+    )
+    ap.add_argument(
+        "--cookies",
+        type=str,
+        default=None,
+        help="Path to a Netscape cookies.txt for yt-dlp. Off by default.",
+    )
+    ap.add_argument(
         "--no-whisper",
         action="store_true",
         help="Disable Whisper fallback. Report frames-only if no captions available.",
@@ -449,7 +462,12 @@ def main() -> int:
 
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
-        dl = fetch_captions(args.source, work / "download")
+        dl = fetch_captions(
+            args.source,
+            work / "download",
+            cookies_from_browser=args.cookies_from_browser,
+            cookies_file=args.cookies,
+        )
         # --audio supplies an external track that must win over the video's own
         # captions, so skip caption parsing entirely when it is set.
         if dl.get("subtitle_path") and audio_override is None:
@@ -477,6 +495,8 @@ def main() -> int:
                 args.source,
                 work / "download",
                 audio_only=audio_only,
+                cookies_from_browser=args.cookies_from_browser,
+                cookies_file=args.cookies,
             )
         else:
             print("[watch] using local file…", file=sys.stderr)
