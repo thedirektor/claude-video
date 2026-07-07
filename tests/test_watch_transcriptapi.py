@@ -46,6 +46,11 @@ def test_no_transcriptapi_flag_skips_it(monkeypatch, tmp_path):
         raise AssertionError("TranscriptAPI called despite --no-transcriptapi")
     monkeypatch.setattr(watch.transcriptapi, "fetch_transcript", boom)
     monkeypatch.setattr(watch.transcriptapi, "load_api_key", lambda: "sk_test")
+    # With TranscriptAPI off and no captions, transcript mode would otherwise hit
+    # the real yt-dlp download — stub it so the test stays offline (no network).
+    monkeypatch.setattr(watch, "download",
+                        lambda *a, **k: {"video_path": None, "subtitle_path": None,
+                                         "info": {"title": "T", "duration": 30}, "downloaded": False})
     monkeypatch.setattr(sys, "argv", ["watch.py", YT, "--detail", "transcript",
                                       "--no-whisper", "--no-transcriptapi", "--out-dir", str(tmp_path)])
     assert watch.main() == 0  # no transcript, but no crash
