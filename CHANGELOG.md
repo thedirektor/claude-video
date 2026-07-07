@@ -2,6 +2,23 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.5] — 2026-07-07
+
+### Added
+- **`/watch-recall <topic-or-title>` command.** Retrieve a previously saved
+  `/watch` report so a later session can read, see, or learn from a video it
+  never watched — the read side of the library storage added in 0.4.3/0.4.4.
+  New skill `skills/watch-recall/` + `skills/watch/scripts/recall.py`. Retrieval
+  order: **Paperless-ngx full-text search** (`GET /api/documents/?query=…` →
+  fetch each match's full `content`) → **Nextcloud folder-title match** fallback
+  (lists `Watch/`, matches the query against folder names, reads `report.md`) —
+  so recall still works when Paperless is unconfigured or its search index is
+  stale. Every match points at the original video URL, the Paperless doc +
+  Nextcloud path, and the **Immich album** (pull frames only when visual detail
+  is needed). `--full` prints each report's whole text; `--limit N` caps
+  matches. Best-effort: `recall()` never raises. Reuses `library.py`'s config +
+  Nextcloud/SSL helpers; read-only (GET/PROPFIND, never writes).
+
 ## [0.4.4] — 2026-07-07
 
 ### Added
