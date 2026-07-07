@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from config import frame_cap, get_config  # noqa: E402
 from download import DEFAULT_SUB_LANGS, download, fetch_captions, is_url  # noqa: E402
+import state  # noqa: E402
 from frames import (  # noqa: E402
     MAX_FPS,
     auto_fps,
@@ -361,6 +362,12 @@ def main() -> int:
         "uses the first available in this order. Never pass 'all'.",
     )
     ap.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Ignore any resume state in --out-dir and re-run every stage from "
+        "scratch (also bypasses the Whisper chunk cache for this run).",
+    )
+    ap.add_argument(
         "--no-whisper",
         action="store_true",
         help="Disable Whisper fallback. Report frames-only if no captions available.",
@@ -443,6 +450,25 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     print(f"[watch] working dir: {work}", file=sys.stderr)
 
+    # Resume is only meaningful with a stable work dir. With the default tmp dir
+    # each run gets a fresh path, so load_stage always misses (harmless no-op).
+    resume = bool(args.out_dir) and not args.fresh
+    resume_sig = state.params_signature(
+        args.source,
+        {
+            "detail": args.detail,
+            "start": args.start,
+            "end": args.end,
+            "audio": args.audio,
+            "sub_lang": args.sub_lang,
+            "whisper": args.whisper,
+            "resolution": args.resolution,
+        },
+    )
+    if args.out_dir and args.fresh:
+        state.clear_stages(work)
+        print("[watch] --fresh: cleared resume state", file=sys.stderr)
+
     if args.backend == "gemini":
         return _run_gemini_backend(args, work)
     if args.backend == "openrouter":
@@ -494,23 +520,34 @@ def main() -> int:
     if detail == "transcript" and transcript_segments and not cue_timestamps:
         video_path = None
     else:
-        if url_source:
-            print(
-                "[watch] downloading audio via yt-dlp…" if audio_only
-                else "[watch] downloading video via yt-dlp…",
-                file=sys.stderr,
-            )
-            dl = download(
-                args.source,
-                work / "download",
-                audio_only=audio_only,
-                sub_langs=args.sub_lang or DEFAULT_SUB_LANGS,
-                cookies_from_browser=args.cookies_from_browser,
-                cookies_file=args.cookies,
-            )
+        cached_dl = state.load_stage(work, "download", resume_sig) if resume else None
+        if (
+            cached_dl
+            and cached_dl.get("video_path")
+            and Path(cached_dl["video_path"]).exists()
+        ):
+            print("[watch] resume: reusing previously downloaded video", file=sys.stderr)
+            dl = cached_dl
         else:
-            print("[watch] using local file…", file=sys.stderr)
-            dl = download(args.source, work / "download")
+            if url_source:
+                print(
+                    "[watch] downloading audio via yt-dlp…" if audio_only
+                    else "[watch] downloading video via yt-dlp…",
+                    file=sys.stderr,
+                )
+                dl = download(
+                    args.source,
+                    work / "download",
+                    audio_only=audio_only,
+                    sub_langs=args.sub_lang or DEFAULT_SUB_LANGS,
+                    cookies_from_browser=args.cookies_from_browser,
+                    cookies_file=args.cookies,
+                )
+            else:
+                print("[watch] using local file…", file=sys.stderr)
+                dl = download(args.source, work / "download")
+            if args.out_dir:
+                state.save_stage(work, "download", dl, resume_sig)
         video_path = dl["video_path"]
 
     meta = get_metadata(video_path) if video_path else {
@@ -554,6 +591,15 @@ def main() -> int:
     # sees Whisper transcripts too — local files and caption-less URLs — not just the
     # captions available pre-frames. A failed Whisper call falls through, leaving the
     # frame pipeline (without two-pass) to run exactly as it would with no transcript.
+    cached_tx = state.load_stage(work, "transcript", resume_sig) if resume else None
+    if cached_tx and cached_tx.get("segments"):
+        transcript_segments = cached_tx["segments"]
+        transcript_source = cached_tx.get("source") or "captions"
+        transcript_text = format_transcript(transcript_segments)
+        print(
+            f"[watch] resume: reusing transcript ({len(transcript_segments)} segments)",
+            file=sys.stderr,
+        )
     if not transcript_segments and dl.get("subtitle_path") and audio_override is None:
         try:
             all_segments = parse_vtt(dl["subtitle_path"])
@@ -588,7 +634,7 @@ def main() -> int:
                     enable_diarization=args.diarize if backend == "assemblyai" else False,
                     start_seconds=(effective_start if (focused and not audio_override) else None),
                     end_seconds=(effective_end if (focused and not audio_override) else None),
-                    use_cache=True,
+                    use_cache=not args.fresh,
                 )
                 transcript_segments = (
                     filter_range(all_segments, start_sec, end_sec) if focused else all_segments
@@ -619,6 +665,14 @@ def main() -> int:
             )
     elif not transcript_segments and video_path and not meta.get("has_audio") and not audio_override:
         print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
+
+    if args.out_dir and transcript_segments:
+        state.save_stage(
+            work,
+            "transcript",
+            {"segments": transcript_segments, "source": transcript_source},
+            resume_sig,
+        )
 
     scope = (
         f"{format_time(effective_start)}-{format_time(effective_end)} ({effective_duration:.1f}s)"
