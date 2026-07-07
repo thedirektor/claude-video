@@ -43,16 +43,16 @@ def save_stage(work: Path, name: str, data, sig: str) -> None:
         _stage_path(work, name).write_text(
             json.dumps({"sig": sig, "data": data}), encoding="utf-8"
         )
-    except (OSError, TypeError):
+    except (OSError, TypeError, ValueError):
         pass  # unserializable / unwritable → just don't cache this stage
 
 
 def load_stage(work: Path, name: str, sig: str):
     """Return the saved `data` iff the stage file exists and its sig matches."""
     path = _stage_path(work, name)
-    if not path.exists():
-        return None
     try:
+        if not path.exists():
+            return None
         blob = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError):
         return None
