@@ -88,6 +88,12 @@ OPENAI_API_KEY=
 # NEXTCLOUD_USER=
 # NEXTCLOUD_PASS=
 #
+# Paperless-ngx (report.md as a full-text-searchable, tagged document —
+# additive with Nextcloud). Create an API token in Paperless at
+# Settings -> "My Profile" -> API Auth Token. Needs Tika enabled to ingest .md.
+# PAPERLESS_URL=https://paperless.cort3x.me
+# PAPERLESS_TOKEN=
+#
 # Cap on representative frames uploaded to Immich per run (0 = all).
 # WATCH_SAVE_FRAME_CAP=20
 
@@ -175,6 +181,11 @@ def _have_nextcloud_pass() -> bool:
     return bool(_read_env_key("NEXTCLOUD_PASS"))
 
 
+def _have_paperless_token() -> bool:
+    """True if PAPERLESS_TOKEN is set (optional library-storage target)."""
+    return bool(_read_env_key("PAPERLESS_TOKEN"))
+
+
 def _library_targets() -> list[str]:
     """Which library-storage targets (library.py's save_artifacts) are
     configured. Best-effort and purely informational — like TranscriptAPI,
@@ -185,6 +196,8 @@ def _library_targets() -> list[str]:
         targets.append("immich")
     if _have_nextcloud_pass():
         targets.append("nextcloud")
+    if _have_paperless_token():
+        targets.append("paperless")
     return targets
 
 
@@ -419,8 +432,9 @@ def cmd_install() -> int:
     else:
         print(
             "[setup] Library storage: not configured (optional — set IMMICH_API_KEY "
-            "and/or NEXTCLOUD_PASS to auto-save each run's video/frames to an Immich "
-            "album and report.md to a Nextcloud folder; --no-save always skips)"
+            "and/or NEXTCLOUD_PASS and/or PAPERLESS_TOKEN to auto-save each run's "
+            "video/frames to an Immich album, report.md to a Nextcloud folder, and "
+            "report.md as a searchable Paperless document; --no-save always skips)"
         )
 
     has_key, backend = _have_api_key()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Route /watch artifacts into a browsable library: Immich (video + frames) +
-Nextcloud (report.md + any non-media).
+"""Route /watch artifacts into a browsable library: Immich (video + frames),
+Nextcloud (report.md + any non-media), and Paperless-ngx (report.md, searchable).
 
 - **video + representative frames -> Immich** (album per video: `POST
   /api/assets` multipart upload, dedup via a stable `deviceAssetId`, then
@@ -8,6 +8,10 @@ Nextcloud (report.md + any non-media).
   /api/albums/{id}/assets`).
 - **report.md (+ any non-media artifact) -> Nextcloud** (WebDAV folder per
   video: `MKCOL` then `PUT`, idempotent).
+- **report.md (+ any non-media artifact) -> Paperless-ngx** (additive with
+  Nextcloud: `POST /api/documents/post_document/`, tagged `watch`, so a
+  no-vision agent can full-text-search across every watched video via the
+  Paperless API. Relies on Paperless's own content-hash dedup for re-runs).
 
 Pure stdlib (`urllib`, `json`, `base64`, `ssl`, `hashlib`, `mimetypes`).
 
@@ -43,7 +47,9 @@ for _stream in (sys.stdout, sys.stderr):
 DEFAULT_IMMICH_BASE_URL = "https://immich.cort3x.me"
 DEFAULT_NEXTCLOUD_URL = "https://nextcloud.cort3x.me"
 DEFAULT_NEXTCLOUD_USER = "thedirektor"
+DEFAULT_PAPERLESS_URL = "https://paperless.cort3x.me"
 DEFAULT_FRAME_CAP = 20
+PAPERLESS_TAG = "watch"
 
 # Router: every artifact belongs to exactly one target. Media (video +
 # frames) -> Immich; everything else (.md/.txt/.json/.vtt/.srt/...) -> Nextcloud.
@@ -62,6 +68,8 @@ CONFIG_KEYS = (
     "NEXTCLOUD_URL",
     "NEXTCLOUD_USER",
     "NEXTCLOUD_PASS",
+    "PAPERLESS_URL",
+    "PAPERLESS_TOKEN",
     "WATCH_SAVE_FRAME_CAP",
 )
 
@@ -112,6 +120,7 @@ def load_config() -> dict:
     cfg["IMMICH_BASE_URL"] = cfg.get("IMMICH_BASE_URL") or DEFAULT_IMMICH_BASE_URL
     cfg["NEXTCLOUD_URL"] = cfg.get("NEXTCLOUD_URL") or DEFAULT_NEXTCLOUD_URL
     cfg["NEXTCLOUD_USER"] = cfg.get("NEXTCLOUD_USER") or DEFAULT_NEXTCLOUD_USER
+    cfg["PAPERLESS_URL"] = cfg.get("PAPERLESS_URL") or DEFAULT_PAPERLESS_URL
 
     cap_raw = cfg.get("WATCH_SAVE_FRAME_CAP")
     try:
@@ -496,6 +505,123 @@ def upload_to_nextcloud(files: list[str], folder: str, cfg: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Paperless-ngx uploader — token auth, tag resolve, dedup, post_document
+#
+# report.md -> a searchable Paperless document (Tika ingests markdown as text),
+# so a no-vision agent can later full-text-search across every watched video via
+# the Paperless API. Additive with Nextcloud: Nextcloud keeps the browsable copy,
+# Paperless provides the search index.
+# --------------------------------------------------------------------------
+
+def _paperless_headers(token: str, content_type: str | None = None) -> dict:
+    headers = {
+        "Authorization": f"Token {token}",
+        "User-Agent": "watch-skill/1.0 (+claude-code; python-urllib)",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _paperless_get(base_url: str, token: str, path: str) -> dict | list:
+    request = Request(f"{base_url}{path}", headers=_paperless_headers(token), method="GET")
+    with urlopen(request, timeout=30, context=_ssl_context()) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+
+
+def _resolve_tag(base_url: str, token: str, name: str) -> int | None:
+    """Return the id of tag `name`, creating it if absent. Best-effort:
+    any failure returns None (the document is still uploaded, untagged)."""
+    try:
+        data = _paperless_get(
+            base_url, token, f"/api/tags/?name__iexact={urllib.parse.quote(name)}"
+        )
+        results = data.get("results") if isinstance(data, dict) else None
+        if results:
+            return results[0].get("id")
+    except Exception:
+        pass
+    try:
+        body = json.dumps({"name": name}).encode("utf-8")
+        request = Request(
+            f"{base_url}/api/tags/",
+            data=body,
+            headers=_paperless_headers(token, "application/json"),
+            method="POST",
+        )
+        with urlopen(request, timeout=30, context=_ssl_context()) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+        return payload.get("id")
+    except Exception as exc:
+        print(f"[watch] library: Paperless tag resolve failed: {exc}", file=sys.stderr)
+        return None
+
+
+def _post_document(base_url: str, token: str, path: str, title: str, tag_id: int | None) -> bool:
+    """POST one file to /api/documents/post_document/. Returns True on a 2xx
+    submission (consumption is async, so this confirms the upload was accepted,
+    not that the document finished processing)."""
+    p = Path(path)
+    data = p.read_bytes()
+    mimetype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+
+    fields: dict = {"title": title}
+    if tag_id is not None:
+        fields["tags"] = tag_id
+
+    body, boundary = _multipart(fields, p.name, data, mimetype, file_field="document")
+    headers = _paperless_headers(token, f"multipart/form-data; boundary={boundary}")
+    request = Request(
+        f"{base_url}/api/documents/post_document/", data=body, headers=headers, method="POST"
+    )
+    with urlopen(request, timeout=120, context=_ssl_context()) as response:
+        status = getattr(response, "status", 200)
+        response.read()
+    return 200 <= status < 300
+
+
+def upload_to_paperless(files: list[str], title: str, cfg: dict) -> dict:
+    """Upload non-media artifacts (report.md, ...) to Paperless-ngx as tagged,
+    searchable documents. NEVER raises."""
+    result = {"title": title, "uploaded": 0, "url": None, "error": None}
+    try:
+        cfg = cfg or {}
+        base_url = (cfg.get("PAPERLESS_URL") or DEFAULT_PAPERLESS_URL).rstrip("/")
+        token = cfg.get("PAPERLESS_TOKEN")
+        if not token:
+            result["error"] = "missing PAPERLESS_TOKEN"
+            return result
+        if not files:
+            return result
+
+        # No delete-then-reupload dedup: Paperless keeps deleted docs (and their
+        # content hash) in a 30-day trash, so deleting a prior run's doc and
+        # re-uploading identical bytes gets rejected as a duplicate — leaving
+        # zero active docs. Paperless's own content-hash dedup already rejects
+        # an identical re-run (the original survives), which is what we want.
+        tag_id = _resolve_tag(base_url, token, PAPERLESS_TAG)
+
+        uploaded = 0
+        for path in files:
+            try:
+                if _post_document(base_url, token, path, title, tag_id):
+                    uploaded += 1
+            except Exception as exc:
+                print(f"[watch] library: Paperless upload failed for {path}: {exc}", file=sys.stderr)
+
+        result["uploaded"] = uploaded
+        if uploaded:
+            result["url"] = f"{base_url}/documents?query={urllib.parse.quote(title)}"
+        else:
+            result["error"] = "no documents uploaded"
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        print(f"[watch] library: Paperless upload failed: {exc}", file=sys.stderr)
+        return result
+
+
+# --------------------------------------------------------------------------
 # Router: content-type split + summary
 # --------------------------------------------------------------------------
 
@@ -580,6 +706,26 @@ def save_artifacts(
                     summary.append(f"Nextcloud: Watch/{name} ({uploaded} files)")
             else:
                 summary.append("Nextcloud: skipped (no NEXTCLOUD_PASS)")
+
+        # Paperless is additive with Nextcloud: same non-media artifacts, but
+        # indexed for full-text search. Only report.md-class files, never media.
+        if nextcloud_files:
+            if cfg.get("PAPERLESS_TOKEN"):
+                try:
+                    result = upload_to_paperless(nextcloud_files, name, cfg)
+                except Exception as exc:
+                    result = {"error": str(exc), "uploaded": 0}
+                    print(f"[watch] library: Paperless uploader raised: {exc}", file=sys.stderr)
+                uploaded = result.get("uploaded", 0)
+                error = result.get("error")
+                if error and not uploaded:
+                    summary.append(f"Paperless: error ({error})")
+                elif error:
+                    summary.append(f"Paperless: '{name}' ({uploaded} docs, {error})")
+                else:
+                    summary.append(f"Paperless: '{name}' ({uploaded} docs)")
+            else:
+                summary.append("Paperless: skipped (no PAPERLESS_TOKEN)")
 
         if not summary:
             summary.append("Library: nothing to save")

@@ -277,6 +277,176 @@ def test_nextcloud_mkcol_put(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Paperless upload flow
+# --------------------------------------------------------------------------
+
+def test_paperless_missing_token_never_raises():
+    result = library.upload_to_paperless(["report.md"], "My Video (abc123)", {})
+    assert result["uploaded"] == 0
+    assert result["error"] and "PAPERLESS_TOKEN" in result["error"]
+
+
+def test_paperless_upload_resolves_tag_and_posts(tmp_path, monkeypatch):
+    report = tmp_path / "report.md"
+    report.write_text("# report body", encoding="utf-8")
+
+    calls = []
+
+    def fake_urlopen(request, timeout=None, context=None):
+        calls.append(request)
+        method = request.get_method()
+        url = request.full_url
+        if "/api/tags/" in url and method == "GET":
+            return _Resp({"count": 1, "results": [{"id": 7, "name": "watch"}]})
+        if url.endswith("/api/documents/post_document/") and method == "POST":
+            return _Resp(b'"11111111-2222-3333-4444-555555555555"')
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    monkeypatch.setattr(library, "urlopen", fake_urlopen)
+
+    cfg = {"PAPERLESS_URL": "https://paperless.example", "PAPERLESS_TOKEN": "tok_abc"}
+    result = library.upload_to_paperless([str(report)], "My Video (abc123)", cfg)
+
+    assert result["error"] is None
+    assert result["uploaded"] == 1
+
+    # Auth header on every call
+    for c in calls:
+        assert c.get_header("Authorization", "") == "Token tok_abc"
+
+    # NEVER deletes: Paperless keeps deleted docs (and their content hash) in a
+    # 30-day trash, so a delete-then-reupload of identical bytes is rejected as
+    # a duplicate — leaving zero active docs. We rely on Paperless's own
+    # content-hash dedup instead (identical re-run is auto-rejected, original
+    # stays). So no DELETE is ever issued.
+    assert not [c for c in calls if c.get_method() == "DELETE"]
+
+    # Document posted with the tag id and title, file field named "document"
+    post_calls = [c for c in calls if c.full_url.endswith("/api/documents/post_document/")]
+    assert len(post_calls) == 1
+    body = post_calls[0].data
+    assert b'name="document"; filename="report.md"' in body
+    assert b'name="title"' in body and b"My Video (abc123)" in body
+    assert b'name="tags"' in body and b"7" in body
+
+
+def test_paperless_creates_tag_when_missing(tmp_path, monkeypatch):
+    report = tmp_path / "report.md"
+    report.write_text("# body", encoding="utf-8")
+
+    calls = []
+
+    def fake_urlopen(request, timeout=None, context=None):
+        calls.append(request)
+        method = request.get_method()
+        url = request.full_url
+        if "/api/tags/" in url and method == "GET":
+            return _Resp({"count": 0, "results": []})
+        if url.endswith("/api/tags/") and method == "POST":
+            return _Resp({"id": 99, "name": "watch"})
+        if "/api/documents/" in url and method == "GET":
+            return _Resp({"count": 0, "results": []})
+        if url.endswith("/api/documents/post_document/") and method == "POST":
+            return _Resp(b'"task-uuid"')
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    monkeypatch.setattr(library, "urlopen", fake_urlopen)
+
+    cfg = {"PAPERLESS_URL": "https://paperless.example", "PAPERLESS_TOKEN": "tok"}
+    result = library.upload_to_paperless([str(report)], "Vid (x1)", cfg)
+
+    assert result["uploaded"] == 1
+    tag_post = [c for c in calls if c.full_url.endswith("/api/tags/") and c.get_method() == "POST"]
+    assert len(tag_post) == 1
+    assert json.loads(tag_post[0].data)["name"] == "watch"
+    # new tag id 99 flows into the document post
+    post = [c for c in calls if c.full_url.endswith("/api/documents/post_document/")][0]
+    assert b"99" in post.data
+
+
+def test_paperless_upload_errors_never_raise(monkeypatch):
+    def boom(request, timeout=None, context=None):
+        raise RuntimeError("paperless down")
+
+    monkeypatch.setattr(library, "urlopen", boom)
+    cfg = {"PAPERLESS_TOKEN": "tok"}
+    # even a hard failure on tag lookup / post must not raise
+    result = library.upload_to_paperless(["/nonexistent/report.md"], "T (v)", cfg)
+    assert result["uploaded"] == 0
+    assert isinstance(result.get("error"), str)
+
+
+# --------------------------------------------------------------------------
+# Paperless routing in save_artifacts (additive with Nextcloud)
+# --------------------------------------------------------------------------
+
+def test_router_sends_report_to_paperless_additive(tmp_path, monkeypatch):
+    report = tmp_path / "report.md"
+    report.write_text("# report", encoding="utf-8")
+
+    nextcloud_calls = []
+    paperless_calls = []
+    monkeypatch.setattr(
+        library, "upload_to_nextcloud",
+        lambda files, folder, cfg: nextcloud_calls.append(list(files)) or {"uploaded": len(files), "error": None},
+    )
+    monkeypatch.setattr(
+        library, "upload_to_paperless",
+        lambda files, title, cfg: paperless_calls.append(list(files)) or {"uploaded": len(files), "error": None},
+    )
+
+    cfg = {
+        "NEXTCLOUD_PASS": "pass",
+        "PAPERLESS_URL": "https://paperless.example",
+        "PAPERLESS_TOKEN": "tok",
+        "WATCH_SAVE_FRAME_CAP": 20,
+    }
+    summary = library.save_artifacts(None, [], str(report), {}, "My Video", "abc123", cfg=cfg)
+
+    # report.md goes to BOTH targets (additive), not one or the other
+    assert nextcloud_calls == [[str(report)]]
+    assert paperless_calls == [[str(report)]]
+    assert any("Paperless" in line for line in summary)
+    assert any("Nextcloud" in line for line in summary)
+
+
+def test_router_paperless_skipped_without_token(tmp_path, monkeypatch):
+    report = tmp_path / "report.md"
+    report.write_text("# report", encoding="utf-8")
+
+    paperless_calls = []
+    monkeypatch.setattr(
+        library, "upload_to_nextcloud",
+        lambda files, folder, cfg: {"uploaded": len(files), "error": None},
+    )
+    monkeypatch.setattr(
+        library, "upload_to_paperless",
+        lambda files, title, cfg: paperless_calls.append(files) or {"uploaded": len(files), "error": None},
+    )
+
+    cfg = {"NEXTCLOUD_PASS": "pass", "WATCH_SAVE_FRAME_CAP": 20}
+    summary = library.save_artifacts(None, [], str(report), {}, "T", "v1", cfg=cfg)
+
+    assert len(paperless_calls) == 0
+    assert any("Paperless" in line and "skipped" in line for line in summary)
+
+
+def test_load_config_paperless(monkeypatch, tmp_path):
+    for k in ("PAPERLESS_URL", "PAPERLESS_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(library.Path, "home", lambda: tmp_path / "nohome")
+    monkeypatch.chdir(tmp_path)
+
+    cfg = library.load_config()
+    assert cfg["PAPERLESS_URL"] == "https://paperless.cort3x.me"
+    assert cfg["PAPERLESS_TOKEN"] is None
+
+    monkeypatch.setenv("PAPERLESS_TOKEN", "tok_env")
+    cfg2 = library.load_config()
+    assert cfg2["PAPERLESS_TOKEN"] == "tok_env"
+
+
+# --------------------------------------------------------------------------
 # Missing config skips only the affected target
 # --------------------------------------------------------------------------
 

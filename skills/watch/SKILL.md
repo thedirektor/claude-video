@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.4.3"
+version: "0.4.4"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -410,15 +410,16 @@ with the same source and options resumes past them. Pass `--fresh` to ignore all
 of this and start clean. With `--start/--end`, only that time window's audio is
 transcribed, so focusing on a section costs nothing outside it.
 
-## Library storage (Immich + Nextcloud)
+## Library storage (Immich + Nextcloud + Paperless-ngx)
 
 Every `/watch` run **saves its own artifacts after the report is printed**, unless `--no-save` is passed. The goal: turn each watch into a browsable, re-consumable library entry so an agent **without video vision** (Claude Code, other agents) can later learn from a video it never watched — by reading the transcript + OCR text in `report.md`, pulling key frames only when visual detail is actually needed.
 
 Artifacts are routed by content type, split by who consumes them:
 - **Video + representative frames → an Immich album** named `<title> (<video-id>)`. This is the visual source — human gallery browsing, Immich's own search, or a vision-capable step later. Re-runs of the same video/frame dedup (stable per-file `deviceAssetId`) instead of creating duplicate assets; re-running against an existing album name reuses it instead of creating another one.
 - **`report.md` (+ any other non-media artifact) → a Nextcloud folder** at `Watch/<title> (<video-id>)/`. `report.md` is the *full* report text (transcript + OCR + frame index) — self-sufficient for a no-vision agent to understand the video without ever seeing a frame. Re-runs overwrite (WebDAV `PUT`), so no duplicates there either.
+- **`report.md` (+ any other non-media artifact) → a Paperless-ngx document** (additive with Nextcloud), titled `<title> (<video-id>)`, tagged `watch`. This is the **searchable** copy: Nextcloud stores the report, Paperless *indexes* it, so a no-vision agent can answer "did I already watch something about X?" with one `GET /api/documents/?query=X` across every report ever saved — turning the library from passive archive into queryable memory. Needs Paperless's Tika/Gotenberg pipeline (which ingests markdown as text). Re-runs rely on Paperless's own content-hash dedup: an identical `report.md` is auto-rejected as a duplicate (the original survives). The uploader never deletes — Paperless keeps deleted docs in a 30-day trash whose content hash would otherwise block the re-upload, so a delete-then-reupload of identical bytes would leave *zero* active docs. A materially changed `report.md` (different frames/transcript) creates a second document with the same title.
 
-The video itself is only uploaded when a real download happened — it's skipped for TranscriptAPI-only YouTube runs and for `--detail transcript`. A transcript-only run simply uploads `report.md` to Nextcloud and does nothing on Immich.
+The video itself is only uploaded when a real download happened — it's skipped for TranscriptAPI-only YouTube runs and for `--detail transcript`. A transcript-only run simply uploads `report.md` to Nextcloud + Paperless and does nothing on Immich.
 
 **Representative frame cap.** The library uploads a further-reduced subset of frames, not the full extracted set, so Immich isn't flooded with every sampled frame — `WATCH_SAVE_FRAME_CAP` (default **20**, `0` = upload all). Selection priority: OCR-significant frames first (on-screen text — critical for tutorials/code/debugging), then transcript-cue frames, then scene-representative frames, then even time-spacing fill if still under the cap.
 
@@ -427,16 +428,17 @@ The video itself is only uploaded when a real download happened — it's skipped
 **Config** (`~/.config/watch/.env`, scaffolded by `setup.py` — see "Setup preflight" above):
 - `IMMICH_BASE_URL` (default `https://immich.cort3x.me`) and `IMMICH_API_KEY` — the Immich target. Create an API key in Immich under Account Settings → API Keys.
 - `NEXTCLOUD_URL` (default `https://nextcloud.cort3x.me`), `NEXTCLOUD_USER` (default `thedirektor`), and `NEXTCLOUD_PASS` — the Nextcloud target. **`NEXTCLOUD_PASS` must be an app password, not your account login password** — generate one in Nextcloud at Settings → Security → Devices & Sessions.
+- `PAPERLESS_URL` (default `https://paperless.cort3x.me`) and `PAPERLESS_TOKEN` — the Paperless-ngx target. Create an API token in Paperless at Settings → "My Profile" → API Auth Token. Requires the Paperless Tika/Gotenberg pipeline enabled so it can ingest `report.md` as text.
 - `WATCH_SAVE_FRAME_CAP` (default `20`, `0` = all) — the representative-frame cap uploaded to Immich per run.
 
-`setup.py --json` reports which targets are configured under `library_targets` (e.g. `["immich"]`, `["nextcloud"]`, both, or `[]`) — like TranscriptAPI, this is informational only and never gates `can_proceed`; an unconfigured or partially configured library is not an error.
+`setup.py --json` reports which targets are configured under `library_targets` (e.g. `["immich"]`, `["nextcloud"]`, `["paperless"]`, any combination, or `[]`) — like TranscriptAPI, this is informational only and never gates `can_proceed`; an unconfigured or partially configured library is not an error.
 
-After the report is printed (and written to `work/report.md`), the script prints one `[watch] …` line per attempted target to **stderr** — naming the Immich album / Nextcloud folder the run landed in, or the reason a target was skipped (e.g. `[watch] Immich: skipped (no IMMICH_API_KEY)`). This is separate from the report itself; it doesn't appear in `report.md` or on stdout.
+After the report is printed (and written to `work/report.md`), the script prints one `[watch] …` line per attempted target to **stderr** — naming the Immich album / Nextcloud folder / Paperless document the run landed in, or the reason a target was skipped (e.g. `[watch] Immich: skipped (no IMMICH_API_KEY)`, `[watch] Paperless: skipped (no PAPERLESS_TOKEN)`). This is separate from the report itself; it doesn't appear in `report.md` or on stdout.
 
 ## Failure modes and handling
 
 - **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
-- **Library save (Immich/Nextcloud) fails or is unconfigured** → best-effort and never fatal — the report is already printed before saving is attempted, so a save failure never costs the user the report. A stderr note names which target and why (e.g. missing `IMMICH_API_KEY`/`NEXTCLOUD_PASS`, or a network/HTTP error); the other target still runs. Pass `--no-save` if the user doesn't want this run saved at all.
+- **Library save (Immich/Nextcloud/Paperless) fails or is unconfigured** → best-effort and never fatal — the report is already printed before saving is attempted, so a save failure never costs the user the report. A stderr note names which target and why (e.g. missing `IMMICH_API_KEY`/`NEXTCLOUD_PASS`/`PAPERLESS_TOKEN`, or a network/HTTP error); the other targets still run. Paperless upload is async — the `post_document` call only submits a consume task; a bad token surfaces on the submit, but a Tika-parse failure surfaces later in Paperless's own task log, not in the `/watch` output. Pass `--no-save` if the user doesn't want this run saved at all.
 - **No transcript available** → captions missing AND no Whisper backend usable (no GPU + faster-whisper, no API key, or every backend failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
@@ -516,15 +518,15 @@ This fork has been tested on **Windows 11 + Python 3.14** (and the Bash tool's P
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
 - Reads / creates `~/.config/watch/.env` (mode `0600`) to store API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 - On first use of `--whisper local`, downloads the chosen faster-whisper model from HuggingFace into the user's HuggingFace cache (`~/.cache/huggingface/hub`)
-- **After the report is printed, unless `--no-save` is passed:** uploads this run's downloaded video + a capped set of representative frames to an Immich instance (`IMMICH_BASE_URL`) when `IMMICH_API_KEY` is set, and uploads `report.md` (+ any other non-media artifact) to a Nextcloud instance (`NEXTCLOUD_URL`) via WebDAV when `NEXTCLOUD_PASS` is set — see "Library storage" above. Either upload is skipped (not attempted) when its key/password isn't configured
+- **After the report is printed, unless `--no-save` is passed:** uploads this run's downloaded video + a capped set of representative frames to an Immich instance (`IMMICH_BASE_URL`) when `IMMICH_API_KEY` is set; uploads `report.md` (+ any other non-media artifact) to a Nextcloud instance (`NEXTCLOUD_URL`) via WebDAV when `NEXTCLOUD_PASS` is set; and uploads `report.md` (+ any other non-media artifact) to a Paperless-ngx instance (`PAPERLESS_URL`) via `POST /api/documents/post_document/` when `PAPERLESS_TOKEN` is set — see "Library storage" above. Each upload is skipped (not attempted) when its key/password/token isn't configured
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any *transcription or vision* API in `--backend claude` mode — only the extracted audio goes to a Whisper API, and only when an API Whisper backend is in use. (The video **can** still leave the machine via the separate, opt-out library save described above, when `IMMICH_API_KEY` is configured.)
 - Does not upload anything when `--whisper local` is the active backend — the audio stays on disk and is processed entirely on-device
 - The full video leaves the machine for transcription/vision purposes only when `--backend gemini` is explicitly selected (Files API upload, or a YouTube URL passed through for Google to fetch server-side); `--backend openrouter` sends extracted frames + audio for that purpose, never the raw video file
-- Does not upload anything to Immich or Nextcloud when `--no-save` is passed, or when neither `IMMICH_API_KEY` nor `NEXTCLOUD_PASS` is configured
+- Does not upload anything to Immich, Nextcloud, or Paperless when `--no-save` is passed, or when none of `IMMICH_API_KEY` / `NEXTCLOUD_PASS` / `PAPERLESS_TOKEN` is configured
 - Does not access any platform account (no login, no session cookies, no posting)
-- Does not share API keys between providers (Groq → `api.groq.com`, OpenAI → `api.openai.com`, AssemblyAI → `api.assemblyai.com`, Gemini → `generativelanguage.googleapis.com`, OpenRouter → `openrouter.ai`, TranscriptAPI → `transcriptapi.com`, Immich → your configured `IMMICH_BASE_URL`, Nextcloud → your configured `NEXTCLOUD_URL`)
+- Does not share API keys between providers (Groq → `api.groq.com`, OpenAI → `api.openai.com`, AssemblyAI → `api.assemblyai.com`, Gemini → `generativelanguage.googleapis.com`, OpenRouter → `openrouter.ai`, TranscriptAPI → `transcriptapi.com`, Immich → your configured `IMMICH_BASE_URL`, Nextcloud → your configured `NEXTCLOUD_URL`, Paperless → your configured `PAPERLESS_URL`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory, `~/.config/watch/.env`, and the HuggingFace model cache (when local Whisper is used) — clean up the working directory when you're done (Step 5)
 

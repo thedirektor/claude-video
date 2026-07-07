@@ -2,6 +2,32 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.4] — 2026-07-07
+
+### Added
+- **Paperless-ngx as a third library-storage target (searchable index).**
+  Every `/watch` run now also uploads `report.md` (and any other non-media
+  artifact) to a Paperless-ngx instance as a `watch`-tagged document, additive
+  with the Nextcloud copy. Nextcloud stores the report; Paperless full-text
+  *indexes* it, so a no-vision agent can answer "did I already watch something
+  about X?" with a single `GET /api/documents/?query=X` across every report
+  ever saved. Configured via `PAPERLESS_URL` (default
+  `https://paperless.cort3x.me`) + `PAPERLESS_TOKEN` in `~/.config/watch/.env`;
+  needs the Paperless Tika/Gotenberg pipeline to ingest markdown as text.
+  Best-effort and never fatal, exactly like Immich/Nextcloud — a missing token
+  skips only Paperless, and `--no-save` skips all three. `setup.py --json` now
+  reports `paperless` under `library_targets`.
+- The `watch` tag is auto-created in Paperless on first upload if absent.
+
+### Notes
+- **Re-run dedup relies on Paperless's own content-hash dedup, not delete.** An
+  identical `report.md` is auto-rejected by Paperless as a duplicate (the
+  original survives). The uploader deliberately never deletes prior docs:
+  Paperless keeps deleted documents (and their content hash) in a 30-day trash,
+  so a delete-then-reupload of identical bytes would be rejected as a duplicate
+  and leave *zero* active docs. A materially changed `report.md` creates a
+  second document with the same title.
+
 ## [0.4.3] — 2026-07-07
 
 ### Added
