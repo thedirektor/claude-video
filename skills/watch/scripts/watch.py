@@ -459,10 +459,12 @@ def main() -> int:
             "detail": args.detail,
             "start": args.start,
             "end": args.end,
+            "timestamps": args.timestamps,
             "audio": args.audio,
             "sub_lang": args.sub_lang,
             "whisper": args.whisper,
-            "resolution": args.resolution,
+            "whisper_model": args.whisper_model,
+            "diarize": args.diarize,
         },
     )
     if args.out_dir and args.fresh:
