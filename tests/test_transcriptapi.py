@@ -85,3 +85,36 @@ def test_fetch_transcript_network_error_returns_none(monkeypatch):
     monkeypatch.setattr(transcriptapi, "urlopen", boom)
     monkeypatch.setattr(transcriptapi.time, "sleep", lambda *_a, **_k: None)
     assert transcriptapi.fetch_transcript("vid", "sk_key") is None  # never raises
+
+
+def test_fetch_transcript_malformed_json_returns_none(monkeypatch):
+    class _Bad:
+        status = 200
+        def read(self): return b"not valid json{{{"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(transcriptapi, "urlopen", lambda *a, **k: _Bad())
+    assert transcriptapi.fetch_transcript("vid", "sk") is None  # never raises
+
+
+def test_fetch_transcript_wrong_shape_returns_none(monkeypatch):
+    monkeypatch.setattr(transcriptapi, "urlopen",
+                        lambda *a, **k: _Resp({"transcript": ["a", "b", "c"]}))
+    assert transcriptapi.fetch_transcript("vid", "sk") is None  # non-dict items skipped → empty → None
+
+
+def test_language_mapping_reserves_asr_slot():
+    many = ",".join(f"l{i}" for i in range(12))
+    out = transcriptapi.languages_from_sub_langs(many).split(",")
+    assert out[-1] == "asr"
+    assert len(out) <= 10
+
+
+def test_load_api_key_env_and_dotenv(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRANSCRIPTAPI_API_KEY", "sk_env")
+    assert transcriptapi.load_api_key() == "sk_env"
+    monkeypatch.delenv("TRANSCRIPTAPI_API_KEY", raising=False)
+    (tmp_path / ".env").write_text('TRANSCRIPTAPI_API_KEY="sk_dot"\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(transcriptapi.Path, "home", lambda: tmp_path / "nohome")
+    assert transcriptapi.load_api_key() == "sk_dot"
