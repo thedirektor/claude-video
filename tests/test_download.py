@@ -62,3 +62,27 @@ def test_download_url_requests_english_only(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         download.download_url(URL, tmp_path / "download")
     _assert_english_only(_sub_langs(calls[0]))
+
+
+def _has_flag_value(argv: list[str], flag: str, value: str) -> bool:
+    for i, tok in enumerate(argv):
+        if tok == flag and i + 1 < len(argv) and argv[i + 1] == value:
+            return True
+    return False
+
+
+def test_fetch_captions_uses_player_client_chain(monkeypatch, tmp_path):
+    calls = _capture_argv(monkeypatch)
+    download.fetch_captions(URL, tmp_path / "download")
+    argv = calls[0]
+    assert _has_flag_value(argv, "--extractor-args", "youtube:player_client=default,android,mweb")
+    assert "--retries" in argv and "--extractor-retries" in argv
+
+
+def test_download_url_uses_player_client_chain(monkeypatch, tmp_path):
+    calls = _capture_argv(monkeypatch)
+    with pytest.raises(SystemExit):
+        download.download_url(URL, tmp_path / "download")
+    argv = calls[0]
+    assert _has_flag_value(argv, "--extractor-args", "youtube:player_client=default,android,mweb")
+    assert "--sleep-interval" in argv and "--max-sleep-interval" in argv

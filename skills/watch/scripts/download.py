@@ -21,6 +21,20 @@ for _stream in (sys.stdout, sys.stderr):
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 
+# yt-dlp hardening. YouTube's SABR/403 rollout breaks the default `web` client;
+# a player_client fallback chain (tried in order) keeps most public videos
+# reachable without cookies. Anti-bot retry + request jitter absorb transient
+# 403/429s. Sources: upstream PRs #46, #42, #27, #21.
+HARDENING_ARGS = [
+    "--extractor-args", "youtube:player_client=default,android,mweb",
+    "--retries", "10",
+    "--fragment-retries", "10",
+    "--extractor-retries", "3",
+    "--sleep-requests", "1",
+    "--sleep-interval", "1",
+    "--max-sleep-interval", "5",
+]
+
 
 def is_url(source: str) -> bool:
     if source.startswith("-"):
@@ -85,6 +99,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         "--convert-subs", "vtt",
         "--no-playlist",
         "--ignore-errors",
+        *HARDENING_ARGS,
         "-o", output_template,
         "--",
         url,
@@ -142,6 +157,7 @@ def download_url(
         "--convert-subs", "vtt",
         "--no-playlist",
         "--ignore-errors",
+        *HARDENING_ARGS,
         "-o", output_template,
         "--",
         url,
