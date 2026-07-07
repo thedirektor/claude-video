@@ -65,6 +65,8 @@ def _cache_load(key: str) -> list[dict] | None:
         blob = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(blob, dict):
+        return None
     segments = blob.get("segments")
     return segments if isinstance(segments, list) else None
 
