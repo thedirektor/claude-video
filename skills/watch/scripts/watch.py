@@ -7,6 +7,7 @@ then Reads each frame path to see the video.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 import tempfile
 from pathlib import Path
@@ -17,6 +18,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from config import frame_cap, get_config  # noqa: E402
 from download import DEFAULT_SUB_LANGS, download, fetch_captions, is_url  # noqa: E402
+import library  # noqa: E402
 import state  # noqa: E402
 from frames import (  # noqa: E402
     MAX_FPS,
@@ -379,6 +381,12 @@ def main() -> int:
         help="Disable the TranscriptAPI YouTube-transcript backend (transcriptapi.com). "
         "By default, YouTube URLs fetch their transcript from TranscriptAPI first "
         "(needs TRANSCRIPTAPI_API_KEY); this forces the yt-dlp caption / Whisper path.",
+    )
+    ap.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Do not push this run's artifacts to the library (Immich/Nextcloud). "
+        "Saving is on by default.",
     )
     ap.add_argument(
         "--no-ocr",
@@ -903,24 +911,32 @@ def main() -> int:
 
     info = dl.get("info") or {}
 
-    print()
-    print("# watch: video report")
-    print()
-    print(f"- **Source:** {args.source}")
+    # Report lines are both printed (stdout, unchanged) AND captured so the
+    # exact same text can be written to work/report.md below.
+    report_lines: list[str] = []
+
+    def emit(s: str = "") -> None:
+        print(s)
+        report_lines.append(s)
+
+    emit()
+    emit("# watch: video report")
+    emit()
+    emit(f"- **Source:** {args.source}")
     if info.get("title"):
-        print(f"- **Title:** {info['title']}")
+        emit(f"- **Title:** {info['title']}")
     if info.get("uploader"):
-        print(f"- **Uploader:** {info['uploader']}")
-    print(f"- **Duration:** {format_time(full_duration)} ({full_duration:.1f}s)")
+        emit(f"- **Uploader:** {info['uploader']}")
+    emit(f"- **Duration:** {format_time(full_duration)} ({full_duration:.1f}s)")
     if focused:
-        print(
+        emit(
             f"- **Focus range:** {format_time(effective_start)} → {format_time(effective_end)} "
             f"({effective_duration:.1f}s)"
         )
     if meta.get("width") and meta.get("height"):
-        print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
+        emit(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
     range_mode = "focused" if focused else "full"
-    print(f"- **Detail:** {detail}")
+    emit(f"- **Detail:** {detail}")
     detail_count = frame_meta.get("selected_count", 0)
     if detail != "transcript":
         cap_label = "unlimited" if report_cap is None else str(report_cap)
@@ -928,79 +944,79 @@ def main() -> int:
         fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
         deduped = frame_meta.get("deduped_count", 0)
         dedup_note = f", {deduped} near-duplicate{'s' if deduped != 1 else ''} dropped" if deduped else ""
-        print(
+        emit(
             f"- **Frames:** {detail_count} selected from {frame_meta.get('candidate_count', detail_count)} "
             f"candidates ({engine}{fallback}{dedup_note}, {range_mode} range, budget {target}, cap {cap_label})"
         )
     elif not cue_frames:
-        print("- **Frames:** skipped (transcript detail)")
+        emit("- **Frames:** skipped (transcript detail)")
     if cue_frames:
         dropped = cue_meta.get("dropped_out_of_window", 0)
         drop_note = f", {dropped} dropped outside range" if dropped else ""
-        print(
+        emit(
             f"- **Cue frames:** {len(cue_frames)} at transcript-flagged timestamps "
             f"(transcript-cue{drop_note})"
         )
     if frames:
-        print(f"- **Frame size:** max {args.resolution}px wide, max 1998px tall")
+        emit(f"- **Frame size:** max {args.resolution}px wide, max 1998px tall")
     # OCR status: report "disabled" only when the user asked, and a count only when
     # OCR actually produced text. Staying silent when OCR ran but found nothing (or
     # was unavailable) keeps the default zero-fork-flags output byte-equivalent.
     if args.no_ocr:
-        print("- **OCR:** disabled (`--no-ocr`)")
+        emit("- **OCR:** disabled (`--no-ocr`)")
     elif ocr_text:
         text_frames = sum(1 for v in ocr_text.values() if v.strip())
-        print(f"- **OCR:** {text_frames}/{len(frames)} frame(s) had detected text (lang=spa+eng)")
+        emit(f"- **OCR:** {text_frames}/{len(frames)} frame(s) had detected text (lang=spa+eng)")
     if transcript_segments:
         in_range = " in range" if focused else ""
-        print(
+        emit(
             f"- **Transcript:** {len(transcript_segments)} segments{in_range} "
             f"(via {transcript_source or 'captions'})"
         )
         if use_two_pass and speech_windows:
             speech_total = sum(e - s for s, e in speech_windows)
             denom = effective_duration if focused else full_duration
-            print(
+            emit(
                 f"- **Speech windows:** "
                 f"{format_windows(speech_windows, speech_total=speech_total, full_duration=denom)}"
             )
     else:
-        print("- **Transcript:** none available")
+        emit("- **Transcript:** none available")
 
     if detail == "token-burner" and len(frames) > 250:
-        print()
-        print(
+        emit()
+        emit(
             f"> **Warning:** token-burner detail selected {len(frames)} frames. "
             "This may use a large number of image tokens."
         )
 
     if not focused and full_duration > 600 and detail not in ("transcript", "token-burner"):
         mins = int(full_duration // 60)
-        print()
-        print(
+        emit()
+        emit(
             f"> **Warning:** This is a {mins}-minute video. Frame coverage is sparse at this length "
             f"under `{detail}` detail — its cap spreads thin across the full clip. For better results, "
             "re-run with `--start HH:MM:SS --end HH:MM:SS` to zoom into a section, or use "
             "`--detail token-burner` to keep every scene-change frame across the whole video."
         )
 
-    print()
-    print("## Frames")
-    print()
+    emit()
+    emit("## Frames")
+    emit()
     if frames:
-        print(f"Frames live at: `{work / 'frames'}`")
-        print()
-        print(
+        emit(f"Frames live at: `{work / 'frames'}`")
+        emit()
+        emit(
             "**Read each frame path below with the Read tool to view the image.** "
             "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video."
         )
         if ocr_text:
-            print()
-            print(
+            emit()
+            emit(
                 "Frame lines include any OCR-detected text (Spanish + English). "
                 f"Frames with significant text were re-extracted at {HIRES_WIDTH}px for legibility."
             )
-        print()
+        emit()
         # Under two-pass, tag each frame [speech]/[silent] by speech-window membership;
         # keep upstream's reason= annotation and append inline OCR text when present.
         speech_set = list(speech_windows) if use_two_pass else []
@@ -1015,43 +1031,57 @@ def main() -> int:
             text = ocr_text.get(frame["path"], "").strip() if ocr_text else ""
             if text:
                 line += f" — OCR: {' '.join(text.split())}"
-            print(line)
+            emit(line)
     else:
-        print("_No frames extracted._")
+        emit("_No frames extracted._")
 
-    print()
-    print("## Transcript")
-    print()
+    emit()
+    emit("## Transcript")
+    emit()
     if transcript_text:
         label = transcript_source or "captions"
         if focused:
-            print(f"_Source: {label}. Filtered to {format_time(effective_start)} → {format_time(effective_end)}:_")
+            emit(f"_Source: {label}. Filtered to {format_time(effective_start)} → {format_time(effective_end)}:_")
         else:
-            print(f"_Source: {label}._")
-        print()
-        print("```")
-        print(transcript_text)
-        print("```")
+            emit(f"_Source: {label}._")
+        emit()
+        emit("```")
+        emit(transcript_text)
+        emit("```")
     elif detail == "transcript":
-        print(
+        emit(
             "_No transcript available at transcript detail. Captions were missing and Whisper was "
             "unavailable or failed, so there is no visual fallback here. Re-run with "
             "`--detail balanced` for frames._"
         )
     elif focused and dl.get("subtitle_path"):
-        print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
+        emit(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
     else:
         setup_py = SCRIPT_DIR / "setup.py"
-        print(
+        emit(
             "_No transcript available — proceed with frames only. "
             "Captions were missing and the Whisper fallback was unavailable "
             "(no API key set, or `--no-whisper` was used). "
             f"Run `python3 {setup_py}` to enable Whisper, then re-run._"
         )
 
-    print()
-    print("---")
-    print(f"_Work dir: `{work}` — delete when done._")
+    emit()
+    emit("---")
+    emit(f"_Work dir: `{work}` — delete when done._")
+
+    (work / "report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+    if not args.no_save:
+        video_id = info.get("id") or hashlib.sha1(args.source.encode("utf-8")).hexdigest()[:8]
+        title = info.get("title") or Path(args.source).name
+        try:
+            summary = library.save_artifacts(
+                video_path, frames, str(work / "report.md"), ocr_text, title, video_id,
+            )
+            for line in summary:
+                print(f"[watch] {line}", file=sys.stderr)
+        except Exception as exc:  # belt: save must never fail the run
+            print(f"[watch] library save skipped ({exc})", file=sys.stderr)
 
     return 0
 
