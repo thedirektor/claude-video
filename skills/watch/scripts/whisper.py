@@ -242,18 +242,28 @@ def resolve_backend(
     )
 
 
-def extract_audio(video_path: str, out_path: Path) -> Path:
-    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit."""
+def extract_audio(
+    video_path: str,
+    out_path: Path,
+    start_seconds: float | None = None,
+    duration_seconds: float | None = None,
+) -> Path:
+    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit.
+
+    With start_seconds/duration_seconds, extract only that window (fast input
+    seek before -i, so the output's timestamps start at 0).
+    """
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-y",
-        "-i", str(Path(video_path).resolve()),
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    if start_seconds is not None and start_seconds > 0:
+        cmd += ["-ss", f"{start_seconds:.3f}"]
+    cmd += ["-i", str(Path(video_path).resolve())]
+    if duration_seconds is not None and duration_seconds > 0:
+        cmd += ["-t", f"{duration_seconds:.3f}"]
+    cmd += [
         "-vn",
         "-acodec", "libmp3lame",
         "-ar", "16000",
@@ -477,6 +487,23 @@ def shift_segments(segments: list[dict], offset_seconds: float) -> list[dict]:
     ]
 
 
+def _shift_all(segments: list[dict], offset_seconds: float) -> list[dict]:
+    """Shift start/end by offset, preserving every other key (e.g. `speaker`).
+
+    Used to lift window-relative Whisper timestamps back to source-absolute time
+    after windowed extraction. Unlike shift_segments, it keeps diarization tags.
+    """
+    if not offset_seconds:
+        return segments
+    out: list[dict] = []
+    for seg in segments:
+        moved = dict(seg)
+        moved["start"] = round(seg["start"] + offset_seconds, 2)
+        moved["end"] = round(seg["end"] + offset_seconds, 2)
+        out.append(moved)
+    return out
+
+
 def _segments_from_response(data: dict) -> list[dict]:
     """Convert Whisper verbose_json into our {start, end, text} segment format."""
     out: list[dict] = []
@@ -562,6 +589,8 @@ def transcribe_video(
     api_key: str | None = None,
     model_name: str | None = None,
     enable_diarization: bool = False,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
     use_cache: bool = True,
 ) -> tuple[list[dict], str]:
     """Run the full flow: extract audio → transcribe (local/API) → parse segments.
@@ -583,7 +612,13 @@ def transcribe_video(
             raise SystemExit(hint or "No Whisper backend available. Run setup.py")
 
     print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
-    audio_path = extract_audio(video_path, audio_out)
+    window_offset = start_seconds or 0.0
+    duration_seconds = None
+    if start_seconds is not None and end_seconds is not None and end_seconds > start_seconds:
+        duration_seconds = end_seconds - start_seconds
+    audio_path = extract_audio(
+        video_path, audio_out, start_seconds=start_seconds, duration_seconds=duration_seconds
+    )
 
     if backend == "local":
         sys.path.insert(0, str(Path(__file__).parent))
@@ -592,6 +627,7 @@ def transcribe_video(
         segments = transcribe_local(audio_path, model_name=model_name or DEFAULT_MODEL)
         if not segments:
             raise SystemExit("Whisper returned no transcript segments")
+        segments = _shift_all(segments, window_offset)
         print(f"[watch] transcribed {len(segments)} segments via local", file=sys.stderr)
         return segments, "local"
 
@@ -602,6 +638,7 @@ def transcribe_video(
         segments = transcribe_assemblyai(audio_path, enable_diarization=enable_diarization)
         if not segments:
             raise SystemExit("Whisper returned no transcript segments")
+        segments = _shift_all(segments, window_offset)
         print(f"[watch] transcribed {len(segments)} segments via assemblyai", file=sys.stderr)
         return segments, "assemblyai"
 
@@ -645,6 +682,7 @@ def transcribe_video(
     if not segments:
         raise SystemExit("Whisper returned no transcript segments")
 
+    segments = _shift_all(segments, window_offset)
     print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
     return segments, backend
 

@@ -586,6 +586,9 @@ def main() -> int:
                     api_key=api_key,
                     model_name=args.whisper_model if backend == "local" else None,
                     enable_diarization=args.diarize if backend == "assemblyai" else False,
+                    start_seconds=(effective_start if (focused and not audio_override) else None),
+                    end_seconds=(effective_end if (focused and not audio_override) else None),
+                    use_cache=True,
                 )
                 transcript_segments = (
                     filter_range(all_segments, start_sec, end_sec) if focused else all_segments
