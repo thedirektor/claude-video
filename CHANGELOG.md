@@ -2,6 +2,17 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.1] — 2026-07-07
+
+### Fixed
+- **Subtitle fetch was broken by an invalid regex in the default languages.**
+  yt-dlp compiles each `--sub-langs` token as a regex; the `*-orig` token
+  shipped in 0.4.0 is a malformed regex (bare `*`) and made yt-dlp abort with
+  `Wrong regex for subtitlelangs`, silently killing caption download for every
+  video. Corrected to `.*-orig`. Added a test that compiles every default
+  sub-lang token so no invalid pattern can ship again (the mocked argv tests
+  never invoke yt-dlp, so they could not catch this).
+
 ## [0.4.0] — 2026-07-07
 
 ### Added
@@ -10,7 +21,7 @@ All notable changes to `/watch` are documented here.
   public videos self-heal without cookies. New `--cookies-from-browser <browser>`
   and `--cookies <file>` flags unlock login-walled sources (off by default).
 - **Spanish-first subtitles.** Default subtitle preference is now
-  `es,es-419,es-ES,en,en-US,en-GB,*-orig`; override with `--sub-lang <csv>`. The
+  `es,es-419,es-ES,en,en-US,en-GB,.*-orig`; override with `--sub-lang <csv>`. The
   report picks the first available track in that order. Never requests `all`.
 - **Whisper chunk cache.** Transcribed audio chunks are cached at
   `~/.cache/watch/transcripts/` keyed by `sha256(bytes + model)`, so re-runs and
