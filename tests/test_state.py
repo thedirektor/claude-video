@@ -46,6 +46,18 @@ def test_load_tolerates_corrupt_file(tmp_path):
     assert state.load_stage(tmp_path, "download", "sig") is None
 
 
+def test_load_stage_swallows_permission_error(tmp_path, monkeypatch):
+    def boom(self):
+        raise PermissionError("denied")
+    monkeypatch.setattr(state.Path, "exists", boom)
+    assert state.load_stage(tmp_path, "download", "sig") is None
+
+
+def test_load_returns_none_on_non_dict_json(tmp_path):
+    (tmp_path / "stage_download.json").write_text("null", encoding="utf-8")
+    assert state.load_stage(tmp_path, "download", "sig") is None
+
+
 def test_clear_stages_removes_only_stage_files(tmp_path):
     (tmp_path / "stage_download.json").write_text("{}", encoding="utf-8")
     (tmp_path / "stage_transcript.json").write_text("{}", encoding="utf-8")
