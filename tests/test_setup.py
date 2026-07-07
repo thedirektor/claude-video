@@ -80,6 +80,23 @@ def test_key_present_is_ready(tmp_path):
     assert js["whisper_backend"] == "groq"
 
 
+def test_library_targets_reported_and_non_gating(tmp_path):
+    """Library storage (Immich/Nextcloud) is optional and must never gate
+    can_proceed — same treatment as TranscriptAPI."""
+    _write_env(tmp_path, "GROQ_API_KEY=sk-test-abc\n")
+    js = json.loads(_run(["--json"], home=tmp_path).stdout)
+    assert js["library_targets"] == []
+    assert js["can_proceed"] is True
+
+    _write_env(
+        tmp_path,
+        "GROQ_API_KEY=sk-test-abc\nIMMICH_API_KEY=k\nNEXTCLOUD_PASS=p\n",
+    )
+    js2 = json.loads(_run(["--json"], home=tmp_path).stdout)
+    assert js2["library_targets"] == ["immich", "nextcloud"]
+    assert js2["can_proceed"] is True
+
+
 def test_scaffolded_env_mentions_all_backends(tmp_path):
     """The installer must scaffold a template mentioning all backend API keys."""
     proc = _run([], home=tmp_path)
@@ -87,5 +104,7 @@ def test_scaffolded_env_mentions_all_backends(tmp_path):
     assert env_file.exists(), f"scaffolded env file does not exist at {env_file}"
     content = env_file.read_text(encoding="utf-8")
     for key in ("GROQ_API_KEY", "OPENAI_API_KEY", "ASSEMBLYAI_API_KEY",
-                "GEMINI_API_KEY", "OPENROUTER_API_KEY", "TRANSCRIPTAPI_API_KEY"):
+                "GEMINI_API_KEY", "OPENROUTER_API_KEY", "TRANSCRIPTAPI_API_KEY",
+                "IMMICH_BASE_URL", "IMMICH_API_KEY", "NEXTCLOUD_URL",
+                "NEXTCLOUD_USER", "NEXTCLOUD_PASS", "WATCH_SAVE_FRAME_CAP"):
         assert key in content, f"missing {key} stanza in scaffolded .env"

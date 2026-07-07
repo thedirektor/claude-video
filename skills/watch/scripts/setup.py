@@ -69,6 +69,28 @@ OPENAI_API_KEY=
 # TranscriptAPI (transcriptapi.com) — YouTube transcripts that beat the bot-gate
 # TRANSCRIPTAPI_API_KEY=
 
+# Optional: library storage. /watch auto-saves each run's artifacts after the
+# report is printed (video + representative frames -> an Immich album;
+# report.md -> a Nextcloud folder), so a no-vision agent can later learn from
+# a video by reading report.md (transcript + OCR + frame index). Pass
+# --no-save to skip. Missing config for one target just skips that target —
+# the other still runs.
+#
+# Immich (video + representative frames). Create an API key in Immich ->
+# Account Settings -> API Keys.
+# IMMICH_BASE_URL=https://immich.cort3x.me
+# IMMICH_API_KEY=
+#
+# Nextcloud (report.md + any non-media file). NEXTCLOUD_PASS must be an APP
+# PASSWORD, not your login password — generate one in Nextcloud at
+# Settings -> Security -> Devices & Sessions.
+# NEXTCLOUD_URL=https://nextcloud.cort3x.me
+# NEXTCLOUD_USER=
+# NEXTCLOUD_PASS=
+#
+# Cap on representative frames uploaded to Immich per run (0 = all).
+# WATCH_SAVE_FRAME_CAP=20
+
 # Default watch behavior (the /watch first-run wizard sets this for you).
 # Allowed values: transcript | efficient | balanced | token-burner
 # Keep the value on its own line with no trailing comment.
@@ -141,6 +163,29 @@ def _have_api_key() -> tuple[bool, str | None]:
 def _have_transcriptapi_key() -> bool:
     """True if TRANSCRIPTAPI_API_KEY is set (optional YouTube-transcript backend)."""
     return bool(_read_env_key("TRANSCRIPTAPI_API_KEY"))
+
+
+def _have_immich_key() -> bool:
+    """True if IMMICH_API_KEY is set (optional library-storage target)."""
+    return bool(_read_env_key("IMMICH_API_KEY"))
+
+
+def _have_nextcloud_pass() -> bool:
+    """True if NEXTCLOUD_PASS is set (optional library-storage target)."""
+    return bool(_read_env_key("NEXTCLOUD_PASS"))
+
+
+def _library_targets() -> list[str]:
+    """Which library-storage targets (library.py's save_artifacts) are
+    configured. Best-effort and purely informational — like TranscriptAPI,
+    this never gates `can_proceed`; a missing target is just skipped at
+    save time (see library.py:save_artifacts)."""
+    targets = []
+    if _have_immich_key():
+        targets.append("immich")
+    if _have_nextcloud_pass():
+        targets.append("nextcloud")
+    return targets
 
 
 def is_first_run() -> bool:
@@ -251,6 +296,7 @@ def _status() -> dict:
     missing = _check_binaries()
     has_key, backend = _have_api_key()
     has_transcriptapi_key = _have_transcriptapi_key()
+    library_targets = _library_targets()
     setup_complete = not is_first_run()
 
     if not missing and has_key:
@@ -274,6 +320,7 @@ def _status() -> dict:
         "whisper_backend": backend,
         "has_api_key": has_key,
         "has_transcriptapi_key": has_transcriptapi_key,
+        "library_targets": library_targets,
         "config_file": str(CONFIG_FILE),
         "watch_detail": cfg["detail"],
         "platform": platform.system(),
@@ -361,6 +408,19 @@ def cmd_install() -> int:
         print(
             "[setup] TranscriptAPI: not configured (optional — set TRANSCRIPTAPI_API_KEY "
             "for YouTube transcripts that beat the bot-gate; falls back to captions/Whisper)"
+        )
+
+    library_targets = _library_targets()
+    if library_targets:
+        print(
+            f"[setup] Library storage: configured ({', '.join(library_targets)}) — "
+            "each /watch run auto-saves its artifacts there (--no-save to skip)"
+        )
+    else:
+        print(
+            "[setup] Library storage: not configured (optional — set IMMICH_API_KEY "
+            "and/or NEXTCLOUD_PASS to auto-save each run's video/frames to an Immich "
+            "album and report.md to a Nextcloud folder; --no-save always skips)"
         )
 
     has_key, backend = _have_api_key()
