@@ -72,3 +72,19 @@ def test_transcriptapi_miss_falls_back(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["watch.py", YT, "--detail", "transcript", "--no-whisper", "--out-dir", str(tmp_path)])
     assert watch.main() == 0
     assert hit["n"] >= 1  # fell back to captions
+
+
+def test_resume_reuses_transcriptapi_without_recall(monkeypatch, tmp_path):
+    _no_frames(monkeypatch)
+    calls = {"n": 0}
+    def fake_fetch(url, key, language=None):
+        calls["n"] += 1
+        return ([{"start": 0.0, "end": 2.0, "text": "hola"}], "es")
+    monkeypatch.setattr(watch.transcriptapi, "fetch_transcript", fake_fetch)
+    monkeypatch.setattr(watch.transcriptapi, "load_api_key", lambda: "sk_test")
+    argv = ["watch.py", YT, "--detail", "transcript", "--no-whisper", "--out-dir", str(tmp_path)]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert watch.main() == 0
+    monkeypatch.setattr(sys, "argv", argv)
+    assert watch.main() == 0
+    assert calls["n"] == 1  # 2nd run served from stage_transcript.json — no re-bill
