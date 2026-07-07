@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.4.0"
+version: "0.4.1"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -157,7 +157,7 @@ Optional flags:
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
 
 **Download / resume**
-- `--sub-lang CSV` — subtitle language preference for yt-dlp (default `es,es-419,es-ES,en,en-US,en-GB,*-orig`). The report uses the first available track in this order. Never pass `all`.
+- `--sub-lang CSV` — subtitle language preference for yt-dlp (default `es,es-419,es-ES,en,en-US,en-GB,.*-orig`). The report uses the first available track in this order. Never pass `all`.
 - `--cookies-from-browser BROWSER` — load yt-dlp cookies from a browser profile (`chrome|firefox|edge|brave|safari|...`) for login-walled or age-gated sources. Off by default.
 - `--cookies FILE` — path to a Netscape `cookies.txt` for yt-dlp. Off by default.
 - `--fresh` — with `--out-dir`, ignore any saved resume state and re-run every stage from scratch (also bypasses the Whisper chunk cache).

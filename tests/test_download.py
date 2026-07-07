@@ -44,7 +44,7 @@ def _sub_langs(argv: list[str]) -> str:
     return argv[idx + 1]
 
 
-DEFAULT_LANGS = "es,es-419,es-ES,en,en-US,en-GB,*-orig"
+DEFAULT_LANGS = "es,es-419,es-ES,en,en-US,en-GB,.*-orig"
 
 
 def _assert_bounded(langs: str) -> None:
@@ -140,3 +140,20 @@ def test_cookies_file_passed_through(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         download.download_url(URL, tmp_path / "download", cookies_file="/tmp/c.txt")
     assert _has_flag_value(calls[0], "--cookies", "/tmp/c.txt")
+
+
+def test_every_default_sub_lang_token_is_a_valid_regex():
+    """yt-dlp compiles each --sub-langs token as a regex; a malformed one (e.g.
+    a bare `*-orig`) makes it abort with "Wrong regex for subtitlelangs", which
+    silently kills caption fetching. Guard the whole default set at import time
+    so no invalid token can ship again — the mocked argv tests never run yt-dlp,
+    so only this catches it."""
+    import re
+
+    for token in download.DEFAULT_SUB_LANGS.split(","):
+        token = token.strip()
+        assert token, "empty sub-lang token"
+        try:
+            re.compile(token)
+        except re.error as exc:  # pragma: no cover - assertion carries the detail
+            raise AssertionError(f"invalid sub-lang regex {token!r}: {exc}")

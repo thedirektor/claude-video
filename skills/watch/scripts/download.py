@@ -22,12 +22,15 @@ for _stream in (sys.stdout, sys.stderr):
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 
 # Default subtitle language preference. Spanish first (owner's primary content),
-# then English, then any original-language track. yt-dlp tries each in order and
-# writes every match; _pick_subtitle then selects by this same preference.
-# `*-orig` catches the uploader's original auto-caption track when localized
-# tracks are absent. Never "all" — that pulls YouTube's hundreds of
-# auto-translated tracks and stalls the run. Sources: PRs #12, #26, #30.
-DEFAULT_SUB_LANGS = "es,es-419,es-ES,en,en-US,en-GB,*-orig"
+# then English, then any original-language track. yt-dlp treats each token as a
+# REGEX (matched against available track ids), tries them in order and writes
+# every match; _pick_subtitle then selects by this same preference.
+# `.*-orig` catches the uploader's original auto-caption track (e.g. `en-orig`)
+# when localized tracks are absent — it MUST be a valid regex, so `.*-orig`, not
+# `*-orig` (a bare `*` makes yt-dlp abort with "Wrong regex for subtitlelangs").
+# Never "all" — that pulls YouTube's hundreds of auto-translated tracks and
+# stalls the run. Sources: PRs #12, #26, #30.
+DEFAULT_SUB_LANGS = "es,es-419,es-ES,en,en-US,en-GB,.*-orig"
 
 # yt-dlp hardening. YouTube's SABR/403 rollout breaks the default `web` client;
 # a player_client fallback chain (tried in order) keeps most public videos
