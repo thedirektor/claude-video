@@ -17,6 +17,7 @@ Returns the model's full text response so watch.py can print it as-is.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -279,6 +280,106 @@ def generate_with_video(
         raise SystemExit(f"Gemini returned an empty response{finish_info}")
 
     return text
+
+
+TRANSCRIPT_PROMPT = (
+    "Transcribe the spoken audio of this video verbatim in its original language. "
+    "Output only lines of the form [MM:SS] text (use [H:MM:SS] past one hour), "
+    "one line per sentence, covering the entire video to the end. No commentary."
+)
+
+_TS_LINE = re.compile(r"^\s*\[(\d{1,2}:)?\d{1,2}:\d{2}\]\s*(.+)$")
+_TS_BRACKET = re.compile(r"\[([\d:]+)\]")
+_LAST_SEGMENT_SECONDS = 5.0
+
+
+def parse_timestamped_lines(text: str) -> list[dict]:
+    """Parse `[MM:SS] text` / `[H:MM:SS] text` lines into transcript segments.
+
+    Non-matching lines are ignored. A line whose start is not strictly greater
+    than the previous kept start (duplicate or going backwards) is dropped.
+    Each `end` is the next segment's `start`; the last is `start + 5.0`.
+    """
+    segs: list[dict] = []
+    for line in (text or "").splitlines():
+        m = _TS_LINE.match(line)
+        if not m:
+            continue
+        stamp = _TS_BRACKET.search(line).group(1)
+        start = 0.0
+        for part in stamp.split(":"):
+            start = start * 60 + int(part)
+        body = m.group(2).strip()
+        if not body or (segs and start <= segs[-1]["start"]):
+            continue
+        segs.append({"start": float(start), "end": float(start), "text": body})
+    for cur, nxt in zip(segs, segs[1:]):
+        cur["end"] = nxt["start"]
+    if segs:
+        segs[-1]["end"] = segs[-1]["start"] + _LAST_SEGMENT_SECONDS
+    return segs
+
+
+def transcribe_youtube(
+    url: str,
+    model_name: str = DEFAULT_MODEL,
+    api_key: str | None = None,
+    client=None,
+) -> tuple[list[dict], str] | None:
+    """Transcribe a YouTube video by handing its URL to Gemini (server-side fetch).
+
+    Never raises: returns (segments, model_name), or None on a missing SDK/key,
+    client/API error, blocked/empty reply, or a reply with no timestamped lines.
+    A MAX_TOKENS finish keeps the partial segments.
+    """
+    try:
+        from google.genai import types
+
+        if client is None:
+            from google import genai
+
+            key = api_key or load_api_key()
+            if not key:
+                return None
+            client = genai.Client(api_key=key)
+
+        print(
+            f"[watch] requesting transcript from Gemini ({model_name}) via YouTube URL…",
+            file=sys.stderr,
+        )
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(file_data=types.FileData(file_uri=url, mime_type="video/*")),
+                    types.Part(text=TRANSCRIPT_PROMPT),
+                ],
+            )
+        ]
+        response = client.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW
+            ),
+        )
+        try:
+            finish = str(getattr(response.candidates[0], "finish_reason", "") or "")
+        except (AttributeError, IndexError, TypeError):
+            finish = ""
+        if "MAX_TOKENS" in finish:
+            print(
+                "[watch] Gemini hit MAX_TOKENS — transcript may be truncated",
+                file=sys.stderr,
+            )
+        segments = parse_timestamped_lines(getattr(response, "text", None) or "")
+        return (segments, model_name) if segments else None
+    except Exception as exc:  # never raise: callers fall through the chain
+        print(
+            f"[watch] Gemini transcript failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return None
 
 
 if __name__ == "__main__":
