@@ -47,7 +47,7 @@ def test_parse_timestamped_lines_mixed_reply():
     )
     assert gemini.parse_timestamped_lines(text) == [
         {"start": 0.0, "end": 4.0, "text": "Hello there."},
-        {"start": 4.0, "end": 3723.0, "text": "Second line."},
+        {"start": 4.0, "end": 3723.0, "text": "Second line. Duplicate timestamp line."},
         {"start": 3723.0, "end": 3728.0, "text": "Over an hour in."},
     ]
 

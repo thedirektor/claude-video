@@ -296,8 +296,9 @@ _LAST_SEGMENT_SECONDS = 5.0
 def parse_timestamped_lines(text: str) -> list[dict]:
     """Parse `[MM:SS] text` / `[H:MM:SS] text` lines into transcript segments.
 
-    Non-matching lines are ignored. A line whose start is not strictly greater
-    than the previous kept start (duplicate or going backwards) is dropped.
+    Non-matching lines are ignored. A line whose start is earlier than the
+    previous kept start is dropped; a line with the
+    same start is merged into the previous segment's text.
     Each `end` is the next segment's `start`; the last is `start + 5.0`.
     """
     segs: list[dict] = []
@@ -310,7 +311,12 @@ def parse_timestamped_lines(text: str) -> list[dict]:
         for part in stamp.split(":"):
             start = start * 60 + int(part)
         body = m.group(2).strip()
-        if not body or (segs and start <= segs[-1]["start"]):
+        if not body:
+            continue
+        if segs and start < segs[-1]["start"]:
+            continue
+        if segs and start == segs[-1]["start"]:
+            segs[-1]["text"] += " " + body
             continue
         segs.append({"start": float(start), "end": float(start), "text": body})
     for cur, nxt in zip(segs, segs[1:]):
