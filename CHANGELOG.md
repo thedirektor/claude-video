@@ -12,18 +12,29 @@ All notable changes to `/watch` are documented here.
   `(ok, task_id)`; `upload_to_immich` returns `album_id` + `assets`;
   `upload_to_paperless` returns `task_ids`; `save_artifacts(refs=…)` accepts and
   records them. `watch.py` writes `<work>/library.json` so downstream tools can
-  resolve exactly which Immich assets and Paperless documents a run produced.
+  resolve exactly which Immich assets a run produced and which Paperless
+  consume **task ids** it queued (task ids, not document ids — Paperless assigns
+  the document id asynchronously).
 - **Service** (`/opt/watch`):
   - MCP report strips frame lines that carry OCR text and exposes `frames[].ocr`.
   - `transcribe` parses diarized segments (`speaker`, `end`).
-  - `watch_frames` honours `resolution` (cap 768, never upscales).
-  - REST/MCP pass `no_save`, `timestamps`, `sub_lang`, `fresh`, `no_dedup`,
-    `no_transcriptapi`; `diarize=false` now reaches `watch.py` as `--no-diarize`.
+  - `watch_frames` `resolution`: omitted = frames served exactly as extracted
+    (no re-encode; text frames stay at the 1024 px hi-res width); an explicit
+    value downscales to `min(resolution, 1024)`, never upscales.
+  - REST `options` pass `no_save`, `timestamps`, `sub_lang`, `fresh`,
+    `no_dedup`, `no_transcriptapi`; the MCP `watch` tool gained only `no_save`,
+    `timestamps` and `max_frames`. `diarize=false` now reaches `watch.py` as
+    `--no-diarize`.
   - `POST /analyze` reuses queued/processing/done jobs (not failed) like MCP,
-    with YouTube URL spellings collapsed to one identity.
+    with YouTube URL spellings collapsed to one identity; `fresh=true` never
+    reuses.
+  - REST `sections.Transcript` no longer carries the plugin's work-dir footer
+    (`markdown` stays raw).
   - Job results carry `library` refs; the service version is read from the plugin.
 - **ingest**: MCP `extract` exposes watch options (`detail`, `whisper`,
-  `diarize`, `start`, `end`, `no_ocr`, `watch_backend`, `watch_model`).
+  `diarize`, `start`, `end`, `no_ocr`, `watch_backend`, `watch_model`); ingest
+  forwards `diarize=false` to watch (previously dropped), and a rejected submit
+  surfaces watch's error detail.
 
 ## [0.4.5] — 2026-07-07
 
