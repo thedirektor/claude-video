@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -1080,11 +1081,15 @@ def main() -> int:
         video_id = info.get("id") or hashlib.sha1(args.source.encode("utf-8")).hexdigest()[:8]
         title = info.get("title") or Path(args.source).name
         try:
+            refs: dict = {}
             summary = library.save_artifacts(
                 video_path, frames, str(work / "report.md"), ocr_text, title, video_id,
+                refs=refs,
             )
             for line in summary:
                 print(f"[watch] {line}", file=sys.stderr)
+            if refs:
+                (work / "library.json").write_text(json.dumps(refs, indent=2), encoding="utf-8")
         except Exception as exc:  # belt: save must never fail the run
             print(f"[watch] library save skipped ({exc})", file=sys.stderr)
 

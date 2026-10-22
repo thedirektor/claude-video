@@ -370,7 +370,10 @@ def _add_to_album(base_url: str, api_key: str, album_id: str, asset_ids: list[st
 
 def upload_to_immich(files: list[str], album_name: str, cfg: dict) -> dict:
     """Upload files (video + frames) to an Immich album. NEVER raises."""
-    result = {"album": album_name, "uploaded": 0, "url": None, "error": None}
+    result = {
+        "album": album_name, "uploaded": 0, "url": None, "error": None,
+        "album_id": None, "assets": {},
+    }
     try:
         cfg = cfg or {}
         base_url = cfg.get("IMMICH_BASE_URL") or DEFAULT_IMMICH_BASE_URL
@@ -387,6 +390,7 @@ def upload_to_immich(files: list[str], album_name: str, cfg: dict) -> dict:
                 asset_id = _upload_immich_asset(base_url, api_key, path, album_name)
                 if asset_id:
                     asset_ids.append(asset_id)
+                    result["assets"][str(path)] = asset_id
             except Exception as exc:
                 print(f"[watch] library: Immich upload failed for {path}: {exc}", file=sys.stderr)
 
@@ -404,6 +408,7 @@ def upload_to_immich(files: list[str], album_name: str, cfg: dict) -> dict:
             result["error"] = f"album create/lookup failed: {exc}"
             print(f"[watch] library: Immich {result['error']}", file=sys.stderr)
 
+        result["album_id"] = album_id
         if album_id:
             try:
                 _add_to_album(base_url, api_key, album_id, asset_ids)
@@ -557,10 +562,14 @@ def _resolve_tag(base_url: str, token: str, name: str) -> int | None:
         return None
 
 
-def _post_document(base_url: str, token: str, path: str, title: str, tag_id: int | None) -> bool:
-    """POST one file to /api/documents/post_document/. Returns True on a 2xx
-    submission (consumption is async, so this confirms the upload was accepted,
-    not that the document finished processing)."""
+def _post_document(
+    base_url: str, token: str, path: str, title: str, tag_id: int | None
+) -> tuple[bool, str | None]:
+    """POST one file to /api/documents/post_document/. Returns (ok, task_id):
+    ok is True on a 2xx submission (consumption is async, so this confirms the
+    upload was accepted, not that the document finished processing); task_id is
+    the consumption task id Paperless returns as a JSON string body, or None if
+    the body is anything else."""
     p = Path(path)
     data = p.read_bytes()
     mimetype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
@@ -576,14 +585,22 @@ def _post_document(base_url: str, token: str, path: str, title: str, tag_id: int
     )
     with urlopen(request, timeout=120, context=_ssl_context()) as response:
         status = getattr(response, "status", 200)
-        response.read()
-    return 200 <= status < 300
+        raw = response.read()
+    ok = 200 <= status < 300
+    task_id = None
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        if isinstance(parsed, str) and parsed:
+            task_id = parsed
+    except Exception:
+        pass
+    return ok, task_id
 
 
 def upload_to_paperless(files: list[str], title: str, cfg: dict) -> dict:
     """Upload non-media artifacts (report.md, ...) to Paperless-ngx as tagged,
     searchable documents. NEVER raises."""
-    result = {"title": title, "uploaded": 0, "url": None, "error": None}
+    result = {"title": title, "uploaded": 0, "url": None, "error": None, "task_ids": []}
     try:
         cfg = cfg or {}
         base_url = (cfg.get("PAPERLESS_URL") or DEFAULT_PAPERLESS_URL).rstrip("/")
@@ -604,8 +621,11 @@ def upload_to_paperless(files: list[str], title: str, cfg: dict) -> dict:
         uploaded = 0
         for path in files:
             try:
-                if _post_document(base_url, token, path, title, tag_id):
+                ok, task_id = _post_document(base_url, token, path, title, tag_id)
+                if ok:
                     uploaded += 1
+                    if task_id:
+                        result["task_ids"].append(task_id)
             except Exception as exc:
                 print(f"[watch] library: Paperless upload failed for {path}: {exc}", file=sys.stderr)
 
@@ -625,6 +645,16 @@ def upload_to_paperless(files: list[str], title: str, cfg: dict) -> dict:
 # Router: content-type split + summary
 # --------------------------------------------------------------------------
 
+def _put_ref(refs: dict | None, key: str, value) -> None:
+    """Best-effort: record one target's refs. Never raises, never affects the
+    summary — a bad refs argument must not turn a good save into a failure."""
+    try:
+        if isinstance(refs, dict):
+            refs[key] = value
+    except Exception as exc:
+        print(f"[watch] library: could not record refs[{key}]: {exc}", file=sys.stderr)
+
+
 def save_artifacts(
     video_path: str | None,
     frames: list[dict],
@@ -633,12 +663,19 @@ def save_artifacts(
     title: str,
     video_id: str,
     cfg: dict | None = None,
+    refs: dict | None = None,
 ) -> list[str]:
     """Route this run's artifacts to Immich (video + representative frames)
     and Nextcloud (report.md + any non-media). NEVER raises — any failure is
     logged to stderr and reflected in the returned summary.
 
     Returns human-readable summary lines for the report footer.
+
+    When ``refs`` is a dict it is filled in place with machine-readable
+    pointers (``name``, ``immich`` album/asset ids, ``nextcloud`` folder,
+    ``paperless`` task ids, each with its ``url``) for every target that
+    actually uploaded something; skipped/failed targets are absent. The
+    return value is unaffected.
     """
     try:
         if cfg is None:
@@ -680,6 +717,14 @@ def save_artifacts(
                     print(f"[watch] library: Immich uploader raised: {exc}", file=sys.stderr)
                 uploaded = result.get("uploaded", 0)
                 error = result.get("error")
+                if uploaded:
+                    _put_ref(refs, "immich", {
+                        "album_id": result.get("album_id"),
+                        "url": result.get("url"),
+                        "assets": {
+                            Path(k).name: v for k, v in (result.get("assets") or {}).items()
+                        },
+                    })
                 if error and not uploaded:
                     summary.append(f"Immich: error ({error})")
                 elif error:
@@ -698,6 +743,11 @@ def save_artifacts(
                     print(f"[watch] library: Nextcloud uploader raised: {exc}", file=sys.stderr)
                 uploaded = result.get("uploaded", 0)
                 error = result.get("error")
+                if uploaded:
+                    _put_ref(refs, "nextcloud", {
+                        "folder": result.get("folder") or name,
+                        "url": result.get("url"),
+                    })
                 if error and not uploaded:
                     summary.append(f"Nextcloud: error ({error})")
                 elif error:
@@ -718,6 +768,11 @@ def save_artifacts(
                     print(f"[watch] library: Paperless uploader raised: {exc}", file=sys.stderr)
                 uploaded = result.get("uploaded", 0)
                 error = result.get("error")
+                if uploaded:
+                    _put_ref(refs, "paperless", {
+                        "task_ids": list(result.get("task_ids") or []),
+                        "url": result.get("url"),
+                    })
                 if error and not uploaded:
                     summary.append(f"Paperless: error ({error})")
                 elif error:
@@ -726,6 +781,9 @@ def save_artifacts(
                     summary.append(f"Paperless: '{name}' ({uploaded} docs)")
             else:
                 summary.append("Paperless: skipped (no PAPERLESS_TOKEN)")
+
+        if refs:
+            _put_ref(refs, "name", name)
 
         if not summary:
             summary.append("Library: nothing to save")

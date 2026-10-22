@@ -532,3 +532,109 @@ def test_load_config_defaults_and_env(monkeypatch, tmp_path):
     cfg2 = library.load_config()
     assert cfg2["IMMICH_API_KEY"] == "sk_env"
     assert cfg2["WATCH_SAVE_FRAME_CAP"] == 5
+
+
+# --------------------------------------------------------------------------
+# Structured refs (album/asset ids, Paperless task ids) for library.json
+# --------------------------------------------------------------------------
+
+def test_post_document_returns_task_id(tmp_path, monkeypatch):
+    report = tmp_path / "report.md"
+    report.write_text("# r", encoding="utf-8")
+
+    monkeypatch.setattr(library, "urlopen", lambda *a, **k: _Resp(b'"8f1c-uuid"'))
+    assert library._post_document("https://p.example", "tok", str(report), "T", None) == (True, "8f1c-uuid")
+
+    monkeypatch.setattr(library, "urlopen", lambda *a, **k: _Resp(b"OK"))
+    assert library._post_document("https://p.example", "tok", str(report), "T", None) == (True, None)
+
+
+def test_upload_to_paperless_collects_task_ids(tmp_path, monkeypatch):
+    a = tmp_path / "a.md"
+    b = tmp_path / "b.md"
+    a.write_text("a", encoding="utf-8")
+    b.write_text("b", encoding="utf-8")
+
+    monkeypatch.setattr(library, "_resolve_tag", lambda *args: 7)
+    answers = iter([(True, "t1"), (True, None)])
+    monkeypatch.setattr(library, "_post_document", lambda *args: next(answers))
+
+    cfg = {"PAPERLESS_URL": "https://paperless.example", "PAPERLESS_TOKEN": "tok"}
+    result = library.upload_to_paperless([str(a), str(b)], "T (v)", cfg)
+
+    assert result["uploaded"] == 2
+    assert result["task_ids"] == ["t1"]
+
+
+def test_upload_to_immich_returns_album_and_assets(tmp_path, monkeypatch):
+    frame = tmp_path / "frame_0001.jpg"
+    frame.write_bytes(b"x")
+
+    monkeypatch.setattr(library, "_upload_immich_asset", lambda *args: "a1")
+    monkeypatch.setattr(library, "_find_album", lambda *args: "alb")
+    monkeypatch.setattr(library, "_add_to_album", lambda *args: None)
+
+    cfg = {"IMMICH_BASE_URL": "https://immich.example", "IMMICH_API_KEY": "k"}
+    result = library.upload_to_immich([str(frame)], "N (v)", cfg)
+
+    assert result["album_id"] == "alb"
+    assert result["assets"] == {str(frame): "a1"}
+
+
+def test_save_artifacts_fills_refs(tmp_path, monkeypatch):
+    frame = tmp_path / "frame_0001.jpg"
+    frame.write_bytes(b"x")
+    report = tmp_path / "report.md"
+    report.write_text("# r", encoding="utf-8")
+
+    monkeypatch.setattr(
+        library, "upload_to_immich",
+        lambda files, name, cfg: {
+            "uploaded": 1, "error": None, "url": "https://immich.example/albums/alb",
+            "album_id": "alb", "assets": {str(frame): "a1"},
+        },
+    )
+    monkeypatch.setattr(
+        library, "upload_to_nextcloud",
+        lambda files, folder, cfg: {
+            "uploaded": 1, "error": None, "folder": folder, "url": "https://nc.example/Watch/x",
+        },
+    )
+    monkeypatch.setattr(
+        library, "upload_to_paperless",
+        lambda files, title, cfg: {
+            "uploaded": 1, "error": None, "url": "https://paperless.example/documents?query=x",
+            "task_ids": ["t1"],
+        },
+    )
+
+    cfg = {
+        "IMMICH_API_KEY": "k", "NEXTCLOUD_PASS": "p", "PAPERLESS_TOKEN": "tok",
+        "WATCH_SAVE_FRAME_CAP": 20,
+    }
+    frames = [{"path": str(frame), "timestamp": "0:00"}]
+
+    plain = library.save_artifacts(None, frames, str(report), {}, "My Video", "abc123", cfg=cfg)
+
+    refs: dict = {}
+    summary = library.save_artifacts(
+        None, frames, str(report), {}, "My Video", "abc123", cfg=cfg, refs=refs
+    )
+
+    assert summary == plain  # refs never changes the summary
+    assert refs["name"] == "My Video (abc123)"
+    assert refs["immich"]["album_id"] == "alb"
+    assert refs["immich"]["url"] == "https://immich.example/albums/alb"
+    assert refs["immich"]["assets"] == {"frame_0001.jpg": "a1"}
+    assert refs["nextcloud"]["folder"] == "My Video (abc123)"
+    assert refs["nextcloud"]["url"] == "https://nc.example/Watch/x"
+    assert refs["paperless"]["task_ids"] == ["t1"]
+    assert refs["paperless"]["url"] == "https://paperless.example/documents?query=x"
+
+
+def test_save_artifacts_refs_omit_skipped_targets(tmp_path):
+    report = tmp_path / "report.md"
+    report.write_text("# r", encoding="utf-8")
+    refs: dict = {}
+    library.save_artifacts(None, [], str(report), {}, "T", "v1", cfg={}, refs=refs)
+    assert "immich" not in refs and "nextcloud" not in refs and "paperless" not in refs

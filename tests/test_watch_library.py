@@ -17,7 +17,9 @@ import watch  # noqa: E402
 def _record_save(monkeypatch):
     calls = []
 
-    def fake_save_artifacts(video_path, frames, report_path, ocr_text, title, video_id, cfg=None):
+    def fake_save_artifacts(video_path, frames, report_path, ocr_text, title, video_id, cfg=None, refs=None):
+        if refs is not None:
+            refs["immich"] = {"album_id": "x"}
         calls.append(
             {
                 "video_path": video_path,
@@ -58,6 +60,10 @@ def test_writes_report_and_saves_by_default(cut_clip: Path, monkeypatch, tmp_pat
     assert call["title"]
     assert call["video_id"]
 
+    library_json = tmp_path / "library.json"
+    assert library_json.exists()
+    assert '"album_id": "x"' in library_json.read_text(encoding="utf-8")
+
 
 def test_no_save_skips_library_push(cut_clip: Path, monkeypatch, tmp_path):
     calls = _record_save(monkeypatch)
@@ -70,3 +76,4 @@ def test_no_save_skips_library_push(cut_clip: Path, monkeypatch, tmp_path):
 
     assert (tmp_path / "report.md").exists()
     assert calls == []
+    assert not (tmp_path / "library.json").exists()
