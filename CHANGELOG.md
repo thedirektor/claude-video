@@ -2,6 +2,29 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.6] — 2026-10-22
+
+### Added
+- **Canonical source identity.** `identity.canonical_source` collapses URL
+  spellings (e.g. the several YouTube forms) to one stable identity, so the same
+  video always maps to the same job/video id.
+- **Structured library refs + `library.json`.** `_post_document` now returns
+  `(ok, task_id)`; `upload_to_immich` returns `album_id` + `assets`;
+  `upload_to_paperless` returns `task_ids`; `save_artifacts(refs=…)` accepts and
+  records them. `watch.py` writes `<work>/library.json` so downstream tools can
+  resolve exactly which Immich assets and Paperless documents a run produced.
+- **Service** (`/opt/watch`):
+  - MCP report strips frame lines that carry OCR text and exposes `frames[].ocr`.
+  - `transcribe` parses diarized segments (`speaker`, `end`).
+  - `watch_frames` honours `resolution` (cap 768, never upscales).
+  - REST/MCP pass `no_save`, `timestamps`, `sub_lang`, `fresh`, `no_dedup`,
+    `no_transcriptapi`; `diarize=false` now reaches `watch.py` as `--no-diarize`.
+  - `POST /analyze` reuses queued/processing/done jobs (not failed) like MCP,
+    with YouTube URL spellings collapsed to one identity.
+  - Job results carry `library` refs; the service version is read from the plugin.
+- **ingest**: MCP `extract` exposes watch options (`detail`, `whisper`,
+  `diarize`, `start`, `end`, `no_ocr`, `watch_backend`, `watch_model`).
+
 ## [0.4.5] — 2026-07-07
 
 ### Added
