@@ -289,6 +289,13 @@ def _outputs(args, work: Path, result: dict | None, *, saved: bool, info: dict) 
             for line in library.save_exports(files, title, video_id, paperless_doc=paperless_doc,
                                              contact=built.get("contact", {}).get("path")):
                 print(f"[watch] {line}", file=sys.stderr)
+        if args.origin != "import":
+            import push
+
+            if push.enabled():
+                push.flush_outbox()
+                r = push.push_video(key, library_saved=saved)
+                print(f"[watch] central memory: {'pushed' if r['ok'] else 'queued in outbox'}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - outputs must never fail a run
         print(f"[watch] outputs skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
 
@@ -644,6 +651,10 @@ MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index", "stats", "export"
 def main() -> int:
     if sys.argv[1:2] == ["doctor"]:
         return doctor.main(sys.argv[2:])
+    if sys.argv[1:2] == ["push"] and not os.path.exists("push"):
+        import push
+
+        return push.main(sys.argv[2:])
     if sys.argv[1:2] == ["batch"] and not os.path.exists("batch"):
         import playlist
 
