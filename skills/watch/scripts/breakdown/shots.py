@@ -3,7 +3,7 @@
 ``frame_series`` makes one ffmpeg pass (160 px, every frame) and records the
 scene score and mean luma per frame. ``detect_shots`` turns that series into
 shots: a hard cut is a single-frame score spike, a gradual boundary is a run of
-frames above a lower threshold with a smooth ramp. Boundaries are frame
+frames whose end frames differ a lot (tiny colour thumbnails) while the content on both sides of the window is stable; a flash frame is not a cut. Boundaries are frame
 accurate because they come from per-frame timestamps, never from sampling.
 """
 from __future__ import annotations
@@ -15,12 +15,8 @@ import subprocess
 NOT_DETERMINED = "not determined"
 CUT_FLOOR = 0.15  # brief says 0.3; ffmpeg's scene score for a real red->green cut is only 0.23
 LUMA_SCALE = 60.0  # a luma jump of this many levels counts as a full-strength cut
-GRADUAL_LUMA = 0.5  # per-frame luma step that marks a ramping frame
 CUT_K = 6.0
-GRADUAL_FLOOR = 0.004
 GRADUAL_MIN_FRAMES = 3
-GAP_FRAMES = 1
-EDGE_FRAMES = 2
 
 _PTS = re.compile(r"pts_time:([0-9.]+)")
 _SCENE = re.compile(r"lavfi\.scene_score=([0-9.eE+-]+)")
@@ -28,7 +24,7 @@ _YAVG = re.compile(r"lavfi\.signalstats\.YAVG=([0-9.eE+-]+)")
 
 
 def _empty() -> dict:
-    return {"t": [], "scene": [], "yavg": []}
+    return {"t": [], "scene": [], "yavg": [], "thumb": []}
 
 
 def frame_series(path: str, fps: float) -> dict:
@@ -64,7 +60,24 @@ def frame_series(path: str, fps: float) -> dict:
         elif (m := _YAVG.search(line)):
             cur["yavg"] = float(m.group(1))
     flush()
+    series["thumb"] = _thumbs(path, len(series["t"]))
     return series
+
+
+def _thumbs(path: str, count: int) -> list[list[int]]:
+    """Tiny RGB thumbnail per frame (second pass); [] when the count disagrees."""
+    size = THUMB_W * THUMB_H * 3
+    try:
+        res = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-an", "-vf",
+             f"scale={THUMB_W}:{THUMB_H}:flags=area,format=rgb24", "-vsync", "0", "-f", "rawvideo", "-"],
+            capture_output=True, timeout=1800)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    raw = res.stdout
+    if len(raw) != size * count:
+        return []
+    return [list(raw[i * size:(i + 1) * size]) for i in range(count)]
 
 
 def _cut_threshold(scene: list[float]) -> float:
@@ -77,15 +90,83 @@ def _clamp(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
-def _ramp_ok(scores: list[float], yavg: list[float]) -> bool:
-    """Monotonic luma change, or a smooth (no spikes) score ramp."""
-    net = yavg[-1] - yavg[0]
-    if abs(net) >= 2.0:
-        sign = 1 if net > 0 else -1
-        if all(sign * (b - a) >= -1.0 for a, b in zip(yavg, yavg[1:])):
-            return True
-    top, med = max(scores), statistics.median(scores)
-    return med > 0 and top <= 6 * med
+THUMB_W, THUMB_H = 16, 9
+MAX_GRADUAL_S = 2.0
+MIN_CROSS = 0.08  # content change across a gradual window (0..1 mean abs thumbnail diff)
+MIN_SCORE = 3.0  # cross-window change vs the shots' own frame-to-frame variation
+FLASH_FRAMES = 3
+DARK = 40  # near-black thumbnail (mean channel value)
+_LENGTHS = (4, 6, 9, 13, 19, 27, 38, 50)
+
+
+def _dist(a, b) -> float:
+    return sum(abs(x - y) for x, y in zip(a, b)) / (255.0 * len(a))
+
+
+def _fps_of(t: list[float]) -> float:
+    dts = sorted(t[i] - t[i - 1] for i in range(1, len(t)) if t[i] > t[i - 1])
+    return 1.0 / dts[len(dts) // 2] if dts else 0.0
+
+
+def _flash_cuts(cands: list[int], strength: list[float], series: dict) -> set[int]:
+    """Cut pairs a few frames apart where the content returns (flash frames)."""
+    thumb, yavg = series.get("thumb") or [], series["yavg"]
+    drop: set[int] = set()
+    for i in cands:
+        for j in cands:
+            if not (i < j <= i + FLASH_FRAMES) or i in drop:
+                continue
+            if thumb:
+                before, after = _dist(thumb[i - 1], thumb[i]), _dist(thumb[i - 1], thumb[j])
+            else:
+                before, after = abs(yavg[i] - yavg[i - 1]), abs(yavg[j] - yavg[i - 1])
+            if after < 0.3 * before:
+                drop.update((i, j))
+    return drop
+
+
+def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
+    """Dissolves: a window whose end frames differ a lot while the content on
+    either side of the window is stable. Needs thumbnails; never guesses."""
+    thumb, t = series.get("thumb") or [], series["t"]
+    n = len(t)
+    if len(thumb) != n or n < 8:
+        return []
+    fps = _fps_of(t)
+    cap = int(MAX_GRADUAL_S * fps)
+    cands = []
+    for i0 in range(n):
+        for length in _LENGTHS:
+            if length > cap or length < GRADUAL_MIN_FRAMES:
+                continue
+            i1 = i0 + length
+            pre_n = min(length, i0)
+            post_n = min(length, n - 1 - i1)
+            if i1 >= n or pre_n < 3 or post_n < 3:
+                continue
+            if any(i0 < c <= i1 for c in cut_idx):
+                continue
+            # a fade in from / out to black near a clip edge is not a shot boundary
+            near = int(0.5 * fps)
+            if (i0 < near and sum(thumb[i0]) < DARK * len(thumb[i0])) or (n - 1 - i1 < near and sum(thumb[i1]) < DARK * len(thumb[i1])):
+                continue
+            cross = _dist(thumb[i0], thumb[i1])
+            if cross < MIN_CROSS:
+                continue
+            own = max(_dist(thumb[i0 - pre_n], thumb[i0]), _dist(thumb[i1], thumb[i1 + post_n]))
+            cands.append((cross / (own + 0.02), cross, i0, i1))
+    cands.sort(key=lambda c: (-c[0], c[3] - c[2]))
+    out, taken = [], []
+    for score, cross, i0, i1 in cands:
+        if score < MIN_SCORE:
+            break
+        if any(i0 <= e + 1 and s0 - 1 <= i1 for s0, e in taken):
+            continue
+        taken.append((i0, i1))
+        out.append({"kind": "gradual", "t": round((t[i0] + t[i1]) / 2, 6), "frames": i1 - i0,
+                    "t_start": t[i0], "t_end": t[i1],
+                    "confidence": round(_clamp(0.4 + 0.08 * score), 3)})
+    return out
 
 
 def _boundaries(series: dict) -> list[dict]:
@@ -95,43 +176,22 @@ def _boundaries(series: dict) -> list[dict]:
     # cut strength: ffmpeg's scene score, or the luma jump when the score under-reads
     strength = [max(scene[i], dy[i] / LUMA_SCALE) for i in range(n)]
     thr = _cut_threshold(strength)
-    cut_idx = set()
+    cands = [i for i in range(1, n) if strength[i] >= thr]
+    flash = _flash_cuts(cands, strength, series)
+    cands = [i for i in cands if i not in flash]
+    cut_idx: set[int] = set()
     out: list[dict] = []
-    for i in range(1, n):
-        if strength[i] >= thr and strength[i] >= strength[i - 1] and (i + 1 >= n or strength[i] >= strength[i + 1]):
-            cut_idx.add(i)
-            out.append({"kind": "cut", "t": t[i], "frames": 1, "t_start": t[i - 1], "t_end": t[i],
-                        "confidence": _clamp(0.5 + strength[i] / (2 * thr))})
-    low = min(GRADUAL_FLOOR, thr / 4)
-
-    def active(k: int) -> bool:
-        return scene[k] > low or dy[k] >= GRADUAL_LUMA
-
-    i = 1
-    while i < n:
-        if not active(i) or i in cut_idx:
-            i += 1
+    for i in cands:
+        # adjacent candidates are one cut: keep the strongest (first on a tie)
+        if i - 1 in cut_idx and strength[i] <= strength[i - 1]:
             continue
-        j, last, gap = i, i, 0
-        while j + 1 < n and (j + 1) not in cut_idx:
-            if active(j + 1):
-                j += 1
-                last, gap = j, 0
-            elif gap < GAP_FRAMES:
-                j += 1
-                gap += 1
-            else:
-                break
-        run = range(i, last + 1)
-        if len(run) >= GRADUAL_MIN_FRAMES and _ramp_ok([scene[k] for k in run], [yavg[k] for k in run]):
-            starts_clip = i - 1 <= EDGE_FRAMES
-            ends_clip = last >= n - 1 - EDGE_FRAMES
-            # a fade in from / out to black at the clip edge is not a shot boundary
-            if not (starts_clip or ends_clip):
-                t0, t1 = t[i - 1], t[last]
-                out.append({"kind": "gradual", "t": round((t0 + t1) / 2, 6), "frames": len(run),
-                            "t_start": t0, "t_end": t1, "confidence": 0.8})
-        i = last + 1
+        if i - 1 in cut_idx:
+            cut_idx.discard(i - 1)
+            out = [b for b in out if b["t"] != t[i - 1]]
+        cut_idx.add(i)
+        out.append({"kind": "cut", "t": t[i], "frames": 1, "t_start": t[i - 1], "t_end": t[i],
+                    "confidence": _clamp(0.5 + strength[i] / (2 * thr))})
+    out += _gradual(series, cut_idx)
     out.sort(key=lambda b: b["t"])
     return out
 
@@ -168,13 +228,15 @@ def rhythm(shots: list[dict]) -> dict:
     if not shots:
         return {"count": 0, "mean": NOT_DETERMINED, "median": NOT_DETERMINED,
                 "min": NOT_DETERMINED, "max": NOT_DETERMINED,
-                "fastest_window": NOT_DETERMINED,
+                "fastest_window": NOT_DETERMINED, "slowest_window": NOT_DETERMINED,
                 "evidence": {"t_start": 0.0, "t_end": 0.0, "method": "measured", "confidence": 0}}
     durs = [s["duration"] for s in shots]
     span = shots[-1]["end"] - shots[0]["start"]
     size = min(3, len(shots))
     best = min(range(len(shots) - size + 1), key=lambda i: sum(durs[i:i + size]))
     win = shots[best:best + size]
+    worst = max(range(len(shots) - size + 1), key=lambda i: sum(durs[i:i + size]))
+    slow = shots[worst:worst + size]
     return {
         "count": len(shots),
         "mean": span / len(shots),
@@ -183,6 +245,8 @@ def rhythm(shots: list[dict]) -> dict:
         "max": max(durs),
         "fastest_window": {"t_start": win[0]["start"], "t_end": win[-1]["end"],
                            "mean": sum(durs[best:best + size]) / size},
+        "slowest_window": {"t_start": slow[0]["start"], "t_end": slow[-1]["end"],
+                           "mean": sum(durs[worst:worst + size]) / size},
         "evidence": {"t_start": shots[0]["start"], "t_end": shots[-1]["end"],
                      "method": "measured", "confidence": round(min(s["evidence"]["confidence"] for s in shots), 3)},
     }

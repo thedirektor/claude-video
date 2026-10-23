@@ -64,6 +64,53 @@ def test_single_shot_clip(tmp_path):
 
 def test_unknown_fps_not_determined():
     series = S.frame_series("/nonexistent", 0.0)
-    assert series == {"t": [], "scene": [], "yavg": []}
+    assert series == {"t": [], "scene": [], "yavg": [], "thumb": []}
     assert S.detect_shots(series, 3.0) == []
     assert S.rhythm([])["mean"] == "not determined"
+
+
+def _ff(*a):
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *a], check=True)
+
+
+_ENC = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25"]
+
+
+def _shots(path, dur):
+    return S.detect_shots(S.frame_series(str(path), 25), dur)
+
+
+def test_moving_shot_no_boundary(tmp_path):
+    a, b = tmp_path / "anim.mp4", tmp_path / "pan.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=4", *_ENC, str(a))
+    _ff("-f", "lavfi", "-i", "testsrc2=s=1280x180:r=25:d=4", "-vf", "crop=320:180:'t*300':0", *_ENC, str(b))
+    assert len(_shots(a, 4.0)) == 1
+    assert len(_shots(b, 4.0)) == 1
+
+
+def test_flash_frame_not_a_cut(tmp_path):
+    p = tmp_path / "flash.mp4"
+    _ff("-f", "lavfi", "-i", "color=c=gray:s=320x180:r=25:d=4",
+        "-vf", "drawbox=c=white:t=fill:enable='eq(n,50)'", *_ENC, str(p))
+    assert len(_shots(p, 4.0)) == 1
+
+
+def test_equal_luma_dissolve(tmp_path):
+    p = tmp_path / "diss.mp4"
+    _ff("-f", "lavfi", "-i", "color=c=0x808080:s=320x180:r=25:d=4",
+        "-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=4",
+        "-filter_complex", "[0][1]xfade=transition=fade:duration=1:offset=1.5", *_ENC, str(p))
+    shots = _shots(p, 4.5)
+    grads = [s["boundary"] for s in shots if s["boundary"]]
+    assert len(shots) == 2 and grads[0]["kind"] == "gradual"
+    assert 1.5 <= grads[0]["t"] <= 2.5
+
+
+def test_rhythm_slowest_window():
+    mk = lambda i, a, b: {"index": i, "start": a, "end": b, "duration": b - a,
+                          "evidence": {"t_start": a, "t_end": b, "method": "measured", "confidence": 0.9}}
+    shots = [mk(0, 0, 1), mk(1, 1, 2), mk(2, 2, 3), mk(3, 3, 8), mk(4, 8, 13)]
+    r = S.rhythm(shots)
+    assert r["fastest_window"] == {"t_start": 0, "t_end": 3, "mean": 1.0}
+    assert r["slowest_window"]["t_start"] == 2 and r["slowest_window"]["t_end"] == 13
+    assert r["slowest_window"]["mean"] == pytest.approx(11 / 3)
