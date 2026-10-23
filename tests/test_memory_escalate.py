@@ -89,7 +89,7 @@ def test_clamps_to_duration_and_zero(conn, tmp_path):
     sd = _video(conn, tmp_path)
     extract, ocr, calls = _fakes({})
     escalate(conn, KEY, [1.0, 59.0], window=2, store_dir=sd, extract=extract, ocr=ocr)
-    assert min(calls) == 0.0 and max(calls) == 60.0
+    assert min(calls) == 0.0 and max(calls) == 59.0  # last seekable frame: duration - 0.5
 
 
 def test_unknown_duration_probes_media(conn, tmp_path):
@@ -100,4 +100,4 @@ def test_unknown_duration_probes_media(conn, tmp_path):
     (vdir / "media.mp4").write_bytes(b"fake")
     extract, ocr, calls = _fakes({})
     escalate(conn, KEY, [9.0], window=3, store_dir=sd, extract=extract, ocr=ocr, probe=lambda media: 10.0)
-    assert max(calls) == 10.0
+    assert max(calls) == 9.0

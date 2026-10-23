@@ -25,6 +25,7 @@ from .textnorm import normalize_for_search
 ZOOM_WIDTH = 2048  # 2x the plugin's 1024 px hi-res OCR frames
 MAX_TIMES = 3
 DUP_WINDOW_S = 2.0
+END_GUARD_S = 0.5  # seeking to the very last instant yields no frame
 
 
 def _budget() -> float:
@@ -110,7 +111,7 @@ def escalate(conn, video_key: str, times: list[float], *, window: float = 5.0, b
                 n = 0
                 lo, hi = max(0.0, t - window), t + window
                 if duration is not None:
-                    hi = min(hi, float(duration))
+                    hi = min(hi, float(duration) - END_GUARD_S)
                 step = lo
                 while step <= hi + 1e-9:
                     if clock() - start > budget:
