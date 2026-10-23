@@ -96,10 +96,11 @@ def _ytdlp_available() -> bool:
     return ytdlp_cmd()[0] != "yt-dlp" or shutil.which("yt-dlp") is not None
 
 
-def run_ytdlp(args: list[str]):
-    """Run yt-dlp (progress live on stderr), returning the result with stderr captured + echoed."""
-    result = subprocess.run([*ytdlp_cmd(), *args], stdout=sys.stderr, stderr=subprocess.PIPE,
-                            text=True, env=ytdlp_env())
+def run_ytdlp(args: list[str], capture: bool = False):
+    """Run yt-dlp (progress live on stderr), returning the result with stderr captured + echoed.
+    ``capture=True`` captures stdout too (e.g. ``--dump-single-json``)."""
+    result = subprocess.run([*ytdlp_cmd(), *args], stdout=subprocess.PIPE if capture else sys.stderr,
+                            stderr=subprocess.PIPE, text=True, env=ytdlp_env())
     if result.stderr:
         sys.stderr.write(result.stderr)
     return result
@@ -260,7 +261,12 @@ def fetch_captions(
     ]
     result = run_ytdlp(args)
     if not (out_dir / "video.info.json").exists() and is_breakage(result.stderr) and self_heal():
-        run_ytdlp(args)
+        result = run_ytdlp(args)
+    proxy = setting("WATCH_YTDLP_FALLBACK_PROXY")
+    if not (out_dir / "video.info.json").exists() and proxy and not is_breakage(result.stderr):
+        print("[watch] metadata/captions blocked — retrying once via the fallback proxy…", file=sys.stderr)
+        pos = args.index("--")
+        run_ytdlp([*args[:pos], "--proxy", proxy, "--socket-timeout", FALLBACK_SOCKET_TIMEOUT_S, *args[pos:]])
     subtitle = _pick_subtitle(out_dir, sub_langs)
     info = _read_info(out_dir / "video.info.json", url)
     return {

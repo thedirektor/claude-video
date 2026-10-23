@@ -87,3 +87,38 @@ def test_audio_only_fallback_keeps_audio_format(monkeypatch, tmp_path):
     monkeypatch.setattr(download.subprocess, "run", fake)
     download.download_url(URL, tmp_path / "dl", audio_only=True)
     assert calls[1][calls[1].index("-f") + 1].startswith("ba")
+
+
+def test_run_ytdlp_capture_returns_stdout(monkeypatch):
+    seen = {}
+
+    def fake(cmd, *a, **k):
+        seen.update(k)
+
+        class R:
+            returncode, stdout, stderr = 0, '{"id": "x"}', ""
+        return R()
+    monkeypatch.setattr(download.subprocess, "run", fake)
+    r = download.run_ytdlp(["--dump-single-json", "--", URL], capture=True)
+    assert r.stdout == '{"id": "x"}' and seen["stdout"] is download.subprocess.PIPE
+
+
+def test_captions_retry_via_proxy_when_blocked(monkeypatch, tmp_path):
+    monkeypatch.setenv("WATCH_YTDLP_FALLBACK_PROXY", PROXY)
+    out = tmp_path / "dl"
+    calls = []
+
+    def fake(cmd, *a, **k):
+        calls.append(list(cmd))
+
+        class R:
+            returncode, stdout = 1, ""
+            stderr = "ERROR: [youtube] x: Sign in to confirm you’re not a bot"
+        if "--proxy" in cmd:
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "video.info.json").write_text('{"title": "T", "duration": 5}')
+            R.returncode, R.stderr = 0, ""
+        return R()
+    monkeypatch.setattr(download.subprocess, "run", fake)
+    r = download.fetch_captions(URL, out)
+    assert r["info"]["title"] == "T" and len(calls) == 2 and "--proxy" in calls[1]

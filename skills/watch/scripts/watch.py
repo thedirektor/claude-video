@@ -19,7 +19,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from config import frame_cap, get_config, memory_paths  # noqa: E402
+from config import frame_cap, get_config, memory_paths, setting  # noqa: E402
 from download import DEFAULT_SUB_LANGS, download, fetch_captions, is_url  # noqa: E402
 import library  # noqa: E402
 import state  # noqa: E402
@@ -117,8 +117,12 @@ def _probe(args) -> dict:
                     "youtube": False, "has_captions": False}
         from download import run_ytdlp
 
-        r = run_ytdlp(["--skip-download", "--dump-single-json", "--no-warnings", "--no-playlist", "--", args.source])
-        info = json.loads(r.stdout or "{}") if getattr(r, "stdout", None) else {}
+        base = ["--skip-download", "--dump-single-json", "--no-warnings", "--no-playlist"]
+        r = run_ytdlp([*base, "--", args.source], capture=True)
+        proxy = setting("WATCH_YTDLP_FALLBACK_PROXY")
+        if r.returncode != 0 and proxy:
+            r = run_ytdlp([*base, "--proxy", proxy, "--socket-timeout", "20", "--", args.source], capture=True)
+        info = json.loads(r.stdout) if r.returncode == 0 and (r.stdout or "").strip() else {}
         subs = info.get("subtitles") or {}
         auto = info.get("automatic_captions") or {}
         wanted = ("es", "en")
