@@ -160,14 +160,11 @@ def test_build_all_with_fake_clis(conn, video, fake_clis, tmp_path):
     assert (base / "notes.md").read_text(encoding="utf-8").startswith("# Título")
 
 
-def test_build_missing_cli_skips_only_that_format(conn, video, fake_clis):
-    bin_dir, _ = fake_clis
-    (bin_dir / "gridcraft-cli").unlink()
-    os.environ["PATH"] = os.pathsep.join(p for p in os.environ["PATH"].split(os.pathsep) if "artcraft" not in p)
+def test_build_missing_cli_skips_only_that_format(conn, video, fake_clis, monkeypatch):
+    real_find = exports.find_cli
+    monkeypatch.setattr(exports, "find_cli", lambda app: None if app == "gridcraft" else real_find(app))
     res = exports.build(conn, KEY, ["xlsx", "viewer"], store_dir=video)
-    if "path" in res["xlsx"]:
-        pytest.skip("a real gridcraft-cli is installed on this machine")
-    assert "skipped" in res["xlsx"] and "path" in res["viewer"]
+    assert res["xlsx"] == {"skipped": "gridcraft-cli not found"} and "path" in res["viewer"]
 
 
 def test_build_unknown_video(conn, tmp_path):
