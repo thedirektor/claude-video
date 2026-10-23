@@ -269,7 +269,7 @@ python3 skills/watch/scripts/watch.py list
 python3 skills/watch/scripts/watch.py index --backfill-paperless   # also --rebuild/--forget KEY, --embed-missing
 ```
 
-Answers cite only timestamps present in the evidence. Embeddings need the optional `fastembed` package; without it search is full-text only. Opt out per run with `--no-index`; tune with `WATCH_INDEX_DB`, `WATCH_STORE_DIR`, `WATCH_MODEL_DIR`, `WATCH_EMBEDDINGS`, `WATCH_STORE_MAX_GB` (default 20), `WATCH_STORE_MEDIA_MAX_MB` (300), `WATCH_QDRANT_INBOX`. See the `watch` skill's "Video memory" section.
+Answers cite only timestamps present in the evidence. Embeddings need the optional `fastembed` package; without it search is full-text only. Per run: `--no-index` skips memory, `--save` archives gemini/openrouter runs to the library, `--origin` records who started the run. Keep downloaded media with `WATCH_STORE_KEEP_MEDIA=1`. Tune with `WATCH_INDEX_DB`, `WATCH_STORE_DIR`, `WATCH_MODEL_DIR`, `WATCH_EMBEDDINGS`, `WATCH_STORE_MAX_GB` (default 20), `WATCH_STORE_MEDIA_MAX_MB` (300), `WATCH_QDRANT_INBOX`. See the `watch` skill's "Video memory" section.
 
 ## Limits
 

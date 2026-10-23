@@ -441,7 +441,7 @@ After the report is printed (and written to `work/report.md`), the script prints
 
 ## Video memory (index + store)
 
-Every `/watch` run also writes to a local, searchable **video memory**, so a later session can ask "where did they say X?" without re-watching. One video = one merged evidence set, keyed by `video_key` (`yt:<id>`, `<extractor>:<id>`, `url:<hash>`, `file:<hash>`). Transcripts are replaced only by a better source (AssemblyAI-diarized > Whisper > TranscriptAPI > captions); frames/OCR are unioned; notes append. Every backend writes memory: the Gemini and OpenRouter backends index their answer as a note plus free captions only (no TranscriptAPI call, no extra paid transcript call). Writes are best-effort and never fail a run.
+Every `/watch` run also writes to a local, searchable **video memory**, so a later session can ask "where did they say X?" without re-watching. One video = one merged evidence set, keyed by `video_key` (`yt:<id>`, `<extractor>:<id>`, `url:<hash>`, `file:<hash>`). Transcripts are replaced only by a better source (AssemblyAI-diarized > Whisper > TranscriptAPI > captions); frames/OCR are unioned; notes append. Every backend writes memory: Gemini indexes yt-dlp captions (or Whisper only if `--whisper` is given); OpenRouter indexes the transcript the run already made (captions, else its audio model); both also index the backend answer as a note; neither calls TranscriptAPI or makes an extra paid transcript call. Writes are best-effort and never fail a run.
 
 Run flags: `--no-index` skips memory for this run (`--no-save` skips the library and Qdrant but still indexes); `--save` archives a gemini/openrouter or ingest-transcript run to the library (they do not archive by default; `--no-save` / `WATCH_NO_SAVE` still win); `--origin skill|service|ingest|import|backfill` records who started the run (default `skill`).
 
@@ -454,6 +454,8 @@ python3 "${SKILL_DIR}/scripts/watch.py" moment <video> <t> [--window 10] [--fram
 python3 "${SKILL_DIR}/scripts/watch.py" list [query] [--limit 20]
 python3 "${SKILL_DIR}/scripts/watch.py" index --backfill-paperless | --rebuild KEY | --forget KEY | --embed-missing
 ```
+
+Exit codes for these subcommands: 0 ok, 2 error, 3 video not found, 4 ambiguous video (a disambiguation list is printed).
 
 Retrieval is hybrid: 0.45 BM25 + 0.55 cosine (each min-max normalised per query), top-k 8, one video or all. Without the optional `fastembed` dependency the index is full-text only (said once on stderr).
 
