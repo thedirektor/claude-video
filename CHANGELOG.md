@@ -2,6 +2,13 @@
 
 All notable changes to `/watch` are documented here.
 
+## [Unreleased] — 0.6.0 in progress
+
+### Added
+- **Cost plan + ceiling** (`cost.py`): `--plan`, `WATCH_COST_CEILING_USD` (default 1.00) enforced before any paid call, `--allow-cost`, `WATCH_PRICES` overrides; metadata probe (falls back to the proxy when blocked).
+- **Actual spend** (`spend.py`): Gemini / OpenRouter usage tokens, Whisper audio seconds, TranscriptAPI credits, LLM chapter titles → `work/spend.json`.
+- Metadata/captions fetch retries via `WATCH_YTDLP_FALLBACK_PROXY` when blocked; `run_ytdlp(capture=True)`.
+
 ## [0.5.3] — 2026-10-23
 
 Outputs from the video memory.

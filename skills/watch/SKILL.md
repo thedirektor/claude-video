@@ -487,6 +487,10 @@ After every indexed run `/watch` stores **chapters** (from transcript pauses ≥
 
 When the run is archived, the exports go to the Nextcloud folder, the merged PDF goes to **Paperless instead of report.md**, and the contact sheet joins the Immich album. Rebuild exports for any indexed video without re-watching: `watch.py export <video> [--formats …] [--out DIR] [--json]`.
 
+## Cost plan and ceiling
+
+`watch.py <source> --plan [flags]` prints what a run would cost and does nothing else: duration, frames, the transcript route (TranscriptAPI → captions → Gemini → Whisper, decided from a metadata probe), dollars per paid provider (list prices; override with `WATCH_PRICES='{"openai:whisper-1": {"per_hour": 0.36}}'`), prepaid credits, and what leaves the machine. Every run checks the same plan first: if it exceeds `WATCH_COST_CEILING_USD` (default `1.00`; `0` turns the check off) it stops **before any paid call** and prints the plan — re-run with `--allow-cost` when the user accepts it. Only money /watch itself spends counts; the image tokens of the calling Claude session are shown as information. What a run actually spent is written to `work/spend.json` (tokens, audio seconds, credits, dollars). Mention the plan's total when a user asks about cost, and never pass `--allow-cost` without the user's go-ahead.
+
 ## Blocked YouTube downloads (storyboards, self-heal, doctor)
 
 - **Storyboard frames.** If the media download fails for a YouTube URL on a non-transcript run, `/watch` fetches the public storyboard (`yt-dlp -f sb0`, 320x180 seek-preview tiles, one every ~2–10 s; no account, no cookies) and uses the tiles as frames. The report says `Frame source: YouTube storyboard (…)` — treat them as low-res: fine for scenes, people, layout and big text, not for small text. Focus ranges and the frame cap apply. With no storyboard but a transcript, the run completes without frames (`Frames: none — media download blocked…`); with neither, it fails as before.
