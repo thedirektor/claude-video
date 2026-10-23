@@ -23,6 +23,7 @@ import download
 from config import memory_paths, setting
 
 CANARY_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+PROXY_PROBE_URL = "https://www.youtube.com/generate_204"
 LOW_DISK_BYTES = 2 * 1024**3
 ENDPOINTS = (("immich", "IMMICH_BASE_URL"), ("nextcloud", "NEXTCLOUD_URL"),
              ("paperless", "PAPERLESS_URL"), ("llm proxy", "WATCH_LLM_BASE_URL"))
@@ -105,8 +106,19 @@ def _keys() -> list[dict]:
     return out
 
 
+def _proxy_status(proxy: str) -> int | None:
+    handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    try:
+        with urllib.request.build_opener(handler).open(PROXY_PROBE_URL, timeout=15) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except Exception:  # noqa: BLE001 - unreachable proxy (e.g. the home machine is off)
+        return None
+
+
 def run_checks(*, online: bool = True, which=shutil.which, run=subprocess.run, http=_http_status,
-               embedder_ok=_embedder_status) -> dict:
+               embedder_ok=_embedder_status, proxy_status=_proxy_status) -> dict:
     checks: list[dict] = []
 
     def version(cmd: list[str]) -> tuple[bool, str]:
@@ -185,6 +197,14 @@ def run_checks(*, online: bool = True, which=shutil.which, run=subprocess.run, h
             checks.append(_check(name, "ok" if reachable else "warn",
                                  f"{url} reachable (HTTP {code})" if reachable
                                  else f"{url} unreachable" + (f" (HTTP {code})" if code else "")))
+
+        proxy = setting("WATCH_YTDLP_FALLBACK_PROXY")
+        if proxy:
+            code = proxy_status(proxy)
+            ok = code is not None and code < 400
+            checks.append(_check("fallback proxy", "ok" if ok else "warn",
+                                 f"{proxy} → YouTube HTTP {code}" if code is not None
+                                 else f"{proxy} unreachable — blocked downloads fall back to storyboards"))
 
     checks.extend(_keys())
     return {"ok": not any(c["status"] == "fail" for c in checks), "checks": checks}

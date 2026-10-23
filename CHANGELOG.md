@@ -2,6 +2,12 @@
 
 All notable changes to `/watch` are documented here.
 
+## [Unreleased]
+
+### Added
+- **Fallback proxy** (`WATCH_YTDLP_FALLBACK_PROXY`, `WATCH_FALLBACK_MAX_MB`): a blocked download is retried once through a residential HTTP proxy (≤480p, size cap, 20 s socket timeout); `doctor` probes it. Storyboards remain the next fallback.
+- **Chapters + cited notes** (`memory/extract.py`).
+
 ## [0.5.2] — 2026-10-23
 
 Acquisition resilience without accounts or paid proxies.
@@ -16,7 +22,7 @@ Acquisition resilience without accounts or paid proxies.
 - Personal hosts are no longer built-in defaults: `IMMICH_BASE_URL`, `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `PAPERLESS_URL` and `WATCH_LLM_BASE_URL` must be configured (a target without them is skipped).
 
 ### Not done (closed no-go)
-- PO-token provider, Deno/EJS and self-hosted cobalt could not fetch most YouTube media from a datacenter IP without a logged-in account; the residential-proxy fallback was dropped (paid).
+- PO-token provider, Deno/EJS and self-hosted cobalt could not fetch most YouTube media from a datacenter IP without a logged-in account; the paid residential-proxy fallback was dropped (a self-hosted one arrived right after, see Unreleased).
 
 ## [0.5.1] — 2026-10-23
 

@@ -60,6 +60,10 @@ _BREAKAGE = re.compile(
     re.IGNORECASE,
 )
 SELF_HEAL_WINDOW_S = 6 * 3600
+# Residential fallback (e.g. tinyproxy on a home machine over Tailscale): one retry,
+# capped, when the normal egress is blocked. Off unless WATCH_YTDLP_FALLBACK_PROXY is set.
+FALLBACK_FORMAT = "bv*[height<=480]+ba/b[height<=480]/b"
+FALLBACK_SOCKET_TIMEOUT_S = "20"
 
 
 def is_breakage(stderr: str) -> bool:
@@ -142,6 +146,21 @@ def self_heal(clock=time.time, force: bool = False) -> bool:
     except Exception as exc:  # noqa: BLE001 - self-heal is best-effort
         print(f"[watch] yt-dlp self-heal skipped: {type(exc).__name__}: {exc}", file=sys.stderr)
         return False
+
+
+def _fallback_args(args: list[str], proxy: str, audio_only: bool) -> list[str]:
+    """The download argv re-pointed at the fallback proxy: ≤480p, size-capped, quick timeout."""
+    out = list(args)
+    if not audio_only:
+        out[out.index("-f") + 1] = FALLBACK_FORMAT
+    try:
+        max_mb = max(1, int(setting("WATCH_FALLBACK_MAX_MB") or "400"))
+    except ValueError:
+        max_mb = 400
+    pos = out.index("--")
+    out[pos:pos] = ["--proxy", proxy, "--max-filesize", f"{max_mb}M",
+                    "--socket-timeout", FALLBACK_SOCKET_TIMEOUT_S]
+    return out
 
 
 def _cookie_args(cookies_from_browser: str | None, cookies_file: str | None) -> list[str]:
@@ -310,6 +329,13 @@ def download_url(
     if video is None and is_breakage(result.stderr) and self_heal():
         result = run_ytdlp(args)
         video = _pick_video(out_dir)
+    via_proxy = False
+    proxy = setting("WATCH_YTDLP_FALLBACK_PROXY")
+    if video is None and proxy and not is_breakage(result.stderr):
+        print("[watch] download blocked — retrying once via the fallback proxy (≤480p)…", file=sys.stderr)
+        result = run_ytdlp(_fallback_args(args, proxy, audio_only))
+        video = _pick_video(out_dir)
+        via_proxy = video is not None
     if video is None:
         raise SystemExit(
             f"yt-dlp did not produce a video file in {out_dir} (exit {result.returncode})"
@@ -323,6 +349,7 @@ def download_url(
         "subtitle_path": str(subtitle) if subtitle else None,
         "info": info or {"url": url},
         "downloaded": True,
+        "via_fallback_proxy": via_proxy,
     }
 
 

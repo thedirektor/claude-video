@@ -130,3 +130,19 @@ def test_watch_py_dispatches_doctor(monkeypatch):
     monkeypatch.setattr(watch.doctor, "main", lambda argv: got.append(argv) or 0)
     monkeypatch.setattr(sys, "argv", ["watch.py", "doctor", "--json"])
     assert watch.main() == 0 and got == [["--json"]]
+
+
+def test_fallback_proxy_check(env):
+    env.setenv("WATCH_YTDLP_FALLBACK_PROXY", "http://100.64.0.9:8888")
+    common = dict(online=True, which=lambda n: f"/usr/bin/{n}", run=_ok_run(), embedder_ok=lambda: True,
+                  http=lambda url: 200)
+    assert _by_name(doctor.run_checks(**common, proxy_status=lambda p: 204))["fallback proxy"]["status"] == "ok"
+    c = _by_name(doctor.run_checks(**common, proxy_status=lambda p: None))["fallback proxy"]
+    assert c["status"] == "warn" and "storyboards" in c["detail"]
+
+
+def test_no_fallback_proxy_no_check(env):
+    env.delenv("WATCH_YTDLP_FALLBACK_PROXY", raising=False)
+    rep = doctor.run_checks(online=True, which=lambda n: f"/usr/bin/{n}", run=_ok_run(), embedder_ok=lambda: True,
+                            http=lambda url: 200, proxy_status=lambda p: pytest.fail("not configured"))
+    assert "fallback proxy" not in _by_name(rep)

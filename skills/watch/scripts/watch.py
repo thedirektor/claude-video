@@ -1299,6 +1299,8 @@ def main() -> int:
         )
     elif not cue_frames:
         emit("- **Frames:** skipped (transcript detail)")
+    if dl.get("via_fallback_proxy"):
+        emit("- **Download:** via the fallback proxy (≤480p) — the normal egress was blocked")
     if frame_meta.get("engine") == "storyboard":
         step = frame_meta.get("interval_s")
         every = f", one every ~{step:g}s" if step else ""
