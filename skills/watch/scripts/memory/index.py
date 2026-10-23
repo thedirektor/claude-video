@@ -19,20 +19,8 @@ from pathlib import Path
 import frames as _frames
 import identity
 from config import memory_paths
+from memory.chunking import chunk_segments
 from memory.textnorm import normalize_for_search
-
-try:  # Task 5 lands the real speaker-aware chunker.
-    from memory.chunking import chunk_segments
-except ModuleNotFoundError as _exc:  # pragma: no cover - replaced in Task 5
-    if _exc.name != "memory.chunking":
-        raise
-
-    def chunk_segments(segments: list[dict]) -> list[dict]:
-        """Stub: one chunk per segment, same output shape as the real chunker."""
-        return [
-            {"t_start": s["start"], "t_end": s["end"], "speaker": s.get("speaker"), "text": s["text"]}
-            for s in segments
-        ]
 
 SCHEMA_VERSION = 1
 

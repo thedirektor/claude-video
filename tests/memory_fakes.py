@@ -122,3 +122,27 @@ def run_count(conn, video_key: str = KEY) -> int:
 def meta(conn, key: str) -> str | None:
     row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
+
+
+class FakeEmbedder:
+    """Deterministic bag-of-words embedder hashed into 16 dims (no model, no network)."""
+
+    model_name = "fake-16"
+    dim = 16
+    SYNONYMS = {"coche": "automovil", "carro": "automovil", "car": "automovil"}
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        import zlib
+
+        out = []
+        for t in texts:
+            v = [0.0] * self.dim
+            for w in t.lower().split():
+                w = self.SYNONYMS.get(w, w)
+                v[zlib.crc32(w.encode()) % self.dim] += 1.0
+            out.append(v)
+        return out
+
+
+def embedding_models(conn) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT DISTINCT model FROM embeddings")}
