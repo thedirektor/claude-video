@@ -160,6 +160,16 @@ def _tree_bytes(root: Path) -> int:
     return sum(_size(p) for p in root.rglob("*") if p.is_file()) if root.is_dir() else 0
 
 
+PINNED_MARKER = ".pinned"
+
+
+def _breakdown_media_cap_bytes() -> int:
+    try:
+        return int(float(setting("WATCH_BREAKDOWN_MEDIA_MAX_MB", "2048") or "2048") * _MB)
+    except ValueError:
+        return 2048 * _MB
+
+
 def enforce_retention(conn, store_dir: Path, max_bytes: int | None = None,
                       protect: frozenset[str] = frozenset()) -> dict:
     """Evict media, then frames, in least-recently-accessed order until the
@@ -181,11 +191,16 @@ def enforce_retention(conn, store_dir: Path, max_bytes: int | None = None,
         "SELECT video_key FROM videos ORDER BY COALESCE(last_access, '') ASC, video_key ASC")]
     keys = [k for k in keys if k not in protect]
 
-    for key in keys:  # pass 1: media
+    cap = _breakdown_media_cap_bytes()
+    for key in keys:  # pass 1: media (pinned breakdown media is exempt unless over its own cap)
         if total <= max_bytes:
             return out
-        for media in sorted(video_dir(root, key).glob("media.*")):
+        vdir = video_dir(root, key)
+        pinned = (vdir / PINNED_MARKER).exists()
+        for media in sorted(vdir.glob("media.*")):
             size = _size(media)
+            if pinned and size <= cap:
+                continue
             media.unlink(missing_ok=True)
             total -= size
             out["freed"] += size

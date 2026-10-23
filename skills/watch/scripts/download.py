@@ -301,6 +301,7 @@ def download_url(
     sub_langs: str = DEFAULT_SUB_LANGS,
     cookies_from_browser: str | None = None,
     cookies_file: str | None = None,
+    fmt: str | None = None,
 ) -> dict:
     if not _ytdlp_available():
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
@@ -308,7 +309,8 @@ def download_url(
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
 
-    fmt = "ba/bestaudio" if audio_only else "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
+    if fmt is None:
+        fmt = "ba/bestaudio" if audio_only else "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
     args = [
         "-N", "8",
         "-f", fmt,
