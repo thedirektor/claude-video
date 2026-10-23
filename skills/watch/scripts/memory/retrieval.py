@@ -6,6 +6,9 @@ fold into their chunk; consecutive near-identical OCR hits collapse into one.
 from __future__ import annotations
 
 import difflib
+import re
+import sqlite3
+import sys
 from dataclasses import dataclass, replace
 
 from .textnorm import normalize_for_search
@@ -19,6 +22,14 @@ _KIND = {"chunks": "transcript", "ocr_blocks": "ocr", "notes": "note"}
 
 @dataclass
 class Hit:
+    """One retrieval result.
+
+    ``t`` is the evidence time (best-matching segment start for transcript hits). For OCR hits
+    ``dup_count`` is how many near-identical consecutive hits were collapsed into this one
+    (1 = none), and ``t_first``/``t_last`` the earliest/latest time of that run (None when not
+    an OCR hit). ``t`` is the representative's own time (highest score, then earliest).
+    """
+
     video_key: str
     kind: str  # transcript | ocr | note
     src_table: str
@@ -54,9 +65,13 @@ def hybrid_scores(fts: dict, vec: dict) -> dict:
     return {k: W_FTS * f.get(k, 0.0) + W_VEC * v.get(k, 0.0) for k in set(f) | set(v)}
 
 
+_CTRL = re.compile(r"[\x00-\x1f]")
+
+
 def _fts_query(query: str) -> str:
     terms = []
     for tok in normalize_for_search(query).split():
+        tok = _CTRL.sub("", tok)
         tok = tok.replace('"', '""')
         if tok:
             terms.append(f'"{tok}"')
@@ -80,7 +95,11 @@ def _fts_candidates(conn, query: str, video_key: str | None) -> tuple[dict, dict
     args.append(CANDIDATES)
     scores: dict = {}
     seg_t: dict = {}
-    for table, sid, vkey, t, s in (tuple(r) for r in conn.execute(sql, args)):
+    try:
+        rows = [tuple(r) for r in conn.execute(sql, args)]
+    except sqlite3.OperationalError:
+        return {}, {}
+    for table, sid, vkey, t, s in rows:
         key = (table, sid)
         if table == "segments":
             row = conn.execute(
@@ -89,9 +108,15 @@ def _fts_candidates(conn, query: str, video_key: str | None) -> tuple[dict, dict
             if row is None:
                 continue
             start = row[0]
+            # half-open [t_start, t_end) so a boundary segment folds into the chunk it starts;
+            # inclusive end only as a fallback (final chunk, zero-length chunk)
             c = conn.execute(
+                "SELECT id FROM chunks WHERE video_key = ? AND t_start <= ? AND t_end > ? "
+                "ORDER BY t_start DESC, id LIMIT 1",
+                (vkey, start, start),
+            ).fetchone() or conn.execute(
                 "SELECT id FROM chunks WHERE video_key = ? AND t_start <= ? AND t_end >= ? "
-                "ORDER BY t_start, id LIMIT 1",
+                "ORDER BY t_start DESC, id LIMIT 1",
                 (vkey, start, start),
             ).fetchone()
             if c is None:
@@ -176,10 +201,16 @@ def collapse_ocr_duplicates(hits: list[Hit], window: float = 15.0, similarity: f
 
 def search(conn, query: str, video_key: str | None = None, k: int = 8, embedder=None) -> Hits:
     fts, seg_t = _fts_candidates(conn, query, video_key)
-    vec = _vec_candidates(conn, query, video_key, embedder) if embedder is not None else {}
+    vec: dict = {}
+    if embedder is not None:
+        try:
+            vec = _vec_candidates(conn, query, video_key, embedder)
+        except Exception as e:  # embedder/numpy failure must never fail a search
+            print(f"watch: vector search unavailable ({type(e).__name__}: {e}); using text search only", file=sys.stderr)
+            vec = {}
     scores = hybrid_scores(fts, vec)
     out = Hits()
-    out.mode = "hybrid" if embedder is not None else "fts-only"
+    out.mode = "hybrid" if vec else "fts-only"
     hits: list[Hit] = []
     for key, sc in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0])):
         h = _load(conn, key)
