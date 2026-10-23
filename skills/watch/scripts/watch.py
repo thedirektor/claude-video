@@ -651,6 +651,10 @@ MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index", "stats", "export"
 def main() -> int:
     if sys.argv[1:2] == ["doctor"]:
         return doctor.main(sys.argv[2:])
+    if sys.argv[1:2] == ["mcp"] and not os.path.exists("mcp"):
+        import mcp_stdio
+
+        return mcp_stdio.main(sys.argv[2:])
     if sys.argv[1:2] == ["push"] and not os.path.exists("push"):
         import push
 
