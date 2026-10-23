@@ -10,6 +10,7 @@ bundle twice is a no-op, notes already present are not duplicated.
 from __future__ import annotations
 
 import json
+import shutil
 import socket
 import tempfile
 import zipfile
@@ -17,7 +18,7 @@ from pathlib import Path
 
 from config import memory_paths, setting
 
-from . import index, writer
+from . import index, store, writer
 
 MAX_BUNDLE_BYTES = 200 * 1024 * 1024
 DERIVED_NOTE_KINDS = {"chapter", "visual"}   # rebuilt / re-fetched centrally, never shipped
@@ -76,6 +77,11 @@ def make_bundle(conn, key: str, out_path: Path, *, store_dir=None, host: str | N
         report = root / (v[7] or "") / "report.md" if v[7] else None
         if report and report.is_file():
             z.write(report, "report.md")
+        bdir = root / v[7] / "breakdown" if v[7] else store.video_dir(root, key) / "breakdown"
+        if bdir.is_dir():
+            for f in sorted(bdir.iterdir()):
+                if f.is_file():
+                    z.write(f, f"breakdown/{f.name}")
     return out_path
 
 
@@ -132,5 +138,12 @@ def import_bundle(zip_path, *, embedder: object = "auto") -> dict:
         result = writer.remember(record, archive=True, embedder=embedder)
         if result is None:
             raise BundleError("merge failed (see service log)")
+        shipped = sorted((root / "breakdown").glob("*")) if (root / "breakdown").is_dir() else []
+        if shipped:
+            dest = store.video_dir(Path(memory_paths()["store_dir"]), run["video_key"]) / "breakdown"
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in shipped:
+                if f.is_file():
+                    shutil.copyfile(f, dest / f.name)
         return {**result, "skipped": result.get("run_id") is None, "title": run.get("title"),
                 "library_saved": bool(run.get("library_saved"))}

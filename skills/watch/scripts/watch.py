@@ -645,6 +645,7 @@ def _run_openrouter_backend(args, work: Path) -> int:
     return 0
 
 
+BREAKDOWN_COMMANDS = {"breakdown", "motion", "compare"}
 MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index", "stats", "export"}
 
 
@@ -663,6 +664,10 @@ def main() -> int:
         import playlist
 
         return playlist.main(sys.argv[2:])
+    if sys.argv[1:2] and sys.argv[1] in BREAKDOWN_COMMANDS and not os.path.exists(sys.argv[1]):
+        from breakdown import cli as breakdown_cli
+
+        return breakdown_cli.main(sys.argv[1:])
     # Video-memory read path: `watch.py search|ask|moment|list|index ...`, unless the
     # word is an existing path (a file literally named "search" is still watched).
     if len(sys.argv) > 1 and sys.argv[1] in MEMORY_COMMANDS and not os.path.exists(sys.argv[1]):
