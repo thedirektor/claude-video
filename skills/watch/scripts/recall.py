@@ -2,7 +2,9 @@
 """/watch-recall — retrieve a saved /watch report so a later session can read,
 see, or learn from a video it never watched.
 
-Two retrieval paths, in order:
+Retrieval paths, in order (step 0 is the local video-memory index; when it has
+hits they win, otherwise recall falls through unchanged):
+  0. **Video-memory index** — hybrid search over transcript / OCR / notes.
   1. **Paperless-ngx full-text search** (primary) — `GET /api/documents/?query=Q`
      finds reports by topic even when you don't know the title, then fetches each
      match's full `content` (the whole report.md: transcript + OCR + frame index).
@@ -167,6 +169,53 @@ def _format_match(idx: int, title: str, source_url: str | None, content: str,
     return "\n".join(lines)
 
 
+def _recall_from_index(query: str, limit: int) -> str | None:
+    """Step 0: the video-memory index. None when it is absent, empty for this query, or broken."""
+    try:
+        from config import memory_paths
+        from memory import embeddings, index, retrieval
+
+        db = memory_paths()["index_db"]
+        if not db.exists():
+            return None
+        conn = index.connect(db)
+        try:
+            embedder = embeddings.get_embedder(memory_paths().get("model_dir"), local_only=True)
+            hits = retrieval.search(conn, query, k=limit * 3, embedder=embedder)
+            shaped = retrieval.hit_dicts(conn, hits, hits.mode)
+            if not shaped["hits"]:
+                return None
+            groups: dict[str, list[dict]] = {}
+            for h in shaped["hits"]:
+                groups.setdefault(h["video_key"], []).append(h)
+            parts = [f"# watch-recall: \"{query}\"\n",
+                     f"Found {min(len(groups), limit)} video(s) in the video index ({shaped['mode']} search).\n"]
+            for i, (key, hs) in enumerate(list(groups.items())[:limit], 1):
+                v = conn.execute("SELECT * FROM videos WHERE video_key = ?", (key,)).fetchone()
+                lines = [f"## {i}. {(v['title'] if v else None) or key}",
+                         f"- Video: {(v['url'] if v else None) or '(source not recorded)'}"]
+                where = []
+                if v and v["paperless_doc_id"] is not None:
+                    where.append(f"Paperless doc {v['paperless_doc_id']}")
+                if v and v["nextcloud_path"]:
+                    where.append(f"Nextcloud {v['nextcloud_path']}")
+                if v and v["immich_album_id"]:
+                    where.append(f"Immich album {v['immich_album_id']}")
+                if where:
+                    lines.append(f"- Library: {' | '.join(where)}")
+                lines.append(f"- Key: `{key}` (ask: `watch.py ask {key} \"...\"`)")
+                lines.append("")
+                lines.extend(f"[{h['timestamp'] or '--:--'}] {h['kind']}: {h['snippet']}" for h in hs)
+                parts.append("\n".join(lines))
+                parts.append("\n---\n")
+            return "\n".join(parts).rstrip() + "\n"
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - recall must fall through to Paperless
+        print(f"[watch-recall] index lookup failed: {exc}", file=sys.stderr)
+        return None
+
+
 def recall(query: str, cfg: dict | None = None, limit: int = 5, full: bool = False) -> str:
     """Find saved /watch reports matching `query` and return a readable,
     agent-consumable summary. NEVER raises."""
@@ -175,6 +224,11 @@ def recall(query: str, cfg: dict | None = None, limit: int = 5, full: bool = Fal
             cfg = library.load_config()
         cfg = cfg or {}
         header = f"# watch-recall: \"{query}\"\n"
+
+        # 0) The video-memory index (transcript, OCR and notes with timestamps).
+        indexed = _recall_from_index(query, limit)
+        if indexed:
+            return indexed
 
         # 1) Paperless full-text search.
         matches = search_paperless(query, cfg, limit=limit)

@@ -154,3 +154,38 @@ def test_recall_never_raises(monkeypatch):
     out = recall.recall("anything", cfg=cfg)
     assert isinstance(out, str)
     assert out  # non-empty, no exception
+
+
+# --------------------------------------------------------------------------
+# Index-first recall (Task 10)
+# --------------------------------------------------------------------------
+
+def test_recall_index_first(monkeypatch):
+    from memory import index
+    from memory_fakes import Spy, fake_run, seg
+
+    c = index.connect()
+    index.record_run(c, fake_run(title="Demo canción", segments=[seg(12, 18, "la canción del verano")]))
+    index.set_library_ref(c, "yt:AAAAAAAAAAA", paperless_doc_id=7)
+    c.close()
+    spy = Spy(return_value=[])
+    monkeypatch.setattr(recall, "search_paperless", spy)
+    out = recall.recall("cancion", cfg={"PAPERLESS_TOKEN": "t"})
+    assert "Found 1 video(s) in the video index" in out
+    assert "Demo canción" in out and "Paperless doc 7" in out
+    assert "[00:12] transcript:" in out
+    assert spy.calls == []
+
+
+def test_recall_index_miss_falls_through(monkeypatch):
+    from memory import index
+    from memory_fakes import Spy, fake_run, seg
+
+    c = index.connect()
+    index.record_run(c, fake_run(segments=[seg(0, 5, "hola")]))
+    c.close()
+    spy = Spy(return_value=[])
+    monkeypatch.setattr(recall, "search_paperless", spy)
+    monkeypatch.setattr(recall, "list_nextcloud_watch", lambda cfg: [])
+    assert "No matching reports" in recall.recall("zzzqqq", cfg={})
+    assert len(spy.calls) == 1
