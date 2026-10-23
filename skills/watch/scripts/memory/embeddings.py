@@ -132,14 +132,21 @@ def embed_pending(conn, embedder: Embedder | None, limit: int = 2000) -> int:
         ).fetchall()
         pending.extend((table, r[0], r[1], r[2]) for r in rows)
     done = 0
-    for i in range(0, len(pending), _BATCH):
-        batch = pending[i : i + _BATCH]
-        vecs = embedder.embed([b[3] for b in batch])
-        conn.executemany(
-            "INSERT OR REPLACE INTO embeddings (src_table, src_id, video_key, model, dim, vector) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [(b[0], b[1], b[2], embedder.model_name, embedder.dim, pack(v)) for b, v in zip(batch, vecs)],
-        )
-        done += len(batch)
-    conn.commit()
+    try:
+        for i in range(0, len(pending), _BATCH):
+            batch = pending[i : i + _BATCH]
+            vecs = embedder.embed([b[3] for b in batch])
+            for (table, src_id, vkey, text), v in zip(batch, vecs):
+                # Only store the vector if the row still holds the text we embedded
+                # (a concurrent rebuild may have reused the rowid for new text).
+                cur = conn.execute(
+                    "INSERT OR REPLACE INTO embeddings (src_table, src_id, video_key, model, dim, vector) "
+                    f"SELECT ?, ?, ?, ?, ?, ? FROM {table} WHERE id = ? AND text = ?",
+                    (table, src_id, vkey, embedder.model_name, embedder.dim, pack(v), src_id, text),
+                )
+                done += cur.rowcount
+            conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     return done
