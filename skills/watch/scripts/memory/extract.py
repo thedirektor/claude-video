@@ -25,6 +25,9 @@ SCENE_SNAP_S = 3.0
 TITLE_MAX = 70
 BULLET_MAX = 160
 _SENTENCE = re.compile(r"(?<=[.!?…])\s+")
+# Caption/subtitle credit lines ("Transcriptor: … Revisor: …") are never a chapter title.
+_CREDITS = re.compile(r"^\W*(transcri(ptor|ber|ption)|translat(or|ion|ed by)|revisor|reviewer|traductor|traducci[oó]n|"
+                      r"subt[ií]tulos|subtitles|captions?)\b", re.IGNORECASE)
 
 
 def _video(conn, key: str):
@@ -175,7 +178,7 @@ def chapters(conn, key: str, *, llm_titles: bool | None = None, complete=None) -
     out = []
     for i, (a, b) in enumerate(zip(edges, edges[1:]), 1):
         inside = [s for s in segs if a <= s["start"] < b]
-        title = _first_sentence(inside[0]["text"]) if inside else ""
+        title = next((t for t in (_first_sentence(s["text"]) for s in inside[:4]) if t and not _CREDITS.match(t)), "")
         out.append({"t_start": a, "t_end": b, "title": title or f"Chapter {i} ({stamp(a)})",
                     "bullets": _bullets(segs, ocr, a, b)})
     if llm_titles is None:

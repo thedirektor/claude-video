@@ -114,3 +114,9 @@ def test_notes_md(conn):
     assert md.startswith("# ")
     assert md.count("\n## ") == len(extract.chapters(conn, KEY))
     assert re.search(r"^- .+\(\d\d:\d\d\)$", md, re.M)
+
+
+def test_caption_credits_never_title(conn):
+    record_run(conn, fake_run(duration=60.0, segments=[
+        seg(0, 3, "Transcriptor: Ana Pérez Revisor: Ale Castillo"), seg(4, 8, "Hoy vamos a hablar de comunicación.")]))
+    assert extract.chapters(conn, KEY)[0]["title"] == "Hoy vamos a hablar de comunicación"
