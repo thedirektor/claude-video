@@ -23,7 +23,10 @@ from memory.textnorm import normalize_for_search
 
 try:  # Task 5 lands the real speaker-aware chunker.
     from memory.chunking import chunk_segments
-except ImportError:  # pragma: no cover - replaced in Task 5
+except ModuleNotFoundError as _exc:  # pragma: no cover - replaced in Task 5
+    if _exc.name != "memory.chunking":
+        raise
+
     def chunk_segments(segments: list[dict]) -> list[dict]:
         """Stub: one chunk per segment, same output shape as the real chunker."""
         return [
@@ -318,10 +321,11 @@ def _upsert_video(conn, run: RunRecord, now: str) -> None:
 
 
 def _rebuild_chunks(conn, video_key: str) -> None:
-    old = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE video_key = ?", (video_key,))]
-    conn.execute("DELETE FROM embeddings WHERE src_table = 'chunks' AND video_key = ?", (video_key,))
-    if old:
-        conn.executemany("DELETE FROM embeddings WHERE src_table = 'chunks' AND src_id = ?", [(i,) for i in old])
+    conn.execute(
+        "DELETE FROM embeddings WHERE src_table = 'chunks' AND src_id IN "
+        "(SELECT id FROM chunks WHERE video_key = ?)",
+        (video_key,),
+    )
     conn.execute("DELETE FROM chunks WHERE video_key = ?", (video_key,))
     segs = [
         {"start": r["start"], "end": r["end"], "speaker": r["speaker"], "text": r["text"]}
@@ -339,33 +343,42 @@ def _rebuild_chunks(conn, video_key: str) -> None:
 
 def _merge_transcript(conn, run: RunRecord, run_id: int, current_rank: int) -> tuple[bool, int, int]:
     """Returns (replaced, inserted, deleted)."""
-    if not run.segments:
-        return False, 0, 0
+    incoming = [s for s in run.segments if (s.get("text") or "").strip()]
+    if run.range is not None:
+        # Clip with the SAME predicate as the delete below: callers pass
+        # transcribe.filter_range output, which keeps segments that merely
+        # overlap the range; inserting those would duplicate them every run.
+        a, b = run.range
+        incoming = [s for s in incoming if a <= s["start"] < b]
+    if not incoming:
+        return False, 0, 0  # nothing usable: never wipe or re-rank
     new_rank = transcript_rank(run.transcript_source)
     if new_rank < current_rank:
         return False, 0, 0
     key = run.video_key
+    had_transcript = conn.execute(
+        "SELECT 1 FROM segments WHERE video_key = ? LIMIT 1", (key,)
+    ).fetchone() is not None
     if run.range is None:
         doomed = [r[0] for r in conn.execute("SELECT id FROM segments WHERE video_key = ?", (key,))]
     else:
-        a, b = run.range
         doomed = [r[0] for r in conn.execute(
             "SELECT id FROM segments WHERE video_key = ? AND start >= ? AND start < ?", (key, a, b))]
     if doomed:
         conn.executemany("DELETE FROM fts WHERE src_table = 'segments' AND src_id = ?", [(i,) for i in doomed])
         conn.executemany("DELETE FROM segments WHERE id = ?", [(i,) for i in doomed])
     inserted = 0
-    for s in run.segments:
-        text = (s.get("text") or "").strip()
-        if not text:
-            continue
+    for s in incoming:
+        text = s["text"].strip()
         cur = conn.execute(
             'INSERT INTO segments (video_key, run_id, start, "end", speaker, text, source) VALUES (?, ?, ?, ?, ?, ?, ?)',
             (key, run_id, s["start"], s.get("end"), s.get("speaker"), text, run.transcript_source),
         )
         _fts_add(conn, "transcript", key, "segments", cur.lastrowid, s["start"], text)
         inserted += 1
-    if run.range is None:
+    # Rank follows full runs only; a range run on a video with no transcript
+    # yet sets it too, so a later lower-rank full run cannot wipe it.
+    if run.range is None or not had_transcript:
         conn.execute(
             "UPDATE videos SET transcript_rank = ?, transcript_source = ? WHERE video_key = ?",
             (new_rank, run.transcript_source, key),
@@ -387,14 +400,15 @@ def _is_duplicate_frame(conn, video_key: str, t: float, phash: bytes | None) -> 
     return False
 
 
-def _merge_frames(conn, run: RunRecord, run_id: int) -> tuple[int, int, list[tuple[int, str]]]:
+def _merge_frames(
+    conn, run: RunRecord, run_id: int, phashes: list[bytes | None]
+) -> tuple[int, int, list[tuple[int, str]]]:
     immich_frames = ((run.library or {}).get("immich") or {}).get("frames") or {}
     n_frames = n_ocr = 0
     new_frames: list[tuple[int, str]] = []
-    for f in run.frames:
+    for f, phash in zip(run.frames, phashes):
         t = float(f["t"])
         path = f.get("path")
-        phash = f.get("phash") or _frames.thumb_fingerprint(path)
         if _is_duplicate_frame(conn, run.video_key, t, phash):
             continue  # skipped together with its OCR
         asset = f.get("immich_asset_id") or immich_frames.get(str(round(t * 1000)))
@@ -436,6 +450,8 @@ def _merge_notes(conn, run: RunRecord, run_id: int) -> int:
 def record_run(conn: sqlite3.Connection, run: RunRecord) -> RunResult:
     """Merge one run into the video's evidence set (single transaction)."""
     key = run.video_key
+    # ffmpeg fingerprints are computed before taking the write lock.
+    phashes = [f.get("phash") or _frames.thumb_fingerprint(f.get("path")) for f in run.frames]
     with _tx(conn):
         if run.origin_ref is not None:
             dup = conn.execute(
@@ -456,7 +472,7 @@ def record_run(conn: sqlite3.Connection, run: RunRecord) -> RunResult:
         ).fetchone()[0]
 
         replaced, n_seg, n_seg_deleted = _merge_transcript(conn, run, run_id, current_rank)
-        n_frames, n_ocr, new_frames = _merge_frames(conn, run, run_id)
+        n_frames, n_ocr, new_frames = _merge_frames(conn, run, run_id, phashes)
         n_notes = _merge_notes(conn, run, run_id)
 
         added = {"segments": n_seg, "frames": n_frames, "ocr": n_ocr, "notes": n_notes}

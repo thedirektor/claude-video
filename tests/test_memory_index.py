@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 import frames
+from memory import index
 from memory.index import (
     connect, forget, frame_kind, record_run, set_library_ref, touch, transcript_rank,
 )
@@ -101,7 +102,7 @@ def test_notes_append_and_fts_kinds(conn):
     record_run(conn, fake_run(notes=[{"kind": "backend_answer", "t_start": None, "t_end": None, "text": "respuesta uno"}]))
     r = record_run(conn, fake_run(notes=[{"kind": "backend_answer", "t_start": 3.0, "t_end": 4.0, "text": "respuesta dos"}],
                                   segments=[seg(1, 2, "hola")], transcript_source="captions"))
-    assert texts(conn, "notes") == ["respuesta uno", "respuesta dos"] or texts(conn, "notes") == ["respuesta dos", "respuesta uno"]
+    assert [r[0] for r in conn.execute("SELECT text FROM notes ORDER BY id")] == ["respuesta uno", "respuesta dos"]
     kinds = sorted(r[0] for r in conn.execute("SELECT kind FROM fts"))
     assert kinds == ["note", "note", "transcript"] and r.evidence_version == 2
     assert stored_times(conn) == {1.0, 3.0}
@@ -145,3 +146,44 @@ def test_thumb_fingerprint(tmp_path):
     assert frames.thumb_fingerprint(tmp_path / "missing.jpg") is None
     fp = frames.thumb_fingerprint(jpg(tmp_path, "white"))
     assert isinstance(fp, bytes) and len(fp) == frames.DEDUP_THUMB ** 2
+
+
+def test_range_run_via_filter_range_never_duplicates(conn):          # Review Focus 2
+    from transcribe import filter_range
+    full = [seg(0, 5, "alfa"), seg(8, 12, "straddle"), seg(12, 20, "inside"), seg(20, 25, "edge")]
+    record_run(conn, fake_run(transcript_source="captions", segments=full))
+    n_chunks = len(chunk_texts(conn))
+    for _ in range(3):
+        record_run(conn, fake_run(transcript_source="captions", range=(10.0, 20.0),
+                                  segments=filter_range(full, 10.0, 20.0)))
+    assert texts(conn, "segments") == ["alfa", "straddle", "inside", "edge"]
+    for word in ("alfa", "straddle", "inside", "edge"):
+        assert len(fts_match(conn, word)) == 1
+    assert conn.execute("SELECT count(*) FROM fts").fetchone()[0] == 4
+    assert len(chunk_texts(conn)) == n_chunks
+
+
+def test_empty_text_transcript_never_wipes(conn):
+    record_run(conn, fake_run(transcript_source="captions", segments=[seg(0, 5, "bueno")]))
+    r = record_run(conn, fake_run(transcript_source="whisper (groq)", segments=[seg(0, 5, "  ")]))
+    assert not r.transcript_replaced and texts(conn, "segments") == ["bueno"]
+    assert rank(conn) == transcript_rank("captions") and r.evidence_version == 1
+
+
+def test_range_run_on_empty_transcript_sets_rank(conn):
+    record_run(conn, fake_run(transcript_source="whisper (groq)", range=(0.0, 30.0), segments=[seg(5, 9, "rango")]))
+    assert rank(conn) == transcript_rank("whisper (groq)")
+    record_run(conn, fake_run(transcript_source="captions", segments=[seg(0, 60, "peor")]))
+    assert texts(conn, "segments") == ["rango"]
+
+
+def test_record_run_rolls_back_on_error(conn, monkeypatch):
+    def boom(_segments):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(index, "chunk_segments", boom)
+    with pytest.raises(RuntimeError):
+        record_run(conn, fake_run(transcript_source="captions", segments=[seg(0, 1, "x")],
+                                  notes=[{"kind": "n", "t_start": 0, "t_end": 1, "text": "nn"}]))
+    assert not conn.in_transaction
+    for table in ("videos", "runs", "segments", "notes", "chunks", "fts"):
+        assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
