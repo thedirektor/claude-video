@@ -29,7 +29,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from config import get_config  # noqa: E402
+from config import get_config, config_file_path  # noqa: E402
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -38,8 +38,8 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
-CONFIG_DIR = Path.home() / ".config" / "watch"
-CONFIG_FILE = CONFIG_DIR / ".env"
+CONFIG_FILE = config_file_path()
+CONFIG_DIR = CONFIG_FILE.parent
 ENV_TEMPLATE = """# /watch API configuration
 #
 # Whisper transcription fallback — used only when yt-dlp cannot get captions

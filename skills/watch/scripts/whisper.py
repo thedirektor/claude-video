@@ -24,6 +24,11 @@ import time
 import urllib.error
 import uuid
 from pathlib import Path
+import sys as _sys
+
+if str(Path(__file__).resolve().parent) not in _sys.path:
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import config_file_path  # noqa: E402
 from urllib.request import Request, urlopen
 
 for _stream in (sys.stdout, sys.stderr):
@@ -135,7 +140,7 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
         return None
 
     dotenv_paths = [
-        Path.home() / ".config" / "watch" / ".env",
+        config_file_path(),
         Path.cwd() / ".env",
     ]
 

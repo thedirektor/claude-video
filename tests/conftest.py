@@ -35,13 +35,14 @@ _SESSION_MEM = tempfile.mkdtemp(prefix="watch-test-mem-")
 os.environ["WATCH_INDEX_DB"] = str(Path(_SESSION_MEM) / "index.db")
 os.environ["WATCH_STORE_DIR"] = str(Path(_SESSION_MEM) / "store")
 os.environ["WATCH_EMBEDDINGS"] = "0"
+os.environ["WATCH_CONFIG_FILE"] = str(Path(_SESSION_MEM) / "no-such-config" / ".env")
 os.environ.pop("WATCH_QDRANT_INBOX", None)
 os.environ.pop("WATCH_MODEL_DIR", None)
 
 import config as _config  # noqa: E402
 
 # Otherwise popped vars fall through to the host's ~/.config/watch/.env.
-_config.CONFIG_FILE = Path(_SESSION_MEM) / "no-such-config" / ".env"
+_config.CONFIG_FILE = Path(os.environ["WATCH_CONFIG_FILE"])
 
 
 @pytest.fixture(autouse=True)

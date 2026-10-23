@@ -17,6 +17,11 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+import sys as _sys
+
+if str(Path(__file__).resolve().parent) not in _sys.path:
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import config_file_path  # noqa: E402
 
 
 # Force UTF-8 on stdout/stderr (consistent with the rest of the scripts).
@@ -46,7 +51,7 @@ def load_api_key() -> str | None:
         return value.strip()
 
     candidates = [
-        Path.home() / ".config" / "watch" / ".env",
+        config_file_path(),
         Path.cwd() / ".env",
     ]
     for candidate in candidates:

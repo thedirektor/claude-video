@@ -13,6 +13,7 @@ SETUP = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scripts" 
 def _run(args, *, home=None, extra_env=None):
     env = dict(os.environ)
     env.pop("WATCH_DETAIL", None)
+    env.pop("WATCH_CONFIG_FILE", None)  # these tests exercise HOME-relative config
     # Don't let a real key in the developer's shell env leak into the test.
     env.pop("GROQ_API_KEY", None)
     env.pop("OPENAI_API_KEY", None)

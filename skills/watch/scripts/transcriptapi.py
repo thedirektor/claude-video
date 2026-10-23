@@ -16,6 +16,11 @@ import time
 import urllib.error
 import urllib.parse
 from pathlib import Path
+import sys as _sys
+
+if str(Path(__file__).resolve().parent) not in _sys.path:
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import config_file_path  # noqa: E402
 from urllib.request import Request, urlopen
 
 for _stream in (sys.stdout, sys.stderr):
@@ -74,7 +79,7 @@ def load_api_key() -> str | None:
     value = _from_env()
     if value:
         return value
-    for candidate in (Path.home() / ".config" / "watch" / ".env", Path.cwd() / ".env"):
+    for candidate in (config_file_path(), Path.cwd() / ".env"):
         value = _from_dotenv(candidate)
         if value:
             return value

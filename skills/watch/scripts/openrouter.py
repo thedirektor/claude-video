@@ -25,6 +25,11 @@ import time
 import urllib.error
 import uuid
 from pathlib import Path
+import sys as _sys
+
+if str(Path(__file__).resolve().parent) not in _sys.path:
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import config_file_path  # noqa: E402
 from urllib.request import Request, urlopen
 
 
@@ -59,7 +64,7 @@ def load_api_key() -> str | None:
     if value and value.strip():
         return value.strip()
     for candidate in [
-        Path.home() / ".config" / "watch" / ".env",
+        config_file_path(),
         Path.cwd() / ".env",
     ]:
         if not candidate.exists():
@@ -104,7 +109,7 @@ def _load_groq_key() -> str | None:
     if value and value.strip():
         return value.strip()
     for candidate in [
-        Path.home() / ".config" / "watch" / ".env",
+        config_file_path(),
         Path.cwd() / ".env",
     ]:
         if not candidate.exists():

@@ -7,7 +7,17 @@ from pathlib import Path
 
 
 CONFIG_DIR = Path.home() / ".config" / "watch"
-CONFIG_FILE = CONFIG_DIR / ".env"
+CONFIG_FILE = (
+    Path(os.environ["WATCH_CONFIG_FILE"]).expanduser()
+    if os.environ.get("WATCH_CONFIG_FILE")
+    else CONFIG_DIR / ".env"
+)
+
+
+def config_file_path() -> Path:
+    """The one user config file every loader reads (``WATCH_CONFIG_FILE`` overrides)."""
+    override = os.environ.get("WATCH_CONFIG_FILE")
+    return Path(override).expanduser() if override else CONFIG_FILE
 
 DEFAULT_DETAIL = "balanced"
 

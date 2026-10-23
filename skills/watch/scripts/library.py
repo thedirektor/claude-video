@@ -36,6 +36,11 @@ import urllib.error
 import urllib.parse
 import uuid
 from pathlib import Path
+import sys as _sys
+
+if str(Path(__file__).resolve().parent) not in _sys.path:
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import config_file_path  # noqa: E402
 from urllib.request import Request, urlopen
 
 for _stream in (sys.stdout, sys.stderr):
@@ -105,7 +110,7 @@ def _load_key(name: str) -> str | None:
     value = os.environ.get(name)
     if value and value.strip():
         return value.strip()
-    for candidate in (Path.home() / ".config" / "watch" / ".env", Path.cwd() / ".env"):
+    for candidate in (config_file_path(), Path.cwd() / ".env"):
         value = _from_dotenv(candidate, name)
         if value:
             return value
