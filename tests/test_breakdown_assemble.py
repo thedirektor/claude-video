@@ -115,8 +115,9 @@ def test_interpretation_isolated(conn, stored):
     assert len(calls) == 1
     assert out["interpretation"]["text"] == "Punchy red-green-blue sequence."
     assert out["interpretation"]["evidence"]["method"] == "interpretation"
-    assert out["interpretation"]["frame_times"]
-    texts = [p for p, n in _walk({k: v for k, v in out.items() if k != "interpretation"})]
+    assert out["interpretation"]["made_from"] == "measured fields (no frames)"
+    assert "frame_times" not in out["interpretation"]
+    assert "made from: measured fields (no frames)" in assemble.brief_md(out)
     assert "Punchy" not in json.dumps({k: v for k, v in out.items() if k != "interpretation"})
     assert [i["item"] for i in spend.items()] == ["breakdown_interpretation"]
     free = assemble.build(conn, KEY, store_dir=stored)
@@ -160,11 +161,10 @@ def test_reconcile_fadewhite_dip(tmp_path):
     shots, loose = assemble.reconcile(raw, entries)
     assert all(s["duration"] > 0.3 for s in shots), [s["duration"] for s in shots]
     assert all(s["transition"] for s in shots[1:])
-    assert len(shots) < len(raw)          # phantom shots inside the fade were merged away
-    times = {round(e["t"], 6) for e in entries}
-    assert all(round(s["transition"]["t"], 6) in times for s in shots[1:])
-    assert shots[0]["start"] == 0 and abs(shots[-1]["end"] - 5.5) < 1e-6
-    assert all(abs(a["end"] - b["start"]) < 1e-6 for a, b in zip(shots, shots[1:]))
+    assert len(shots) == 2 and shots[1]["transition"]["kind"] == "dip_white"
+    assert loose == []
+    assert shots[0]["end"] == shots[1]["start"] and abs(shots[-1]["end"] - 5.5) < 1e-6
+    assert 2.6 <= shots[1]["start"] <= 3.0
 
 
 def _sh(i, a, b, kind=None):
@@ -201,3 +201,57 @@ def test_frames_only(conn, tmp_path, monkeypatch):
 def test_cli_formats_validated(conn, stored, monkeypatch, capsys):
     assert cli.main(["breakdown", KEY, "--formats", "nope"]) == 2
     assert cli.main(["motion", "x"]) == 2
+
+
+def test_music_windows_half_music_half_silence(conn, tmp_path):
+    p = tmp_path / "half.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "color=c=gray:s=320x180:r=25:d=12", "-f", "lavfi", "-i",
+                    "aevalsrc=0.8*sin(2*PI*1000*t)*lt(mod(t\\,0.5)\\,0.02)*lt(t\\,6):s=44100:d=12",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(p)], check=True)
+    index.record_run(conn, fake_run(title="Half", duration=12.0, segments=[seg(0, 3, "talking")]))
+    root = tmp_path / "st"
+    vdir = store.video_dir(root, KEY)
+    vdir.mkdir(parents=True)
+    shutil.copy(p, vdir / "media.mp4")
+    out = assemble.build(conn, KEY, store_dir=root)
+    mu = out["audio"]["segments"]["music"]
+    states = [(x["state"], x["t_start"], x["t_end"]) for x in mu["segments"]]
+    assert [x[0] for x in states] == ["music", "silent"], states
+    assert mu["present"] is True and mu["segments"][0]["overlaps_speech_s"] == pytest.approx(3.0)
+    assert mu["segments"][1]["evidence"]["method"] == "measured"
+
+
+def test_brief_low_confidence_and_units(bd):
+    bd = json.loads(json.dumps(bd))
+    bd["audio"]["evidence"]["confidence"] = 0.23
+    bd["audio"]["tempo_alt"] = 60.0
+    bd["shots"][0]["camera"]["evidence"]["confidence"] = 0.1
+    bd["shots"][0]["look"]["letterbox"] = {"top": 0.1, "bottom": 0.1, "left": 0.0, "right": 0.0}
+    md = assemble.brief_md(bd)
+    assert "(low confidence 0.23)" in md and "(low confidence 0.10)" in md
+    assert "alternative reading 60.0 BPM" in md
+    assert "letterbox top 10.0% bottom 10.0% left 0.0% right 0.0%" in md
+    assert "0-1 fractions of the frame" in md and "are 0-1" in md
+    assert "{'top'" not in md
+
+
+def test_interpret_cost_uses_payload_and_provider_price(conn, stored, monkeypatch):
+    monkeypatch.setenv("WATCH_COST_CEILING_USD", "0.0000001")
+    import cost
+    with pytest.raises(cost.CostCeilingExceeded):
+        assemble.build(conn, KEY, store_dir=stored, interpret=True,
+                       complete=lambda *a, **k: llm.LLMReply("x", "fake", "m", 1, 1))
+    ok = assemble.build(conn, KEY, store_dir=stored, interpret=True, allow_cost=True,
+                        complete=lambda *a, **k: llm.LLMReply("x", "fake", "m", 1, 1))
+    assert ok["interpretation"]["text"] == "x"
+
+
+def test_cli_success_path(conn, stored, monkeypatch, capsys):
+    monkeypatch.setenv("WATCH_STORE_DIR", str(stored))
+    rc = cli.main(["breakdown", KEY, "--json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["schema"] == "watch.breakdown/1"
+    out = store.video_dir(stored, KEY) / "breakdown"
+    assert (out / "breakdown.json").is_file() and (out / "breakdown.md").is_file()

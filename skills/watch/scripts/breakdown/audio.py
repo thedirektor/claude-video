@@ -436,3 +436,47 @@ def cuts_on_beat(shots: list[dict], beats: list[float], fps: float):
     n = len(cuts)
     return {"share": round(hits / n, 3), "tolerance_frames": TOLERANCE_FRAMES,
             "evidence": _ev(min(cuts), max(cuts), 0.9 * min(1.0, n / 4), n_cuts=n, n_on_beat=hits)}
+
+
+MUSIC_WINDOW_S = 6.0
+SILENT_PEAK = 1e-3
+
+
+def music_windows(path: str, duration: float = 0.0, window: float = MUSIC_WINDOW_S):
+    """Per-window music presence from onset periodicity, or None when unavailable.
+
+    ``[{"t_start", "t_end", "state", "strength"}]`` with ``state`` ``"music"`` (a steady
+    pulse, strength >= MIN_STRENGTH), ``"silent"`` (no signal) or ``"not determined"``
+    (signal without a steady pulse: speech, ambience or non-rhythmic music). A trailing
+    window shorter than MIN_SECONDS is folded into the previous one."""
+    try:
+        np = _np()
+        x, _note = _decode(path)
+        if x is None:
+            return None
+        dur = float(duration) if duration else len(x) / SR
+        got = _onset_envelope(x, np)
+        if got is None:
+            return None
+        env, t0, hop_s = got
+        edges = [0.0]
+        while edges[-1] + window < dur - MIN_SECONDS + 1e-9:
+            edges.append(edges[-1] + window)
+        edges.append(dur)
+        out = []
+        for a, b in zip(edges, edges[1:]):
+            seg = x[int(a * SR):int(b * SR)]
+            if len(seg) == 0:
+                continue
+            if float(np.max(np.abs(seg))) < SILENT_PEAK:
+                out.append({"t_start": round(a, 3), "t_end": round(b, 3), "state": "silent", "strength": 0.0})
+                continue
+            e = env[max(0, int((a - t0) / hop_s)):max(0, int((b - t0) / hop_s))]
+            tempo = _comb_tempo(e, hop_s, np) if len(e) > 8 else None
+            strength = 0.0 if tempo is None else float(tempo[1])
+            out.append({"t_start": round(a, 3), "t_end": round(b, 3),
+                        "state": "music" if strength >= MIN_STRENGTH else NOT_DETERMINED,
+                        "strength": round(strength, 3)})
+        return out or None
+    except Exception:  # noqa: BLE001 - never raise out of an analysis
+        return None

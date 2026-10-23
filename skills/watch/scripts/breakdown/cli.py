@@ -19,7 +19,6 @@ from . import assemble
 
 EXIT_NOT_FOUND = 3
 EXIT_AMBIGUOUS = 4
-INTERPRET_EST_TOKENS = (3000, 400)
 
 
 def _parse_formats(value: str | None) -> list[str]:
@@ -33,19 +32,6 @@ def _parse_formats(value: str | None) -> list[str]:
         if f not in out:
             out.append(f)
     return out
-
-
-def _interpret_gate(allow: bool) -> None:
-    """The one optional paid call is checked against the cost ceiling first."""
-    ceiling = cost.ceiling()
-    if allow or ceiling <= 0:
-        return
-    p = cost.FALLBACK_TOKEN_PRICE
-    est = (INTERPRET_EST_TOKENS[0] * p["in"] + INTERPRET_EST_TOKENS[1] * p["out"]) / 1e6
-    if est > ceiling:
-        raise cost.CostCeilingExceeded(
-            f"estimated interpretation cost ${est:.4f} exceeds WATCH_COST_CEILING_USD ${ceiling:.2f} - "
-            "re-run with --allow-cost (or raise the ceiling).")
 
 
 def _cmd_breakdown(argv: list[str]) -> int:
@@ -72,13 +58,11 @@ def _cmd_breakdown(argv: list[str]) -> int:
         except retrieval.AmbiguousVideo as exc:
             print(f"[watch] {exc}", file=sys.stderr)
             return EXIT_AMBIGUOUS
-        if a.interpret:
-            try:
-                _interpret_gate(a.allow_cost)
-            except cost.CostCeilingExceeded as exc:
-                print(f"[watch] {exc}", file=sys.stderr)
-                return 2
-        bd = assemble.build(conn, key, interpret=a.interpret)
+        try:
+            bd = assemble.build(conn, key, interpret=a.interpret, allow_cost=a.allow_cost)
+        except cost.CostCeilingExceeded as exc:
+            print(f"[watch] {exc}", file=sys.stderr)
+            return 2
         out_dir = assemble.store(conn, key, bd)
         if formats:
             written = assemble.write_timelines(bd, out_dir, formats)
