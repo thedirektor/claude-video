@@ -41,11 +41,19 @@ def _default_get_json(cfg: dict):
     return lambda path: library._paperless_get(base, token, path)
 
 
-def _default_find_album(cfg: dict):
+def _album_index(cfg: dict) -> dict:
+    """Immich albums by name, fetched once per backfill."""
     base, key = (cfg.get("IMMICH_BASE_URL") or "").rstrip("/"), cfg.get("IMMICH_API_KEY")
     if not base or not key:
-        return lambda name: None
-    return lambda name: library._find_album(base, key, name)
+        return {}
+    try:
+        req = library.Request(f"{base}/api/albums", headers=library._immich_headers(key), method="GET")
+        with library.urlopen(req, timeout=30, context=library._ssl_context()) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace") or "[]")
+        return {a["albumName"]: a["id"] for a in data if isinstance(a, dict) and a.get("albumName") and a.get("id")}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[watch] backfill: Immich album list failed ({type(exc).__name__}); albums not linked", file=sys.stderr)
+        return {}
 
 
 def _record_for(doc: dict, parsed: dict) -> index.RunRecord:
@@ -60,7 +68,7 @@ def _record_for(doc: dict, parsed: dict) -> index.RunRecord:
         video_key=key, source=source, origin="backfill", backend="claude", detail="backfill",
         title=parsed["title"] or doc.get("title"),
         url=canon if canon.lower().startswith(("http://", "https://")) else None,
-        duration=parsed["duration"], transcript_source=parsed["transcript_source"],
+        duration=parsed["duration"], range=parsed.get("range"), transcript_source=parsed["transcript_source"],
         segments=parsed["segments"], frames=frames, origin_ref=f"paperless:{doc['id']}",
     )
 
@@ -69,7 +77,10 @@ def backfill_paperless(conn, cfg: dict, get_json=None, find_album=None) -> dict:
     """Index every Paperless ``watch``-tagged report. Idempotent via UNIQUE(origin, origin_ref)."""
     cfg = cfg or {}
     get_json = get_json or _default_get_json(cfg)
-    find_album = find_album or _default_find_album(cfg)
+    albums = None
+    if find_album is None:
+        albums = _album_index(cfg)
+        find_album = lambda name: albums.get(name)  # noqa: E731
     base = (cfg.get("PAPERLESS_URL") or library.DEFAULT_PAPERLESS_URL).rstrip("/")
     inbox = setting("WATCH_QDRANT_INBOX")
     stats = {"seen": 0, "added": 0, "skipped": 0}
@@ -78,6 +89,7 @@ def backfill_paperless(conn, cfg: dict, get_json=None, find_album=None) -> dict:
         page = get_json(path) or {}
         for doc in page.get("results") or []:
             stats["seen"] += 1
+            counted = False
             try:
                 parsed = parse_report(doc.get("content") or "")
                 if not parsed["source"] or doc.get("id") is None:
@@ -88,18 +100,19 @@ def backfill_paperless(conn, cfg: dict, get_json=None, find_album=None) -> dict:
                 if result.skipped:
                     stats["skipped"] += 1
                     continue
-                stats["added"] += 1
-                refs: dict = {"paperless_doc_id": doc["id"]}
+                stats["added"] += 1  # counted once, whatever fails below
+                counted = True
+                index.set_library_ref(conn, run.video_key, paperless_doc_id=doc["id"])
                 album = find_album(doc.get("title") or run.title or "")
                 if album:
-                    refs["immich_album_id"] = album
-                index.set_library_ref(conn, run.video_key, **refs)
+                    index.set_library_ref(conn, run.video_key, immich_album_id=album)
                 if inbox:
                     created = str(doc.get("created") or "")[:10] or date.today().isoformat()
                     store.write_qdrant_inbox(Path(inbox).expanduser(), run.video_key, run.title, run.url,
                                              created, doc.get("content") or "")
             except Exception as exc:  # noqa: BLE001 - one bad doc must not stop the backfill
-                stats["skipped"] += 1
+                if not counted:
+                    stats["skipped"] += 1
                 print(f"[watch] backfill: doc {doc.get('id')} failed ({type(exc).__name__}: {exc})", file=sys.stderr)
         nxt = page.get("next")
         path = _as_path(nxt, base) if nxt else None
@@ -114,7 +127,13 @@ def _load(vdir: Path, name: str, default):
 
 
 def rebuild(conn, store_dir: Path, video_key: str) -> index.RunResult:
-    """Drop a video's index rows and re-create them from its store directory."""
+    """Drop a video's index rows and re-create them from its store directory.
+
+    Forget + re-insert run in one transaction, so a failure keeps the old rows.
+    Not restored (not kept in the store files): per-frame ``immich_asset_id``,
+    ``phash`` (recomputed from the frame file when present) and frame ``kind``
+    (all rebuilt frames are "scene"); evicted frames without OCR are lost.
+    """
     root = Path(store_dir)
     vdir = store.video_dir(root, video_key)
     if not vdir.is_dir():
@@ -144,7 +163,6 @@ def rebuild(conn, store_dir: Path, video_key: str) -> index.RunResult:
 
     version = meta.get("evidence_version", 0)
     tsource = next((s.get("source") for s in segments if s.get("source")), None)
-    index.forget(conn, video_key)
     run = index.RunRecord(
         video_key=video_key, source=meta.get("url") or "", origin="backfill", backend=meta.get("backend") or "claude",
         detail=meta.get("detail") or "backfill", title=meta.get("title"), url=meta.get("url"),
@@ -157,15 +175,16 @@ def rebuild(conn, store_dir: Path, video_key: str) -> index.RunResult:
         # origin_ref carries the key: UNIQUE(origin, origin_ref) is global across videos
         origin_ref=f"rebuild:{video_key}:{version}",
     )
-    result = index.record_run(conn, run)
     with index._tx(conn):
+        index.forget(conn, video_key)
+        result = index.record_run(conn, run)
         for frame_id, src in result.new_frames:
             conn.execute("UPDATE frames SET store_path = ? WHERE id = ?",
                          (Path(src).relative_to(root).as_posix(), frame_id))
         conn.execute("UPDATE videos SET store_path = ? WHERE video_key = ?",
                      (vdir.relative_to(root).as_posix(), video_key))
-    lib = {k: v for k, v in (meta.get("library") or {}).items()
-           if v is not None and k in index._LIBRARY_COLS}
-    if lib:
-        index.set_library_ref(conn, video_key, **lib)
+        lib = {k: v for k, v in (meta.get("library") or {}).items()
+               if v is not None and k in index._LIBRARY_COLS}
+        if lib:
+            index.set_library_ref(conn, video_key, **lib)
     return result

@@ -8,6 +8,7 @@ from memory.index import record_run
 from memory.reportparse import parse_report
 from memory_fakes import KEY, fake_run, fr, frame_times, jpg, seg, texts
 from memory import store
+import pytest
 
 
 def test_parse_report_immich_and_ocr_tail():
@@ -34,8 +35,9 @@ def test_parse_report_plain_lines():
     assert [s["start"] for s in p["segments"]] == [4503.0, 4510.0, 4560.0]
     assert [s["end"] for s in p["segments"]] == [4510.0, 4560.0, 4565.0]
     assert p["transcript_source"] == "captions"
+    assert p["range"] == (0.0, 120.0)
     assert parse_report("") == {"source": None, "title": None, "transcript_source": None,
-                                "duration": None, "segments": [], "frames": []}
+                                "duration": None, "segments": [], "frames": [], "range": None}
 
 
 def _doc(i, vid):
@@ -101,3 +103,49 @@ def test_rebuild_restores_rows(conn, tmp_path):
     store.write_run(conn, root, run2, record_run(conn, run2))
     index.forget(conn, run2.video_key)
     assert not backfill.rebuild(conn, root, run2.video_key).skipped
+
+
+def test_parse_source_with_spaces():
+    p = parse_report("- **Source:** /home/u/My Videos/a b.mp4\n- **Title:** t\n")
+    assert p["source"] == "/home/u/My Videos/a b.mp4"
+
+
+def test_backfill_filtered_report_keeps_other_segments(conn):
+    record_run(conn, fake_run(transcript_source="captions", segments=[
+        seg(0, 5, "inicio"), seg(12, 18, "viejo"), seg(40, 45, "final")]))
+    doc = {"id": 9, "title": "t", "content": (
+        "- **Source:** https://www.youtube.com/watch?v=AAAAAAAAAAA\n\n## Transcript\n\n"
+        "_Source: captions. Filtered to 00:10 \u2192 00:20:_\n\n```\n[00:12] nuevo\n```\n")}
+    r = backfill.backfill_paperless(conn, {}, get_json=lambda p: {"results": [doc]}, find_album=lambda n: None)
+    assert r["added"] == 1
+    assert texts(conn, "segments") == ["inicio", "nuevo", "final"]
+    assert conn.execute("SELECT paperless_doc_id FROM videos").fetchone()[0] == 9
+
+
+def test_rebuild_failure_keeps_rows(conn, tmp_path, monkeypatch):
+    root = tmp_path / "store"
+    run = fake_run(segments=[seg(0, 5, "hola")], transcript_source="captions")
+    store.write_run(conn, root, run, record_run(conn, run))
+    monkeypatch.setattr(index, "record_run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError):
+        backfill.rebuild(conn, root, KEY)
+    assert texts(conn, "segments") == ["hola"]
+
+
+def test_rebuild_with_evicted_frame(conn, tmp_path):
+    root = tmp_path / "store"
+    run = fake_run(segments=[seg(0, 5, "hola")], frames=[fr(3, jpg(tmp_path, "red"), "ERROR 404")],
+                   transcript_source="captions")
+    store.write_run(conn, root, run, record_run(conn, run))
+    for f in (root / index_dir(KEY) / "frames").glob("*.jpg"):
+        f.unlink()
+    conn.execute("UPDATE frames SET store_path = NULL")
+    conn.commit()
+    backfill.rebuild(conn, root, KEY)
+    assert frame_times(conn) == [3.0] and texts(conn, "ocr_blocks") == ["ERROR 404"]
+    assert conn.execute("SELECT store_path FROM frames").fetchone()[0] is None
+
+
+def index_dir(key):
+    import identity
+    return identity.store_dirname(key)

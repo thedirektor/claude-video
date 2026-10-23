@@ -111,6 +111,16 @@ def _cmd_list(conn, a) -> int:
 
 
 def _cmd_index(conn, a) -> int:
+    try:
+        return _index_actions(conn, a)
+    except (retrieval.VideoNotFound, retrieval.AmbiguousVideo):
+        raise
+    except Exception as exc:  # noqa: BLE001 - HTTP/config errors: one line, no traceback
+        print(f"watch: index failed ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return 2
+
+
+def _index_actions(conn, a) -> int:
     paths = memory_paths()
     res: dict = {}
     if a.backfill_paperless:
@@ -124,12 +134,19 @@ def _cmd_index(conn, a) -> int:
         r = backfill.rebuild(conn, paths["store_dir"], a.rebuild)
         res["rebuild"] = {"video_key": r.video_key, "evidence_version": r.evidence_version, "added": r.added}
     if a.forget:
-        existed = index.forget(conn, a.forget)
-        vdir = paths["store_dir"] / identity.store_dirname(a.forget)
+        try:
+            key = retrieval.resolve_video(conn, a.forget)["video_key"]
+        except retrieval.VideoNotFound:
+            # nothing indexed: still honour an exact key whose store dir is orphaned
+            key = a.forget if (paths["store_dir"] / identity.store_dirname(a.forget)).is_dir() else None
+            if key is None:
+                raise
+        existed = index.forget(conn, key)
+        vdir = paths["store_dir"] / identity.store_dirname(key)
         had_dir = vdir.is_dir()
         if had_dir:
             shutil.rmtree(vdir, ignore_errors=True)
-        res["forget"] = {"video_key": a.forget, "rows": existed, "store_dir": had_dir}
+        res["forget"] = {"video_key": key, "rows": existed, "store_dir": had_dir}
     if a.embed_missing or a.backfill_paperless or a.rebuild:
         emb = embeddings.get_embedder(paths.get("model_dir"))
         n = 0

@@ -12,7 +12,7 @@ import re
 
 LAST_SEGMENT_SECONDS = 5.0
 
-_SOURCE = re.compile(r"\*\*Source:\*\*\s*(\S+)")
+_SOURCE = re.compile(r"\*\*Source:\*\*[ \t]*(.+?)[ \t]*$", re.M)
 _TITLE = re.compile(r"^\s*-\s*\*\*Title:\*\*\s*(.+?)\s*$", re.M)
 _DURATION = re.compile(r"\*\*Duration:\*\*[^\n]*?\(([\d.]+)s\)")
 _TSOURCE = re.compile(r"^_Source: (.*?)(?:\. Filtered to .*:_|\._)\s*$", re.M)
@@ -20,6 +20,7 @@ _FRAME = re.compile(r"^- `[^`]*` \(t=((?:\d+:)?\d+:\d{2})(?:,[^)]*)?\)(.*)$")
 _IMMICH = re.compile(r"— Immich: (\S+)")
 _PLAIN = re.compile(r"^\[(\d+):(\d{2})(?::(\d{2}))?\]\s*(.*)$")
 _DIARIZED = re.compile(r"^\[([^\]]+)\]\s*\((\d+):(\d{2})-(\d+):(\d{2})\)\s*(.*)$")
+_RANGE = re.compile(r"Filtered to (\d+(?::\d+){1,2}) \u2192 (\d+(?::\d+){1,2}):_")
 _OCR_SEP = " — OCR: "
 
 
@@ -104,11 +105,13 @@ def parse_report(markdown: str) -> dict:
     dur = _DURATION.search(text)
     transcript = _section(text, "Transcript")
     tsrc = _TSOURCE.search(transcript)
+    rng = _RANGE.search(transcript)
     return {
         "source": src.group(1) if src else None,
         "title": title.group(1) if title else None,
         "transcript_source": tsrc.group(1).strip() if tsrc else None,
         "duration": float(dur.group(1)) if dur else None,
+        "range": (_clock(rng.group(1)), _clock(rng.group(2))) if rng else None,
         "segments": _segments(_fenced(transcript)),
         "frames": _frames(_section(text, "Frames")),
     }

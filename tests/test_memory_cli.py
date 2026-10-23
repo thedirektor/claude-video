@@ -38,9 +38,11 @@ def test_cli_search_json(seeded, capsys):
 
 
 def test_cli_search_human_and_video_scope(two, capsys):
-    assert cli.main(["search", "demo", "--video", OTHER]) == 0
+    assert cli.main(["search", "otra", "--video", OTHER]) == 0
     out = capsys.readouterr().out
-    assert "Otro demo" not in out or OTHER in out
+    assert "Otro demo" in out and OTHER in out
+    assert cli.main(["search", "otra", "--video", KEY]) == 0
+    assert "No matches" in capsys.readouterr().out
 
 
 def test_cli_ask_prints_rule_and_ids(seeded, capsys):
@@ -111,12 +113,34 @@ def test_dispatch_to_memory_cli(monkeypatch):
 
 
 def test_dispatch_vs_file_named_search(tmp_path, monkeypatch):
+    import watch
+
     (tmp_path / "search").write_bytes(b"not a video")
     monkeypatch.chdir(tmp_path)
     spy = Spy(return_value=0)
     monkeypatch.setattr(cli, "main", spy)
-    try:
+    # the watch pipeline starts by resolving the source; capture what it was given
+    seen = Spy(raises=RuntimeError("stop here"))
+    monkeypatch.setattr(watch, "is_url", seen)
+    with pytest.raises(RuntimeError, match="stop here"):
         run_watch(["search"])
-    except (SystemExit, Exception):
-        pass  # the file is watched (and rejected as a non-video); what matters is no dispatch
-    assert spy.calls == []
+    assert spy.calls == [] and seen.calls and seen.calls[0][0][0] == "search"
+
+
+def test_index_error_is_one_line_exit_2(seeded, monkeypatch, capsys):
+    import library
+
+    monkeypatch.setattr(library, "load_config", lambda: {})
+    assert cli.main(["index", "--backfill-paperless"]) == 2
+    err = capsys.readouterr().err
+    assert "PAPERLESS_TOKEN" in err and "Traceback" not in err
+
+
+def test_forget_by_title_and_no_match(two, capsys):
+    assert cli.main(["index", "--forget", "otro demo"]) == 0
+    c = index.connect()
+    try:
+        assert [v["video_key"] for v in list_videos(c)] == [KEY]
+    finally:
+        c.close()
+    assert cli.main(["index", "--forget", "no-such-video"]) == 3
