@@ -40,6 +40,7 @@ from frames import (  # noqa: E402
 )
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 import transcriptapi  # noqa: E402
+import gemini  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
 from scenes import DEFAULT_THRESHOLD, detect_scenes  # noqa: E402
 from speech import DEFAULT_SPEECH_SHARE, compute_speech_windows, format_windows, two_pass_sample  # noqa: E402
@@ -385,6 +386,13 @@ def main() -> int:
         "(needs TRANSCRIPTAPI_API_KEY); this forces the yt-dlp caption / Whisper path.",
     )
     ap.add_argument(
+        "--no-gemini-transcript",
+        action="store_true",
+        help="Disable the Gemini YouTube-transcript fallback. By default, a YouTube URL "
+        "with no TranscriptAPI/caption transcript is transcribed by Gemini from the URL "
+        "(needs GEMINI_API_KEY); also disabled by WATCH_GEMINI_TRANSCRIPT=0.",
+    )
+    ap.add_argument(
         "--no-save",
         action="store_true",
         help="Do not push this run's artifacts to the library (Immich/Nextcloud). "
@@ -575,6 +583,22 @@ def main() -> int:
             except Exception as exc:
                 print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
                 transcript_segments = []
+        # Gemini URL transcript (YouTube only): last resort before the (often
+        # gated) download + Whisper. Gemini fetches the video itself from the URL,
+        # so it works from datacenter IPs. Best-effort (never raises); opt out with
+        # --no-gemini-transcript or WATCH_GEMINI_TRANSCRIPT=0. Skipped for --audio.
+        if (
+            not transcript_segments
+            and not args.no_gemini_transcript
+            and os.environ.get("WATCH_GEMINI_TRANSCRIPT", "").strip().lower() not in ("0", "false", "no")
+            and audio_override is None
+            and transcriptapi.is_youtube_url(args.source)
+        ):
+            gm_result = gemini.transcribe_youtube(args.source)
+            if gm_result is not None:
+                transcript_segments, _gm_model = gm_result
+                transcript_text = format_transcript(transcript_segments)
+                transcript_source = f"gemini ({_gm_model})"
 
     # Persist a pre-download transcript (TranscriptAPI / captions) now, so a later
     # gated video-download failure doesn't discard it and a resume reuses it without

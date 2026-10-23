@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.4.6"
+version: "0.4.7"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -179,6 +179,7 @@ Optional flags:
 - `--whisper-model NAME` — faster-whisper model size for the local backend. Choices: `tiny | base | small | medium | large-v2 | large-v3`. Default `large-v3`. Ignored for groq / openai / assemblyai. See the model table under "Local Whisper" below.
 - `--diarize` / `--no-diarize` — request speaker labels when the backend supports them (currently only AssemblyAI). Default ON; pass `--no-diarize` for sentence-level segments without speaker tags. Ignored for local / groq / openai.
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions). Cannot combine with `--audio`.
+- `--no-gemini-transcript` — disable the Gemini YouTube-URL transcript fallback (also `WATCH_GEMINI_TRANSCRIPT=0`).
 - `--no-transcriptapi` — disable the TranscriptAPI YouTube-transcript backend. By default, YouTube URLs fetch their transcript from [TranscriptAPI](https://transcriptapi.com) first (needs `TRANSCRIPTAPI_API_KEY`), which succeeds from server IPs where YouTube blocks yt-dlp; this flag forces the yt-dlp caption / Whisper path instead.
 
 **OCR**
@@ -296,7 +297,7 @@ Behavior:
 
 ## YouTube transcripts (TranscriptAPI)
 
-For **YouTube URLs**, `/watch` resolves the transcript in this order: **TranscriptAPI → yt-dlp captions → Whisper**. TranscriptAPI (`transcriptapi.com`) runs the extraction on its own servers, so it clears YouTube's "confirm you're not a bot" / PO-token / nsig walls that block yt-dlp from datacenter/VPS IPs — with **zero Whisper spend** and no video download for `--detail transcript`. Set `TRANSCRIPTAPI_API_KEY` in `~/.config/watch/.env` (1 credit per transcript; video metadata is free). Language preference follows `--sub-lang` (default Spanish→English→auto). Pass `--no-transcriptapi` to force the yt-dlp path. YouTube *frames* still require the (often gated) video download — TranscriptAPI covers the transcript only.
+For **YouTube URLs**, `/watch` resolves the transcript in this order: **TranscriptAPI → yt-dlp captions → Gemini (URL) → Whisper**. TranscriptAPI (`transcriptapi.com`) runs the extraction on its own servers, so it clears YouTube's "confirm you're not a bot" / PO-token / nsig walls that block yt-dlp from datacenter/VPS IPs — with **zero Whisper spend** and no video download for `--detail transcript`. Set `TRANSCRIPTAPI_API_KEY` in `~/.config/watch/.env` (1 credit per transcript; video metadata is free). Language preference follows `--sub-lang` (default Spanish→English→auto). Pass `--no-transcriptapi` to force the yt-dlp path. If both miss, Gemini transcribes the video straight from its URL (needs `GEMINI_API_KEY`; Google fetches the video, so datacenter-IP blocks don't apply) and the run reports `via gemini (model)`; opt out with `--no-gemini-transcript` or `WATCH_GEMINI_TRANSCRIPT=0`. YouTube *frames* still require the (often gated) video download — these backends cover the transcript only.
 
 ## Transcription
 
@@ -317,6 +318,7 @@ Because the transcript now fully resolves before any frame is extracted — for 
 
 The report header shows the backend used:
 - `via transcriptapi (lang)` — YouTube-only; fetched from TranscriptAPI before yt-dlp captions were attempted (see "YouTube transcripts (TranscriptAPI)" above)
+- `via gemini (model)` — YouTube-only; TranscriptAPI and captions both missed, so Gemini transcribed from the URL
 - `via captions` — yt-dlp pulled native subs
 - `via whisper (local, large-v3)` — local GPU
 - `via whisper (groq)` / `via whisper (openai)` — API

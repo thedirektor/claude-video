@@ -2,6 +2,15 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.7] — 2026-10-23
+
+### Added
+- **YouTube transcript fallback via Gemini URL.** When TranscriptAPI and yt-dlp
+  captions both miss, `gemini.transcribe_youtube` transcribes the video straight
+  from its URL (reported as `via gemini (model)`). Opt out with
+  `--no-gemini-transcript` or `WATCH_GEMINI_TRANSCRIPT=0`. Why: datacenter IP
+  blocks on yt-dlp and TranscriptAPI credit exhaustion.
+
 ## [0.4.6] — 2026-10-22
 
 ### Added
