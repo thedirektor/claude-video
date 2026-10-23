@@ -401,7 +401,11 @@ def _nearest_frame(conn, video_key: str, t: float | None, within: float):
 
 
 def ask(conn, video_ref: str, question: str, k: int = 8, embedder=None) -> dict:
-    """Evidence pack for one video (no answer synthesis). Every ``t`` is a stored row time."""
+    """Evidence pack for one video (no answer synthesis). Every ``t`` is a stored row time.
+
+    Beyond the contract shape, the pack carries ``mode`` ("hybrid" iff the embedder contributed,
+    else "fts") so callers can tell whether semantic search was used.
+    """
     v = resolve_video(conn, video_ref)
     key = v["video_key"]
     hits = search(conn, question, video_key=key, k=k, embedder=embedder)
@@ -431,7 +435,10 @@ def moment(conn, video_ref: str, t, window: float = 10.0, frames: int = 4) -> di
 
     v = resolve_video(conn, video_ref)
     key = v["video_key"]
-    tt = parse_time(t)
+    try:
+        tt = parse_time(t)
+    except SystemExit:  # parse_time exits on garbage; never let that escape into a worker/CLI
+        raise ValueError(f"invalid timestamp: {t!r}") from None
     if tt is None:
         raise ValueError("t is required")
     lo, hi = tt - window, tt + window
@@ -456,8 +463,12 @@ def list_videos(conn, query: str | None = None, limit: int = 20) -> list[dict]:
     sql, args = "SELECT * FROM videos", []
     if query and query.strip():
         norm = normalize_for_search(query)
-        sql += " WHERE title_norm LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\'"
-        args += [_like(norm), _like(query.strip())]
+        clauses = ["url LIKE ? ESCAPE '\\'"]
+        args = [_like(query.strip())]
+        if norm:  # an empty normalised query would otherwise match every title
+            clauses.insert(0, "title_norm LIKE ? ESCAPE '\\'")
+            args.insert(0, _like(norm))
+        sql += " WHERE " + " OR ".join(clauses)
     sql += " ORDER BY created DESC, video_key LIMIT ?"
     args.append(max(int(limit), 0))
     out = []

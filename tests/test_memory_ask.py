@@ -102,3 +102,37 @@ def test_hit_dicts_shape(conn, two):
     json.dumps(d)
     assert hit_dicts(conn, [], "fts-only") == {"mode": "fts", "hits": []}
     assert len(hit_dicts(conn, search(conn, "hola"), "hybrid")["hits"][0]["snippet"]) <= 240
+
+
+def test_moment_bad_timestamp_raises_valueerror(conn, two):
+    with pytest.raises(ValueError, match="invalid timestamp"):
+        moment(conn, KEY, "abc")
+
+
+def test_list_videos_punctuation_query_not_match_all(conn, two):
+    assert list_videos(conn, "!!!") == []
+
+
+def test_moment_edges(conn, two):
+    m = moment(conn, KEY, 3, window=10)  # t < window
+    assert [s["start"] for s in m["segments"]] == [0.0, 12.0] and m["t"] == 3.0
+    m = moment(conn, KEY, 44, window=100)  # t+window past the end
+    assert [s["start"] for s in m["segments"]] == [0.0, 12.0, 40.0]
+
+
+def test_ask_grounding_ocr_collapse_and_vector_only(conn, tmp_path):
+    from memory.embeddings import embed_pending
+    from memory_fakes import FakeEmbedder
+
+    colors = ["red", "blue", "white"]
+    frames = [fr(t, jpg(tmp_path, c), "ERROR 404") for t, c in zip((1, 2, 3), colors)]
+    record_run(conn, fake_run(segments=[seg(30, 35, "automovil rojo"), seg(36, 40, "otra frase")], frames=frames))
+    embed_pending(conn, FakeEmbedder())
+    stored = stored_times(conn, KEY)
+    chunk_starts = {r[0] for r in conn.execute("SELECT t_start FROM chunks WHERE video_key=?", (KEY,))}
+    assert chunk_starts <= {r[0] for r in conn.execute("SELECT start FROM segments WHERE video_key=?", (KEY,))}
+    for q in ("error 404", "coche"):  # collapsed OCR run / vector-only (no lexical overlap)
+        pack = ask(conn, KEY, q, embedder=FakeEmbedder())
+        assert pack["evidence"]
+        assert all(e["t"] in stored | chunk_starts for e in pack["evidence"])
+    assert ask(conn, KEY, "coche", embedder=FakeEmbedder())["mode"] == "hybrid"
