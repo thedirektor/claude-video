@@ -294,6 +294,8 @@ def frame_kind(frame: dict) -> str:
     reason = frame.get("reason")
     if reason == "transcript-cue":
         return "cue"
+    if reason == "storyboard":
+        return "storyboard"
     if str(frame.get("path") or "").endswith("_hires.jpg"):
         return "ocr"
     if reason in {"uniform", "two-pass"}:

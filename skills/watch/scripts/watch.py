@@ -42,6 +42,7 @@ from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 import transcriptapi  # noqa: E402
 import gemini  # noqa: E402
 import identity  # noqa: E402
+import storyboard  # noqa: E402
 from memory import writer as memory_writer  # noqa: E402
 from memory.index import RunRecord, frame_kind  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
@@ -115,6 +116,35 @@ def _save_library(args, work: Path, *, media_path: str | None, frames: list[dict
     except Exception as exc:  # belt: save must never fail the run
         print(f"[watch] library save skipped ({exc})", file=sys.stderr)
     return refs
+
+
+def _blocked_media_fallback(args, work: Path, exc: SystemExit, *, detail: str,
+                            has_transcript: bool, max_frames: int | None) -> dict:
+    """A YouTube media download failed (usually the datacenter bot wall).
+
+    Non-transcript runs fetch the public storyboard as low-res frames. With neither
+    storyboard frames nor a transcript the original failure is re-raised; otherwise
+    the run continues (frameless when the storyboard is unavailable).
+    """
+    if not transcriptapi.is_youtube_url(args.source):
+        raise exc
+    print(f"[watch] media download failed: {exc}", file=sys.stderr)
+    board: dict | None = None
+    info: dict = {}
+    if detail != "transcript":
+        try:
+            frames, meta, info = storyboard.fetch(
+                args.source, work / "storyboard",
+                start=parse_time(args.start), end=parse_time(args.end), max_frames=max_frames,
+            )
+            if frames:
+                board = {"frames": frames, "meta": meta}
+        except Exception as sb_exc:  # noqa: BLE001 - fallback of a fallback
+            print(f"[watch] storyboard unavailable: {sb_exc}", file=sys.stderr)
+    if board is None and not has_transcript:
+        raise exc
+    return {"video_path": None, "subtitle_path": None, "info": info or {"url": args.source},
+            "downloaded": False, "storyboard": board, "blocked": str(exc)}
 
 
 def _memory_title(source: str, info: dict) -> str | None:
@@ -908,14 +938,20 @@ def main() -> int:
                     else "[watch] downloading video via yt-dlp…",
                     file=sys.stderr,
                 )
-                dl = download(
-                    args.source,
-                    work / "download",
-                    audio_only=audio_only,
-                    sub_langs=args.sub_lang or DEFAULT_SUB_LANGS,
-                    cookies_from_browser=args.cookies_from_browser,
-                    cookies_file=args.cookies,
-                )
+                try:
+                    dl = download(
+                        args.source,
+                        work / "download",
+                        audio_only=audio_only,
+                        sub_langs=args.sub_lang or DEFAULT_SUB_LANGS,
+                        cookies_from_browser=args.cookies_from_browser,
+                        cookies_file=args.cookies,
+                    )
+                except SystemExit as exc:
+                    dl = _blocked_media_fallback(
+                        args, work, exc, detail=detail,
+                        has_transcript=bool(transcript_segments), max_frames=budget_cap,
+                    )
             else:
                 print("[watch] using local file…", file=sys.stderr)
                 dl = download(args.source, work / "download")
@@ -1188,6 +1224,15 @@ def main() -> int:
                 dedup=not args.no_dedup,
             )
 
+    elif detail != "transcript" and dl.get("storyboard"):
+        frames = list(dl["storyboard"]["frames"])
+        frame_meta = dict(dl["storyboard"]["meta"])
+        if not args.no_dedup:
+            frames, deduped_count = dedupe_perceptual(frames)
+            if deduped_count:
+                frame_meta["deduped_count"] = deduped_count
+                frame_meta["selected_count"] = len(frames)
+
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
 
@@ -1201,7 +1246,7 @@ def main() -> int:
         raw_ocr = run_ocr([f["path"] for f in frames])
         for f in frames:
             text = raw_ocr.get(f["path"], "")
-            if is_significant(text) and args.resolution < HIRES_WIDTH:
+            if is_significant(text) and args.resolution < HIRES_WIDTH and video_path:
                 hires = Path(f["path"]).with_name(Path(f["path"]).stem + "_hires.jpg")
                 if reextract_frame(video_path, hires, f["timestamp_seconds"], HIRES_WIDTH):
                     f["path"] = str(hires)
@@ -1251,6 +1296,15 @@ def main() -> int:
         )
     elif not cue_frames:
         emit("- **Frames:** skipped (transcript detail)")
+    if frame_meta.get("engine") == "storyboard":
+        step = frame_meta.get("interval_s")
+        every = f", one every ~{step:g}s" if step else ""
+        emit(
+            f"- **Frame source:** YouTube storyboard ({frame_meta.get('tile')} tiles{every}) — "
+            "the media download was blocked, so frames are low-res seek previews"
+        )
+    elif dl.get("blocked") and detail != "transcript":
+        emit("- **Frames:** none — media download blocked and no storyboard available")
     if cue_frames:
         dropped = cue_meta.get("dropped_out_of_window", 0)
         drop_note = f", {dropped} dropped outside range" if dropped else ""
