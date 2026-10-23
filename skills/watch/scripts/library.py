@@ -138,6 +138,45 @@ def load_config() -> dict:
     return cfg
 
 
+def save_exports(files: list[str], title: str, video_id: str, *, paperless_doc: str | None = None,
+                 contact: str | None = None, cfg: dict | None = None, refs: dict | None = None) -> list[str]:
+    """Route a run's exports to the same library entry as ``save_artifacts``.
+
+    Every export goes to the Nextcloud folder ``Watch/<title> (<id>)``; ``paperless_doc``
+    (the merged PDF, or report.md when no PDF was built) goes to Paperless; the contact
+    sheet joins the Immich album. NEVER raises; ``refs`` gets ``paperless`` task ids.
+    """
+    summary: list[str] = []
+    try:
+        cfg = load_config() if cfg is None else (cfg or {})
+        name = f"{sanitize(title)} ({video_id})"
+        if files:
+            if cfg.get("NEXTCLOUD_PASS"):
+                r = upload_to_nextcloud(files, name, cfg)
+                summary.append(f"Nextcloud: exports → Watch/{name} ({r.get('uploaded', 0)} files"
+                               + (f", {r['error']})" if r.get("error") else ")"))
+            else:
+                summary.append("Nextcloud: exports skipped (no NEXTCLOUD_PASS)")
+        if paperless_doc:
+            if cfg.get("PAPERLESS_TOKEN"):
+                r = upload_to_paperless([paperless_doc], name, cfg)
+                if r.get("uploaded"):
+                    _put_ref(refs, "paperless", {"task_ids": list(r.get("task_ids") or []), "url": r.get("url")})
+                summary.append(f"Paperless: '{name}' ({Path(paperless_doc).name})"
+                               + (f" ({r['error']})" if r.get("error") else ""))
+            else:
+                summary.append("Paperless: skipped (no PAPERLESS_TOKEN)")
+        if contact:
+            if cfg.get("IMMICH_API_KEY"):
+                r = upload_to_immich([contact], name, cfg)
+                summary.append(f"Immich: contact sheet → album '{name}'" + (f" ({r['error']})" if r.get("error") else ""))
+            else:
+                summary.append("Immich: contact sheet skipped (no IMMICH_API_KEY)")
+    except Exception as exc:  # noqa: BLE001 - never fail the run
+        summary.append(f"Library: exports not saved ({exc})")
+    return summary
+
+
 # --------------------------------------------------------------------------
 # Router
 # --------------------------------------------------------------------------
@@ -746,6 +785,7 @@ def save_artifacts(
     video_id: str,
     cfg: dict | None = None,
     refs: dict | None = None,
+    paperless: bool = True,
 ) -> list[str]:
     """Route this run's artifacts to Immich (video + representative frames)
     and Nextcloud (report.md + any non-media). NEVER raises — any failure is
@@ -758,6 +798,9 @@ def save_artifacts(
     ``paperless`` task ids, each with its ``url``) for every target that
     actually uploaded something; skipped/failed targets are absent. The
     return value is unaffected.
+
+    ``paperless=False`` defers the Paperless upload to ``save_exports`` (the run
+    will produce a PDF that replaces report.md there).
     """
     try:
         if cfg is None:
@@ -858,7 +901,7 @@ def save_artifacts(
 
         # Paperless is additive with Nextcloud: same non-media artifacts, but
         # indexed for full-text search. Only report.md-class files, never media.
-        if nextcloud_files:
+        if nextcloud_files and paperless:
             if cfg.get("PAPERLESS_TOKEN"):
                 try:
                     result = upload_to_paperless(nextcloud_files, name, cfg)

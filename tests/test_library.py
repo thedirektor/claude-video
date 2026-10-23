@@ -777,3 +777,35 @@ def test_no_builtin_library_hosts(monkeypatch):
     assert library.upload_to_immich([str(f)], "a", {"IMMICH_API_KEY": "k"})["error"] == "missing IMMICH_BASE_URL"
     assert library.upload_to_nextcloud([str(f)], "a", {"NEXTCLOUD_PASS": "p"})["error"] == "missing NEXTCLOUD_URL"
     assert library.upload_to_paperless([str(f)], "a", {"PAPERLESS_TOKEN": "t"})["error"] == "missing PAPERLESS_URL"
+
+
+def test_save_artifacts_can_defer_paperless(tmp_path, monkeypatch):
+    report = tmp_path / "report.md"
+    report.write_text("# r")
+    calls = []
+    monkeypatch.setattr(library, "upload_to_nextcloud", lambda f, n, c: calls.append("nc") or {"uploaded": 1})
+    monkeypatch.setattr(library, "upload_to_paperless", lambda f, n, c: calls.append("pl") or {"uploaded": 1})
+    cfg = {"NEXTCLOUD_PASS": "x", "PAPERLESS_TOKEN": "y"}
+    library.save_artifacts(None, [], str(report), {}, "T", "id1", cfg=cfg, paperless=False)
+    assert calls == ["nc"]
+    library.save_artifacts(None, [], str(report), {}, "T", "id1", cfg=cfg)
+    assert calls == ["nc", "nc", "pl"]
+
+
+def test_save_exports_routes_each_target(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(library, "upload_to_nextcloud", lambda f, n, c: seen.setdefault("nc", (f, n)) and {"uploaded": len(f)})
+    monkeypatch.setattr(library, "upload_to_paperless",
+                        lambda f, n, c: seen.setdefault("pl", (f, n)) and {"uploaded": 1, "task_ids": ["t1"], "url": "u"})
+    monkeypatch.setattr(library, "upload_to_immich", lambda f, n, c: seen.setdefault("im", (f, n)) and {"uploaded": 1})
+    refs: dict = {}
+    out = library.save_exports(["a.pdf", "b.pptx"], "Mi vídeo", "abc", paperless_doc="a.pdf", contact="c.png",
+                               cfg={"NEXTCLOUD_PASS": "x", "PAPERLESS_TOKEN": "y", "IMMICH_API_KEY": "z"}, refs=refs)
+    assert seen["nc"] == (["a.pdf", "b.pptx"], "Mi vídeo (abc)")
+    assert seen["pl"] == (["a.pdf"], "Mi vídeo (abc)") and seen["im"] == (["c.png"], "Mi vídeo (abc)")
+    assert refs["paperless"]["task_ids"] == ["t1"] and len(out) == 3
+
+
+def test_save_exports_without_credentials_skips(tmp_path):
+    out = library.save_exports(["a.pdf"], "T", "i", paperless_doc="a.pdf", contact="c.png", cfg={})
+    assert all("skipped" in line for line in out) and len(out) == 3

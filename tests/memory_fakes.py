@@ -190,7 +190,8 @@ def segment_count() -> int:
 
 
 def note_texts() -> list[str]:
-    return [r[0] for r in _query("SELECT text FROM notes ORDER BY id")]
+    """Run notes (derived chapter notes excluded)."""
+    return [r[0] for r in _query("SELECT text FROM notes WHERE kind IS NOT 'chapter' ORDER BY id")]
 
 
 class Spy:

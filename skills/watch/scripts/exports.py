@@ -380,10 +380,9 @@ def default_formats() -> list[str]:
 
 
 def build(conn, key: str, formats: list[str], *, store_dir=None, out_dir: Path | None = None) -> dict:
-    """Build the requested exports; {format: {"path": str} | {"skipped": why} | {"error": why}}."""
+    """Build the requested exports, plus notes.md always;
+    {format: {"path": str} | {"skipped": why} | {"error": why}}."""
     results: dict[str, dict] = {}
-    if not formats:
-        return results
     try:
         d = load(conn, key, store_dir)
     except Exception as exc:  # noqa: BLE001

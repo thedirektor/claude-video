@@ -10,6 +10,7 @@ import argparse
 import json
 import shutil
 import sys
+from pathlib import Path
 
 import identity
 from config import memory_paths
@@ -87,6 +88,23 @@ def _cmd_stats(conn, a) -> int:
     for p, n in s["by_provider"].items():
         _out(f"- {p}: {n}")
     return 0
+
+
+def _cmd_export(conn, a) -> int:
+    import exports
+
+    from . import extract
+
+    key = retrieval.resolve_video(conn, a.video)["video_key"]
+    extract.store_chapters(conn, key, llm_titles=True if a.llm_titles else None)
+    formats = exports.parse_formats(a.formats) if a.formats is not None else exports.default_formats()
+    res = exports.build(conn, key, formats, out_dir=Path(a.out) if a.out else None)
+    if a.json:
+        _json({"video_key": key, "exports": res})
+        return 0
+    for fmt, r in res.items():
+        _out(f"{fmt}: {r.get('path') or ('skipped — ' + r['skipped'] if 'skipped' in r else 'error — ' + r.get('error', '?'))}")
+    return 0 if all("path" in r for r in res.values()) else 1
 
 
 def _cmd_ask(conn, a) -> int:
@@ -235,11 +253,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--forget", metavar="KEY")
     g.add_argument("--embed-missing", action="store_true")
     add("stats", "answer-cache usage (answers, cache hits, tokens used / saved)")
+    s = add("export", "rebuild chapters, notes.md and exports of an indexed video (no re-watch)")
+    s.add_argument("video")
+    s.add_argument("--formats", help="docx,pdf,pptx,xlsx,viewer,json,contact | all (default: WATCH_EXPORTS / auto)")
+    s.add_argument("--out", help="output directory (default: the video's store dir /exports)")
+    s.add_argument("--llm-titles", action="store_true", help="rewrite chapter titles with one LLM call")
     return p
 
 
 _HANDLERS = {"search": _cmd_search, "ask": _cmd_ask, "moment": _cmd_moment, "list": _cmd_list, "index": _cmd_index,
-             "stats": _cmd_stats}
+             "stats": _cmd_stats, "export": _cmd_export}
 
 
 def main(argv: list[str]) -> int:

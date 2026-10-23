@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -18,7 +19,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from config import frame_cap, get_config  # noqa: E402
+from config import frame_cap, get_config, memory_paths  # noqa: E402
 from download import DEFAULT_SUB_LANGS, download, fetch_captions, is_url  # noqa: E402
 import library  # noqa: E402
 import state  # noqa: E402
@@ -44,6 +45,7 @@ import gemini  # noqa: E402
 import identity  # noqa: E402
 import storyboard  # noqa: E402
 import doctor  # noqa: E402
+import exports  # noqa: E402
 from memory import writer as memory_writer  # noqa: E402
 from memory.index import RunRecord, frame_kind  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
@@ -98,17 +100,30 @@ def _run_should_save(args, backend: str, detail: str) -> bool:
     )
 
 
+def _library_name(args, info: dict) -> tuple[str, str]:
+    """(title, video_id) naming this run's library entry (album / folder / document)."""
+    video_id = info.get("id") or hashlib.sha1(args.source.encode("utf-8")).hexdigest()[:8]
+    return info.get("title") or Path(args.source).name, video_id
+
+
+def _planned_exports(args) -> list[str]:
+    """The export formats this run will build (none without the index)."""
+    if args.no_index:
+        return []
+    return exports.parse_formats(args.exports) if args.exports is not None else exports.default_formats()
+
+
 def _save_library(args, work: Path, *, media_path: str | None, frames: list[dict],
                   ocr_text: dict, info: dict) -> dict:
     """Push this run's artifacts to the library; returns the refs (may be empty).
-    Never raises — save must never fail the run."""
-    video_id = info.get("id") or hashlib.sha1(args.source.encode("utf-8")).hexdigest()[:8]
-    title = info.get("title") or Path(args.source).name
+    Never raises — save must never fail the run. Paperless is left to the exports
+    step when this run will build a PDF (it replaces report.md there)."""
+    title, video_id = _library_name(args, info)
     refs: dict = {}
     try:
         summary = library.save_artifacts(
             media_path, frames, str(work / "report.md"), ocr_text, title, video_id,
-            refs=refs,
+            refs=refs, paperless="pdf" not in _planned_exports(args),
         )
         for line in summary or []:
             print(f"[watch] {line}", file=sys.stderr)
@@ -160,10 +175,10 @@ def _memory_title(source: str, info: dict) -> str | None:
 def _remember(args, work: Path, *, backend: str, detail: str, info: dict,
               transcript_source: str | None, segments: list[dict], frames: list[dict],
               notes: list[dict], media_path: str | None, rng: tuple[float, float] | None,
-              refs: dict, archive: bool) -> None:
+              refs: dict, archive: bool) -> dict | None:
     """Index this run (unless --no-index) and write work/memory.json. Never raises."""
     if args.no_index:
-        return
+        return None
     try:
         info = info or {}
         run = RunRecord(
@@ -194,8 +209,46 @@ def _remember(args, work: Path, *, backend: str, detail: str, info: dict,
                 f"(evidence v{result['evidence_version']}, {result['mode']})",
                 file=sys.stderr,
             )
+        return result
     except Exception as exc:  # noqa: BLE001 - memory must never fail a run
         print(f"[watch] memory: not indexed ({type(exc).__name__}: {exc})", file=sys.stderr)
+    return None
+
+
+def _outputs(args, work: Path, result: dict | None, *, saved: bool, info: dict) -> None:
+    """After indexing: chapters (always), cited notes + the requested exports, and —
+    when the run is archived — their library routing. Never raises."""
+    if not result:
+        return
+    try:
+        from memory import extract
+        from memory import index as memory_index
+
+        key = result["video_key"]
+        formats = _planned_exports(args)
+        conn = memory_index.connect(memory_paths()["index_db"])
+        try:
+            extract.store_chapters(conn, key, llm_titles=True if args.llm_titles else None)
+            built = exports.build(conn, key, formats)
+        finally:
+            conn.close()
+        notes_src = built.get("notes", {}).get("path")
+        if notes_src and Path(notes_src).is_file():
+            shutil.copy2(notes_src, work / "notes.md")
+        (work / "exports.json").write_text(json.dumps(built, indent=2), encoding="utf-8")
+        made = [f"{k} → {Path(v['path']).name}" for k, v in built.items() if v.get("path")]
+        if made:
+            print(f"[watch] outputs: {', '.join(made)}", file=sys.stderr)
+        if saved:
+            title, video_id = _library_name(args, info)
+            pdf = built.get("pdf", {}).get("path")
+            paperless_doc = pdf or (str(work / "report.md") if "pdf" in formats else None)
+            files = [v["path"] for k, v in built.items() if v.get("path") and k != "contact"]
+            for line in library.save_exports(files, title, video_id, paperless_doc=paperless_doc,
+                                             contact=built.get("contact", {}).get("path")):
+                print(f"[watch] {line}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - outputs must never fail a run
+        print(f"[watch] outputs skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
 
 
 def _finish_backend_run(args, work: Path, *, backend_label: str, answer: str,
@@ -234,7 +287,7 @@ def _finish_backend_run(args, work: Path, *, backend_label: str, answer: str,
                              frames=[f for f in frames if f.get("path")], ocr_text={}, info=info)
     note = {"kind": "backend_answer", "t_start": None, "t_end": None,
             "text": f"Q: {question}\n\n{answer or ''}"}
-    _remember(
+    result = _remember(
         args, work, backend=backend, detail=detail, info=info,
         transcript_source=transcript_source, segments=segments,
         frames=[{"t": f["timestamp_seconds"], "path": f.get("path"), "kind": frame_kind(f), "ocr": None}
@@ -242,6 +295,7 @@ def _finish_backend_run(args, work: Path, *, backend_label: str, answer: str,
         notes=[note], media_path=media_path, rng=getattr(args, "memory_range", None),
         refs=refs, archive=saved,
     )
+    _outputs(args, work, result, saved=saved, info=info)
 
 
 def _gemini_free_transcript(args, work: Path, *, youtube: bool, dl: dict | None,
@@ -541,7 +595,7 @@ def _run_openrouter_backend(args, work: Path) -> int:
     return 0
 
 
-MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index", "stats"}
+MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index", "stats", "export"}
 
 
 def main() -> int:
@@ -684,6 +738,20 @@ def main() -> int:
         help="Archive this run to the library even where it is off by default "
         "(--backend gemini/openrouter, ingest transcript runs). --no-save / "
         "WATCH_NO_SAVE still win.",
+    )
+    ap.add_argument(
+        "--exports",
+        default=None,
+        metavar="FORMATS",
+        help="Comma list of exports built from the video memory after the run: "
+        "docx,pdf,pptx,xlsx,viewer,json,contact (or all/none). Default: WATCH_EXPORTS, "
+        "else pdf,pptx when wordcraft-cli and deckcraft-cli are installed, else none. "
+        "Chapters and notes.md are always written.",
+    )
+    ap.add_argument(
+        "--llm-titles",
+        action="store_true",
+        help="Rewrite chapter titles with one LLM call (also WATCH_LLM_TITLES=1).",
     )
     ap.add_argument(
         "--no-index",
@@ -1439,7 +1507,7 @@ def main() -> int:
         refs = _save_library(args, work, media_path=video_path, frames=frames,
                              ocr_text=ocr_text, info=info)
 
-    _remember(
+    result = _remember(
         args, work, backend="claude", detail=detail, info=info,
         transcript_source=transcript_source, segments=transcript_segments,
         frames=[
@@ -1451,6 +1519,7 @@ def main() -> int:
         rng=(effective_start, effective_end) if focused else None,
         refs=refs, archive=saved,
     )
+    _outputs(args, work, result, saved=saved, info=info)
 
     return 0
 

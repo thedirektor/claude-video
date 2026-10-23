@@ -17,7 +17,8 @@ import watch  # noqa: E402
 def _record_save(monkeypatch):
     calls = []
 
-    def fake_save_artifacts(video_path, frames, report_path, ocr_text, title, video_id, cfg=None, refs=None):
+    def fake_save_artifacts(video_path, frames, report_path, ocr_text, title, video_id, cfg=None, refs=None,
+                            paperless=True):
         if refs is not None:
             refs["immich"] = {"album_id": "x"}
         calls.append(
@@ -33,6 +34,7 @@ def _record_save(monkeypatch):
         return ["fake save summary line"]
 
     monkeypatch.setattr(watch.library, "save_artifacts", fake_save_artifacts)
+    monkeypatch.setattr(watch.library, "save_exports", lambda *a, **k: [])
     return calls
 
 
