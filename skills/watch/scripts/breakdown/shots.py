@@ -96,11 +96,18 @@ MIN_CROSS = 0.08  # content change across a gradual window (0..1 mean abs thumbn
 MIN_SCORE = 3.0  # cross-window change vs the shots' own frame-to-frame variation
 FLASH_FRAMES = 3
 DARK = 40  # near-black thumbnail (mean channel value)
+WHITE_MEAN = 215  # near-white thumbnail (mean channel value)
 _LENGTHS = (4, 6, 9, 13, 19, 27, 38, 50)
 
 
 def _dist(a, b) -> float:
     return sum(abs(x - y) for x, y in zip(a, b)) / (255.0 * len(a))
+
+
+def _flat_extreme(th) -> bool:
+    """Near-black or near-white thumbnail (the end of a fade, not content)."""
+    m = sum(th) / len(th)
+    return m < DARK or m > WHITE_MEAN
 
 
 def _fps_of(t: list[float]) -> float:
@@ -148,7 +155,7 @@ def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
                 continue
             # a fade in from / out to black near a clip edge is not a shot boundary
             near = int(0.5 * fps)
-            if (i0 < near and sum(thumb[i0]) < DARK * len(thumb[i0])) or (n - 1 - i1 < near and sum(thumb[i1]) < DARK * len(thumb[i1])):
+            if (i0 < near and _flat_extreme(thumb[i0])) or (n - 1 - i1 < near and _flat_extreme(thumb[i1])):
                 continue
             cross = _dist(thumb[i0], thumb[i1])
             if cross < MIN_CROSS:

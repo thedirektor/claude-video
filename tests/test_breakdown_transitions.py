@@ -69,3 +69,74 @@ def test_without_cv2(ref, monkeypatch):
     r = C.camera_motion(str(p), shots[0])
     assert r["type"] == "not determined" and r["confidence"] == 0
     assert any("opencv" in n for n in r["notes"])
+
+
+def _ff(*a):
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *a], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+ENC = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
+
+
+@pytest.fixture(scope="module")
+def still(tmp_path_factory):
+    d = tmp_path_factory.mktemp("cam")
+    _ff("-f", "lavfi", "-i", "mandelbrot=s=1600x900:start_scale=0.5,trim=end_frame=1", "-frames:v", "1", str(d / "s.png"))
+    _ff("-i", str(d / "s.png"), "-vf", "drawbox=x=800:y=0:w=800:h=900:c=gray:t=fill", "-frames:v", "1", str(d / "half.png"))
+    return d
+
+
+def _cam(d, name, vf, img="s.png"):
+    p = d / f"{name}.mp4"
+    _ff("-loop", "1", "-framerate", "25", "-t", "3", "-i", str(d / img), "-vf", vf, *ENC, str(p))
+    return C.camera_motion(str(p), {"start": 0.0, "end": 3.0})
+
+
+def test_tilt_up(still):
+    assert _cam(still, "tu", "crop=640:360:0:'360-t*100',scale=640:360")["type"] == "tilt_up"
+
+
+def test_zoom_in(still):
+    r = _cam(still, "zi", "zoompan=z='1+0.004*on':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=640x360:fps=25")
+    assert r["type"] == "zoom_in"
+
+
+def test_handheld(still):
+    r = _cam(still, "hh", "crop=640:360:'320+30*sin(t*7.3)+20*sin(t*13.1+1)':'180+25*sin(t*9.7+2)+15*sin(t*17.3)',scale=640:360")
+    assert r["type"] == "handheld" and r["confidence"] < 0.8
+
+
+def test_slow_one_sided_pan_is_not_zoom(still):
+    r = _cam(still, "sp", "crop=640:360:'400+t*60':200", img="half.png")
+    assert r["type"] == "pan_right"
+
+
+def _series(p, dur=5.0):
+    s = S.frame_series(str(p), 25)
+    return s, T.classify(s, S.detect_shots(s, dur))
+
+
+def test_fade_in_and_out(tmp_path):
+    p = tmp_path / "io.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=5", "-vf", "fade=t=in:st=0:d=1,fade=t=out:st=4:d=1", *ENC, str(p))
+    _, out = _series(p)
+    assert [e["kind"] for e in out] == ["fade_from_black", "fade_to_black"]
+
+
+def test_fade_to_white(tmp_path):
+    p = tmp_path / "w.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=5", "-vf", "fade=t=out:st=4:d=1:c=white", *ENC, str(p))
+    s, out = _series(p)
+    assert [e["kind"] for e in out] == ["fade_to_white"]
+    assert len(S.detect_shots(s, 5.0)) == 1
+
+
+def test_dip_through_black(tmp_path):
+    a, b, p = tmp_path / "a.mp4", tmp_path / "b.mp4", tmp_path / "x.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=3", *ENC, str(a))
+    _ff("-f", "lavfi", "-i", "testsrc=s=320x180:r=25:d=3", *ENC, str(b))
+    _ff("-i", str(a), "-i", str(b), "-filter_complex", "[0][1]xfade=transition=fadeblack:duration=1:offset=2", *ENC, str(p))
+    _, out = _series(p)
+    assert [e["kind"] for e in out] == ["fade_to_black", "fade_from_black"]
+    assert out[0]["t"] < out[1]["t"]
