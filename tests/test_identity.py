@@ -43,8 +43,26 @@ def test_video_key_file_by_content(tmp_path):
     assert k == video_key(str(b)) and k.startswith("file:") and len(k) == 21
 
 def test_store_dirname_windows_safe():
-    assert store_dirname("yt:dQw4w9WgXcQ") == "yt_dQw4w9WgXcQ"
-    assert store_dirname("generic:a/b?c") == "generic_a_b_c"
+    import re
+    for k in ("yt:dQw4w9WgXcQ", "generic:a/b?c"):
+        assert re.fullmatch(r"[A-Za-z0-9._-]+", store_dirname(k))
+    assert store_dirname("yt:dQw4w9WgXcQ").startswith("yt_dQw4w9WgXcQ-")
+
+def test_store_dirname_collision_safe():
+    assert store_dirname("yt:abc") != store_dirname("yt_abc")
+    assert store_dirname("yt:AbC") != store_dirname("yt:abc")
+    assert store_dirname("file:0123") != store_dirname("file_0123")
+    assert store_dirname("url_abc-1.x") == "url_abc-1.x"
+
+def test_video_key_generic_extractor_not_shared():
+    ia = {"extractor_key": "Generic", "id": "v"}
+    assert video_key("https://a.com/v.mp4", ia) != video_key("https://b.com/v.mp4", ia)
+    assert video_key("https://a.com/v.mp4", ia).startswith("url:")
+    assert video_key("https://a.com/v.mp4", {"extractor_key": "HTML5", "id": "v"}).startswith("url:")
+
+def test_video_key_partial_info_falls_back():
+    assert video_key("https://v.com/1", {"extractor_key": "Vimeo"}).startswith("url:")
+    assert video_key("https://v.com/1", {"id": "1"}).startswith("url:")
 
 def test_canonical_ipv6_and_ports():
     assert canonical_source("http://[::1]:8080/v") == "http://[::1]:8080/v"

@@ -60,6 +60,9 @@ def canonical_source(source: str) -> str:
         return stripped
 
 
+_PATH_DERIVED_EXTRACTORS = {"generic", "html5"}  # id comes from the filename: not unique
+
+
 def _sha16(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
@@ -92,7 +95,7 @@ def video_key(source: str, info: dict | None = None) -> str:
             return f"yt:{m.group(1)}"
         if isinstance(info, dict):
             ek, vid = info.get("extractor_key"), info.get("id")
-            if ek and vid:
+            if ek and vid and str(ek).lower() not in _PATH_DERIVED_EXTRACTORS:
                 return f"{str(ek).lower()}:{vid}"
         return "url:" + _sha16(canon.encode("utf-8", "surrogateescape"))
     except Exception:
@@ -100,5 +103,9 @@ def video_key(source: str, info: dict | None = None) -> str:
 
 
 def store_dirname(video_key: str) -> str:
-    """Windows-safe directory name for a video_key."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", video_key)
+    """Windows-safe directory name; altered keys get a short hash suffix so
+    distinct keys never collide after sanitising."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", video_key)
+    if safe == video_key:
+        return safe
+    return safe + "-" + hashlib.sha1(video_key.encode("utf-8", "replace")).hexdigest()[:6]
