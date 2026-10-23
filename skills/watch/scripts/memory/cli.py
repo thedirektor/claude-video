@@ -41,18 +41,23 @@ def _fmt_t(seconds) -> str:
 
 def _cmd_search(conn, a) -> int:
     key = retrieval.resolve_video(conn, a.video)["video_key"] if a.video else None
-    hits = retrieval.search(conn, a.query, video_key=key, k=a.limit, embedder=_embedder())
-    shaped = retrieval.hit_dicts(conn, hits, hits.mode)
+    if a.visual:
+        from . import visual
+
+        shaped = visual.visual_search(conn, a.query, video_key=key, k=a.limit)
+    else:
+        hits = retrieval.search(conn, a.query, video_key=key, k=a.limit, embedder=_embedder())
+        shaped = retrieval.hit_dicts(conn, hits, hits.mode)
     if a.json:
         _json(shaped)
         return 0
     if not shaped["hits"]:
-        _out(f"No matches for {a.query!r}.")
+        _out(f"No matches for {a.query!r}." + (f" ({shaped['note']})" if shaped.get("note") else ""))
         return 0
     _out(f"# Search: {a.query}  ({shaped['mode']})")
     for h in shaped["hits"]:
         _out(f"- **{h['title'] or h['video_key']}** `{h['video_key']}` [{h['timestamp'] or '--:--'}] "
-             f"{h['kind']}: {h['snippet']}")
+             f"{h['kind']}: {h['snippet'] or h.get('immich_url') or ''}")
     return 0
 
 
@@ -232,6 +237,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("query")
     s.add_argument("--video", help="video_key, URL, or title fragment")
     s.add_argument("--limit", type=int, default=8)
+    s.add_argument("--visual", action="store_true",
+                   help="search what is SEEN (Immich CLIP over the archived frames) instead of the text")
     s = add("ask", "evidence pack for a question about one video")
     s.add_argument("video")
     s.add_argument("question")

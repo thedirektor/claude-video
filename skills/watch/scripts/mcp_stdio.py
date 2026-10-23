@@ -37,7 +37,8 @@ TOOLS = [
      "inputSchema": _schema({"source": S, "question": S, "detail": S, "start": S, "end": S, "backend": S,
                              "max_frames": I, "allow_cost": B}, ["source"])},
     {"name": "search", "description": "Search everything watched on this machine (transcript, on-screen text, "
-     "notes) with timestamps.", "inputSchema": _schema({"query": S, "video": S, "limit": I}, ["query"])},
+     "notes) with timestamps; visual=true searches what is seen in the archived frames (Immich CLIP).",
+     "inputSchema": _schema({"query": S, "video": S, "limit": I, "visual": B}, ["query"])},
     {"name": "ask", "description": "Answer a question about one watched video from its stored evidence, citing "
      "only stored timestamps (answer=false returns the evidence pack only).",
      "inputSchema": _schema({"video": S, "question": S, "k": I, "answer": B}, ["video", "question"])},
@@ -113,6 +114,11 @@ def call_tool(name: str, args: dict) -> dict:
         try:
             if name == "search":
                 key = retrieval.resolve_video(conn, args["video"])["video_key"] if args.get("video") else None
+                if args.get("visual"):
+                    from memory import visual
+
+                    return _text({"query": args["query"], **visual.visual_search(
+                        conn, args["query"], video_key=key, k=int(args.get("limit") or 8))})
                 hits = retrieval.search(conn, args["query"], video_key=key, k=int(args.get("limit") or 8),
                                         embedder=_embedder())
                 return _text({"query": args["query"], **retrieval.hit_dicts(conn, hits, hits.mode)})
