@@ -28,7 +28,7 @@ def _font() -> str | None:
 def _ffmpeg(args: list[str]) -> None:
     res = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
                          capture_output=True, text=True)
-    if res.returncode:
+    if res.returncode or res.stderr.strip():
         raise RuntimeError(f"ffmpeg failed: {res.stderr[-800:]}")
 
 
@@ -44,7 +44,7 @@ def make_reference(path, *, fps: int = 25, with_audio: bool = True) -> dict:
     text_filter = ""
     if font:
         text_filter = (
-            f",drawtext=fontfile={font}:text='SALE 50%':x=20:y=20:fontsize=48:"
+            f",drawtext=fontfile={font}:expansion=none:text='SALE 50%':x=20:y=20:fontsize=48:"
             "fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=8:enable='between(t,1,3)'"
         )
     graph = (

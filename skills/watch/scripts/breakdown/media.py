@@ -71,15 +71,17 @@ def probe(path: Path) -> dict | None:
     }
 
 
-def default_fetch(url: str, vdir: Path) -> Path | None:
-    """Download ``url`` (<=1080p) via the plugin's yt-dlp wrapper; returns the file."""
+def default_fetch(url: str, vdir: Path) -> dict | None:
+    """Download ``url`` (<=1080p) via the plugin's yt-dlp wrapper.
+
+    Returns ``{"video_path", "via_fallback_proxy"}`` (a fetch may also return a bare path)."""
     import download  # deferred: heavy and only needed on a refetch
 
     tmp = Path(vdir) / ".fetch"
     shutil.rmtree(tmp, ignore_errors=True)
     try:
         res = download.download_url(url, tmp, fmt=FETCH_FORMAT)
-        return Path(res["video_path"]) if res.get("video_path") else None
+        return res if res.get("video_path") else None
     except BaseException as exc:  # yt-dlp failures surface as SystemExit
         if isinstance(exc, KeyboardInterrupt):
             raise
@@ -135,10 +137,17 @@ def ensure_media(conn, video_key: str, store_dir: Path | None = None, fetch=None
             if isinstance(exc, KeyboardInterrupt):
                 raise
             got = None
+        proxied = False
+        if isinstance(got, dict):
+            proxied = bool(got.get("via_fallback_proxy"))
+            got = got.get("video_path")
         if got and Path(got).is_file():
             vdir.mkdir(parents=True, exist_ok=True)
             dest = _adopt(Path(got), vdir)
             info = probe(dest)
             if info:
-                return _result(dest, info, "fetched")
+                res = _result(dest, info, "fetched")
+                if proxied:  # fallback proxy forces <=480p
+                    res["low_resolution"] = True
+                return res
     return _frames_only(row["duration"] if row else 0.0, vdir)

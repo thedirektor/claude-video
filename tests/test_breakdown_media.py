@@ -85,6 +85,33 @@ def test_ensure_media_fetched(conn, tmp_path):
     assert Path(info["path"]).name.startswith("media.")
 
 
+def test_fetch_via_fallback_proxy_is_low_resolution(conn, tmp_path):
+    root = tmp_path / "st"
+    _video_row(conn, KEY_A, url="https://example.com/clip")
+    src = tmp_path / "dl" / "video.mp4"
+    src.parent.mkdir()
+    make_reference(src, with_audio=False)
+    info = media.ensure_media(conn, KEY_A, store_dir=root,
+                              fetch=lambda u, v: {"video_path": str(src), "via_fallback_proxy": True})
+    assert info["source"] == "fetched" and info["low_resolution"] is True
+
+
+def test_pinned_media_does_not_starve_other_files(conn, tmp_path):
+    root = tmp_path / "st"
+    _video_row(conn, KEY_A, access="2026-01-01")
+    _video_row(conn, KEY_B, access="2026-01-02")
+    va, vb = store.video_dir(root, KEY_A), store.video_dir(root, KEY_B)
+    for v in (va, vb):
+        (v / "frames").mkdir(parents=True)
+        (v / "frames" / "1000.jpg").write_bytes(b"f" * 10)
+    (va / "media.mp4").write_bytes(b"x" * 100_000)
+    media.pin(root, KEY_A)
+    (vb / "media.mp4").write_bytes(b"y" * 100)
+    store.enforce_retention(conn, root, max_bytes=50_000)
+    assert (va / "media.mp4").exists() and (va / "frames" / "1000.jpg").exists()
+    assert (vb / "media.mp4").exists() and (vb / "frames" / "1000.jpg").exists()
+
+
 def test_refetch_or_flag(conn, tmp_path):
     root = tmp_path / "st"
     _video_row(conn, KEY_A, duration=42.0)
@@ -111,6 +138,17 @@ def _probe(path, *entries):
     return out
 
 
+def _title_pixels(path, t):
+    import cv2
+    cap = cv2.VideoCapture(str(path))
+    cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+    ok, frame = cap.read()
+    assert ok
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # white text on a dark box vs flat colour background
+    return int((gray[10:80, 10:260] > 235).sum())
+
+
 def test_fixture_ground_truth(tmp_path):
     p = tmp_path / "ref.mp4"
     gt = make_reference(p)
@@ -122,6 +160,9 @@ def test_fixture_ground_truth(tmp_path):
     assert gt["dissolve"] == {"start": 4.0, "end": 5.0, "center": 4.5}
     assert gt["fade_out"] == {"start": 6.0, "end": 7.0}
     assert _probe(p, "-select_streams", "a", "-show_entries", "stream=codec_type") == ["audio"]
+    assert gt["title"]["rendered"] is True
+    assert _title_pixels(p, 2.0) > 300
+    assert _title_pixels(p, 0.5) < 50 and _title_pixels(p, 3.5) < 50
 
 
 def test_fixture_no_audio(tmp_path):

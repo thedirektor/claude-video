@@ -183,7 +183,17 @@ def enforce_retention(conn, store_dir: Path, max_bytes: int | None = None,
             gb = 20.0
         max_bytes = int(gb * _GB)
     out = {"freed": 0, "media_removed": 0, "frames_removed": 0}
-    total = _tree_bytes(root)
+    cap = _breakdown_media_cap_bytes()
+
+    def _exempt(key: str) -> list[Path]:
+        vdir = video_dir(root, key)
+        if not (vdir / PINNED_MARKER).exists():
+            return []
+        return [m for m in vdir.glob("media.*") if _size(m) <= cap]
+
+    # Pinned media within its own per-video cap is outside the store budget.
+    all_keys = [r[0] for r in conn.execute("SELECT video_key FROM videos")]
+    total = _tree_bytes(root) - sum(_size(m) for k in all_keys for m in _exempt(k))
     if total <= max_bytes:
         return out
 
@@ -191,7 +201,6 @@ def enforce_retention(conn, store_dir: Path, max_bytes: int | None = None,
         "SELECT video_key FROM videos ORDER BY COALESCE(last_access, '') ASC, video_key ASC")]
     keys = [k for k in keys if k not in protect]
 
-    cap = _breakdown_media_cap_bytes()
     for key in keys:  # pass 1: media (pinned breakdown media is exempt unless over its own cap)
         if total <= max_bytes:
             return out
