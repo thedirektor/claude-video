@@ -2,7 +2,9 @@
 
 All notable changes to `/watch` are documented here.
 
-## [Unreleased] — 0.6.0 in progress
+## [0.6.0] — 2026-10-23
+
+Platform: the plugin side of durable jobs, costs, batch, central memory and integrations (service-side features — job queue, webhooks, subscriptions, `/runs/import`, n8n/Hermes/ingest wiring — live in the private service repo).
 
 ### Added
 - **Cost plan + ceiling** (`cost.py`): `--plan`, `WATCH_COST_CEILING_USD` (default 1.00) enforced before any paid call, `--allow-cost`, `WATCH_PRICES` overrides; metadata probe (falls back to the proxy when blocked).
@@ -10,6 +12,7 @@ All notable changes to `/watch` are documented here.
 - Metadata/captions fetch retries via `WATCH_YTDLP_FALLBACK_PROXY` when blocked; `run_ytdlp(capture=True)`.
 - **Central memory push** (`memory/bundle.py`, `push.py`): run bundles, `WATCH_REMOTE_URL` + `WATCH_REMOTE_TOKEN`, outbox retry, `watch.py push [--all|--retry]`; idempotent import (`origin=import`).
 - **Local MCP server** (`mcp_stdio.py`): `watch.py mcp` over stdio, no dependencies — for Claude Desktop on Windows/macOS/Linux.
+- **Visual search** (`memory/visual.py`): `search --visual` — Immich CLIP over watch albums, mapped to (video_key, t); also in the local MCP.
 - **Batch** (`playlist.py`): `watch.py batch <playlist|channel|file>` with `--limit`, `--force`, skipping indexed videos.
 
 ## [0.5.3] — 2026-10-23
