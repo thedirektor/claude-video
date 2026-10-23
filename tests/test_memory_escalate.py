@@ -90,3 +90,14 @@ def test_clamps_to_duration_and_zero(conn, tmp_path):
     extract, ocr, calls = _fakes({})
     escalate(conn, KEY, [1.0, 59.0], window=2, store_dir=sd, extract=extract, ocr=ocr)
     assert min(calls) == 0.0 and max(calls) == 60.0
+
+
+def test_unknown_duration_probes_media(conn, tmp_path):
+    record_run(conn, fake_run(segments=[seg(0, 5, "hola")]))  # duration None (local files today)
+    sd = tmp_path / "store"
+    vdir = store.video_dir(sd, KEY)
+    vdir.mkdir(parents=True)
+    (vdir / "media.mp4").write_bytes(b"fake")
+    extract, ocr, calls = _fakes({})
+    escalate(conn, KEY, [9.0], window=3, store_dir=sd, extract=extract, ocr=ocr, probe=lambda media: 10.0)
+    assert max(calls) == 10.0

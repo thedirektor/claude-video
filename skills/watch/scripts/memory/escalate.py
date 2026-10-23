@@ -50,6 +50,12 @@ def _default_ocr(paths: list[str]) -> dict:
     return ocr.run_ocr(paths)
 
 
+def _default_probe(media: str) -> float | None:
+    import frames
+
+    return frames.get_metadata(media).get("duration_seconds")
+
+
 def _significant(text: str) -> bool:
     import ocr
 
@@ -78,7 +84,7 @@ def _insert(conn, video_key: str, t: float, text: str) -> None:
 
 
 def escalate(conn, video_key: str, times: list[float], *, window: float = 5.0, budget_s: float | None = None,
-             store_dir=None, extract=None, ocr=None, clock=time.monotonic) -> int:
+             store_dir=None, extract=None, ocr=None, probe=None, clock=time.monotonic) -> int:
     added = 0
     try:
         media = _media(store_dir or memory_paths()["store_dir"], video_key)
@@ -89,6 +95,11 @@ def escalate(conn, video_key: str, times: list[float], *, window: float = 5.0, b
         budget = _budget() if budget_s is None else budget_s
         row = conn.execute("SELECT duration FROM videos WHERE video_key = ?", (video_key,)).fetchone()
         duration = row[0] if row and row[0] else None
+        if duration is None:  # local files / transcript-only runs may not record it
+            try:
+                duration = (probe or _default_probe)(str(media)) or None
+            except Exception:
+                duration = None
         start = clock()
         out_of_time = False
         with tempfile.TemporaryDirectory(prefix="watch-escalate-") as tmp:
