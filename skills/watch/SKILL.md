@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.5.0"
+version: "0.5.1"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -450,6 +450,8 @@ Query it with the `watch.py` subcommands (`video` is a video_key, a URL, or a ti
 ```bash
 python3 "${SKILL_DIR}/scripts/watch.py" search "<query>" [--video V] [--limit 8]
 python3 "${SKILL_DIR}/scripts/watch.py" ask <video> "<question>" [-k 8]      # evidence pack to answer from
+python3 "${SKILL_DIR}/scripts/watch.py" ask <video> "<question>" --answer      # short grounded answer (LLM over the evidence)
+python3 "${SKILL_DIR}/scripts/watch.py" stats                                   # answer-cache usage
 python3 "${SKILL_DIR}/scripts/watch.py" moment <video> <t> [--window 10] [--frames 4]   # t = seconds, MM:SS or H:MM:SS
 python3 "${SKILL_DIR}/scripts/watch.py" list [query] [--limit 20]
 python3 "${SKILL_DIR}/scripts/watch.py" index --backfill-paperless | --rebuild KEY | --forget KEY | --embed-missing
@@ -460,6 +462,8 @@ Exit codes for these subcommands: 0 ok, 2 error, 3 video not found, 4 ambiguous 
 Retrieval is hybrid: 0.45 BM25 + 0.55 cosine (each min-max normalised per query), top-k 8, one video or all. Without the optional `fastembed` dependency the index is full-text only (said once on stderr).
 
 **Citation rule (mandatory).** Answer only with timestamps present in the evidence (`evidence[].timestamp`); never estimate or invent a timestamp. If the evidence does not contain the answer, say it was not found in the video.
+
+**Grounded answers (`ask --answer`).** In this skill *you* answer from the evidence pack (plain `ask`); `--answer` is for callers that want text (scripts, agents without an LLM — the MCP `ask` tool uses it by default). It scores confidence (`high|medium|low`); on `low` it first tries a model-free escalation (re-samples 1 frame/s around the best hits at 2x width and re-OCRs them, writing new text back; only when the video's media is in the store, bounded by `WATCH_ESCALATE_BUDGET_S`, default 45 s), and if still low replies `No encontré esto en el video.` with the 3 nearest moments — no LLM call. Otherwise a cheap LLM answers over numbered evidence and must cite `[E#]`; the server swaps each id for that evidence row's timestamp and strips any other time the model wrote. Answers are cached per video and evidence version (exact or near-identical question). LLM chain `WATCH_LLM_CHAIN` (default `headroom,gemini,openrouter`; headroom needs `WATCH_LLM_API_KEY`, `WATCH_LLM_BASE_URL`, `WATCH_LLM_MODEL`; Gemini uses `GEMINI_API_KEY` + `WATCH_LLM_GEMINI_MODEL`; OpenRouter `OPENROUTER_API_KEY` + `WATCH_LLM_OPENROUTER_MODEL`); when none answers you get the evidence only.
 
 Settings (env or `~/.config/watch/.env`):
 - `WATCH_INDEX_DB` (default `~/.local/share/watch/index.db`) - SQLite index, WAL. Rows are never evicted.

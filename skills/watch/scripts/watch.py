@@ -510,7 +510,7 @@ def _run_openrouter_backend(args, work: Path) -> int:
     return 0
 
 
-MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index"}
+MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index", "stats"}
 
 
 def main() -> int:

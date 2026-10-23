@@ -13,7 +13,8 @@ import sys
 
 import identity
 from config import memory_paths
-from memory import embeddings, index, retrieval
+from memory import answer as answer_mod
+from memory import answers, embeddings, index, retrieval
 
 COMMANDS = ("search", "ask", "moment", "list", "index")
 EXIT_NOT_FOUND = 3
@@ -54,7 +55,43 @@ def _cmd_search(conn, a) -> int:
     return 0
 
 
+def _cmd_answer(conn, a) -> int:
+    r = answer_mod.answer(conn, a.video, a.question, k=a.k, embedder=_embedder())
+    if a.json:
+        _json(r)
+        return 0
+    v = r["video"]
+    _out(r["answer"] if r["answer"] is not None else f"({r.get('note', 'no answer')})")
+    _out("")
+    c = r["confidence"]
+    _out(f"Confidence: {c['level']} ({c['value']})" + ("  [cached]" if r["cached"] else "")
+         + (f"  [escalated +{r['escalated']}]" if r["escalated"] else ""))
+    cited = {x["id"] for x in r["citations"]}
+    for e in r["evidence"]:
+        if e["id"] in cited:
+            _out(f"[{e['id']} {e['timestamp'] or '--:--'} {e['kind']}] {e['text']}")
+    for n in r.get("nearest") or []:
+        _out(f"nearest: [{n['timestamp'] or '--:--'} {n['kind']}] {n['snippet']}")
+    _out(f"Video: {v['title'] or v['video_key']} `{v['video_key']}`"
+         + (f" — {r['provider']}/{r['model']}" if r["provider"] else ""))
+    return 0
+
+
+def _cmd_stats(conn, a) -> int:
+    s = answers.stats(conn)
+    if a.json:
+        _json(s)
+        return 0
+    _out(f"answers cached: {s['answers']}  cache hits: {s['cache_hits']}  "
+         f"tokens used: {s['tokens_used']}  tokens saved: {s['tokens_saved']}")
+    for p, n in s["by_provider"].items():
+        _out(f"- {p}: {n}")
+    return 0
+
+
 def _cmd_ask(conn, a) -> int:
+    if a.answer:
+        return _cmd_answer(conn, a)
     pack = retrieval.ask(conn, a.video, a.question, k=a.k, embedder=_embedder())
     if a.json:
         _json(pack)
@@ -181,6 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("video")
     s.add_argument("question")
     s.add_argument("-k", type=int, default=8)
+    s.add_argument("--answer", action="store_true",
+                   help="write a short grounded answer (LLM over the evidence; cites only evidence timestamps)")
     s = add("moment", "everything stored around a timestamp")
     s.add_argument("video")
     s.add_argument("t", help="seconds, MM:SS or H:MM:SS")
@@ -195,10 +234,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--rebuild", metavar="KEY")
     g.add_argument("--forget", metavar="KEY")
     g.add_argument("--embed-missing", action="store_true")
+    add("stats", "answer-cache usage (answers, cache hits, tokens used / saved)")
     return p
 
 
-_HANDLERS = {"search": _cmd_search, "ask": _cmd_ask, "moment": _cmd_moment, "list": _cmd_list, "index": _cmd_index}
+_HANDLERS = {"search": _cmd_search, "ask": _cmd_ask, "moment": _cmd_moment, "list": _cmd_list, "index": _cmd_index,
+             "stats": _cmd_stats}
 
 
 def main(argv: list[str]) -> int:

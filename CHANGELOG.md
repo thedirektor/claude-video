@@ -2,6 +2,17 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.5.1] — 2026-10-23
+
+Grounded answers over the video memory.
+
+### Added
+- **`ask --answer`** (`memory/answer.py`): confidence (`high|medium|low` from top-hit strength — raw cosine or question-word coverage —, margin and cross-modal agreement), refusal floor (`No encontré esto en el video.` + 3 nearest moments, no LLM call), LLM answer over numbered evidence with a citation guard (only `[E#]` ids survive, rendered with the evidence row's timestamp; every other time string is stripped; no valid citation → not found).
+- **Model-free escalation** (`memory/escalate.py`): on low confidence and stored media, 1 fps re-sample at 2048 px + re-OCR around the best hits; new text written back as `escalated` frames/OCR, evidence_version bumped; each time attempted once; `WATCH_ESCALATE_BUDGET_S` (45).
+- **Answer cache** (schema v2 `answers`): exact normalised question, then cosine ≥ 0.92, per (video_key, evidence_version); `watch.py stats` reports answers, cache hits, tokens used/saved.
+- **LLM chain** (`memory/llm.py`): `WATCH_LLM_CHAIN` = headroom (needs `WATCH_LLM_API_KEY`) → Gemini → OpenRouter; evidence-only when none answers. Never raises.
+- Evidence items carry `cos` (raw cosine) for confidence.
+
 ## [0.5.0] — 2026-10-23
 
 Video memory: every run is indexed, stored and queryable.
