@@ -1,7 +1,7 @@
 ---
 name: watch-recall
-version: "0.4.5"
-description: Retrieve a previously saved /watch report by topic or title so this session can read, see, or learn from a video watched in an earlier session — without re-watching it. Full-text-searches the Paperless-ngx library (report transcript + OCR), falls back to matching Nextcloud folder titles, and points at the Immich album for frames.
+version: "0.5.0"
+description: Retrieve a previously saved /watch report by topic or title so this session can read, see, or learn from a video watched in an earlier session — without re-watching it. Searches the local video-memory index first (transcript, OCR and notes with timestamps), then full-text-searches the Paperless-ngx library (report transcript + OCR), falls back to matching Nextcloud folder titles, and points at the Immich album for frames.
 argument-hint: "<topic-or-title>"
 allowed-tools: Bash, Read
 ---
@@ -45,6 +45,7 @@ Flags:
 
 ## Retrieval order (what the script does)
 
+0. **Local video-memory index** (`WATCH_INDEX_DB`) - hybrid search over transcript / OCR / notes of every video watched with 0.5.0+. Answers carry stored timestamps: cite only timestamps that appear in the output, never estimate one; if nothing answers, say it was not found. For precise Q&A use `watch.py ask|moment|search` (see the `watch` skill, "Video memory"). A missing or broken index silently falls through to step 1.
 1. **Paperless-ngx full-text search** (`GET /api/documents/?query=…`) — finds reports by topic even when you don't know the title, then fetches each match's full `content`. Needs `PAPERLESS_TOKEN` in `~/.config/watch/.env`.
 2. **Nextcloud folder-title match** (fallback) — when Paperless is unconfigured, returns nothing, or its search index is stale, it lists `Watch/` and matches the query against folder names, then reads each `report.md`. Needs `NEXTCLOUD_PASS`.
 

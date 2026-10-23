@@ -257,6 +257,20 @@ Other knobs (passed to `scripts/watch.py`):
 **OCR**
 - `--no-ocr` — skip the Tesseract OCR pass (default `spa+eng`) and the hi-res re-extract it triggers on text-heavy frames.
 
+## Video memory (0.5.0)
+
+Every run is indexed (SQLite FTS + optional multilingual embeddings) and stored under `~/.local/share/watch/`, so you can query videos you already watched without re-watching:
+
+```
+python3 skills/watch/scripts/watch.py search "bevel modifier"
+python3 skills/watch/scripts/watch.py ask yt:dQw4w9WgXcQ "what tools does she mention?"
+python3 skills/watch/scripts/watch.py moment yt:dQw4w9WgXcQ 2:15 --window 10
+python3 skills/watch/scripts/watch.py list
+python3 skills/watch/scripts/watch.py index --backfill-paperless   # also --rebuild/--forget KEY, --embed-missing
+```
+
+Answers cite only timestamps present in the evidence. Embeddings need the optional `fastembed` package; without it search is full-text only. Opt out per run with `--no-index`; tune with `WATCH_INDEX_DB`, `WATCH_STORE_DIR`, `WATCH_MODEL_DIR`, `WATCH_EMBEDDINGS`, `WATCH_STORE_MAX_GB` (default 20), `WATCH_STORE_MEDIA_MAX_MB` (300), `WATCH_QDRANT_INBOX`. See the `watch` skill's "Video memory" section.
+
 ## Limits
 
 - **Long-video accuracy depends on the detail mode.** On the capped modes (`efficient`, default `balanced`) coverage thins out past ~10 minutes — the frame cap spreads across the whole clip, so the script prints a "sparse scan" warning and you're better off re-running focused with `--start`/`--end`. `token-burner` lifts the cap and keeps *every* scene-change frame across the full video, so it stays complete on longer clips at the cost of more image tokens. The 10-minute mark is guidance for the capped modes, not a hard ceiling.

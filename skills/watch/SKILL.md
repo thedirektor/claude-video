@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.4.7"
+version: "0.5.0"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -423,7 +423,7 @@ Artifacts are routed by content type, split by who consumes them:
 
 The video itself is only uploaded when a real download happened — it's skipped for TranscriptAPI-only YouTube runs and for `--detail transcript`. A transcript-only run simply uploads `report.md` to Nextcloud + Paperless and does nothing on Immich.
 
-**Reading it back later.** The `/watch-recall <topic-or-title>` command is the read side of this library: from any later session it full-text-searches Paperless (falling back to Nextcloud folder titles) and returns the saved `report.md` so an agent can learn from a video it never watched, pointing at the Immich album when frames are actually needed. See the `watch-recall` skill.
+**Reading it back later.** The `/watch-recall <topic-or-title>` command is the read side of this library: from any later session it searches the local video-memory index first (see "Video memory"), then full-text-searches Paperless (falling back to Nextcloud folder titles) and returns the saved `report.md` so an agent can learn from a video it never watched, pointing at the Immich album when frames are actually needed. See the `watch-recall` skill.
 
 **Representative frame cap.** The library uploads a further-reduced subset of frames, not the full extracted set, so Immich isn't flooded with every sampled frame — `WATCH_SAVE_FRAME_CAP` (default **20**, `0` = upload all). Selection priority: OCR-significant frames first (on-screen text — critical for tutorials/code/debugging), then transcript-cue frames, then scene-representative frames, then even time-spacing fill if still under the cap.
 
@@ -438,6 +438,38 @@ The video itself is only uploaded when a real download happened — it's skipped
 `setup.py --json` reports which targets are configured under `library_targets` (e.g. `["immich"]`, `["nextcloud"]`, `["paperless"]`, any combination, or `[]`) — like TranscriptAPI, this is informational only and never gates `can_proceed`; an unconfigured or partially configured library is not an error.
 
 After the report is printed (and written to `work/report.md`), the script prints one `[watch] …` line per attempted target to **stderr** — naming the Immich album / Nextcloud folder / Paperless document the run landed in, or the reason a target was skipped (e.g. `[watch] Immich: skipped (no IMMICH_API_KEY)`, `[watch] Paperless: skipped (no PAPERLESS_TOKEN)`). This is separate from the report itself; it doesn't appear in `report.md` or on stdout.
+
+## Video memory (index + store)
+
+Every `/watch` run also writes to a local, searchable **video memory**, so a later session can ask "where did they say X?" without re-watching. One video = one merged evidence set, keyed by `video_key` (`yt:<id>`, `<extractor>:<id>`, `url:<hash>`, `file:<hash>`). Transcripts are replaced only by a better source (AssemblyAI-diarized > Whisper > TranscriptAPI > captions); frames/OCR are unioned; notes append. Every backend writes memory: the Gemini and OpenRouter backends index their answer as a note plus free captions only (no TranscriptAPI call, no extra paid transcript call). Writes are best-effort and never fail a run.
+
+Run flags: `--no-index` skips memory for this run (`--no-save` skips the library and Qdrant but still indexes); `--save` archives a gemini/openrouter or ingest-transcript run to the library (they do not archive by default; `--no-save` / `WATCH_NO_SAVE` still win); `--origin skill|service|ingest|import|backfill` records who started the run (default `skill`).
+
+Query it with the `watch.py` subcommands (`video` is a video_key, a URL, or a title fragment; add `--json` for machine output):
+
+```bash
+python3 "${SKILL_DIR}/scripts/watch.py" search "<query>" [--video V] [--limit 8]
+python3 "${SKILL_DIR}/scripts/watch.py" ask <video> "<question>" [-k 8]      # evidence pack to answer from
+python3 "${SKILL_DIR}/scripts/watch.py" moment <video> <t> [--window 10] [--frames 4]   # t = seconds, MM:SS or H:MM:SS
+python3 "${SKILL_DIR}/scripts/watch.py" list [query] [--limit 20]
+python3 "${SKILL_DIR}/scripts/watch.py" index --backfill-paperless | --rebuild KEY | --forget KEY | --embed-missing
+```
+
+Retrieval is hybrid: 0.45 BM25 + 0.55 cosine (each min-max normalised per query), top-k 8, one video or all. Without the optional `fastembed` dependency the index is full-text only (said once on stderr).
+
+**Citation rule (mandatory).** Answer only with timestamps present in the evidence (`evidence[].timestamp`); never estimate or invent a timestamp. If the evidence does not contain the answer, say it was not found in the video.
+
+Settings (env or `~/.config/watch/.env`):
+- `WATCH_INDEX_DB` (default `~/.local/share/watch/index.db`) - SQLite index, WAL. Rows are never evicted.
+- `WATCH_STORE_DIR` (default `~/.local/share/watch/store`) - per-video dir: `report.md`, transcript/OCR/notes JSON, `frames/`, `meta.json`.
+- `WATCH_MODEL_DIR` (default `~/.local/share/watch/models`) - fastembed model cache (`paraphrase-multilingual-MiniLM-L12-v2`, 384-d).
+- `WATCH_EMBEDDINGS` (default `1`; `0` = full-text only).
+- `WATCH_STORE_MAX_GB` (default `20`) - LRU retention by last access; media evicted first, then frames.
+- `WATCH_STORE_MEDIA_MAX_MB` (default `300`) and `WATCH_STORE_KEEP_MEDIA=1` - keep the downloaded media if under the cap / always.
+- `WATCH_QDRANT_INBOX` (unset = off) - directory where each run's report is handed off for Qdrant ingestion.
+- `WATCH_CONFIG_FILE` - point every loader at a different config file.
+
+Archived report frame lines now link to their Immich assets, and a Paperless upload's task id is resolved to its document id.
 
 ## Failure modes and handling
 

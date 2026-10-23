@@ -2,6 +2,25 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.5.0] — 2026-10-23
+
+Video memory: every run is indexed, stored and queryable.
+
+### Added
+- **Identity.** `identity.video_key` (`yt:<id>`, `<extractor>:<id>` from info-json, `url:<hash>`, `file:<hash>`) and Windows-safe, collision-safe `store_dirname`; IPv6/default-port URL canonicalisation.
+- **`memory/` package.** SQLite index (WAL, schema v1) with runs, merge rules (better transcript source wins, frames/OCR unioned by pHash/timestamp, notes append) and FTS; persistent store with LRU retention (`WATCH_STORE_MAX_GB`, media cap) and Qdrant inbox hand-off; speaker-aware transcript chunking; optional fastembed embeddings (multilingual MiniLM, 384-d, lazy import, FTS-only fallback); hybrid retrieval (0.45 BM25 + 0.55 cosine, OCR duplicate collapse); `resolve`/`ask`/`moment`/`list` evidence packs that cite only stored timestamps; `writer.remember`.
+- **Every backend writes memory.** Claude, Gemini and OpenRouter runs are indexed; Gemini/OpenRouter add their answer as a note plus free captions only (no TranscriptAPI, no extra paid transcript call). Never fails a run.
+- **Flags.** `--save` (archive gemini/openrouter/ingest-transcript runs), `--no-index`, `--origin skill|service|ingest|import|backfill`. `--no-save` still indexes.
+- **CLI subcommands.** `watch.py search | ask | moment | list | index` (`--backfill-paperless`, `--rebuild KEY`, `--forget KEY`, `--embed-missing`), all with `--json`.
+- **`/watch-recall` searches the index first**, then Paperless, then Nextcloud.
+- **Immich links** in archived report frame lines (t_ms-keyed refs); Paperless task id resolved to document id.
+- **Config.** `WATCH_CONFIG_FILE` override; new settings `WATCH_INDEX_DB`, `WATCH_STORE_DIR`, `WATCH_MODEL_DIR`, `WATCH_EMBEDDINGS`, `WATCH_QDRANT_INBOX`, `WATCH_STORE_MAX_GB` (20), `WATCH_STORE_MEDIA_MAX_MB` (300), `WATCH_STORE_KEEP_MEDIA`.
+- **Docs.** SKILL.md "Video memory" section with the rule: cite only evidence timestamps, never invent one.
+
+### Fixed / minors closed
+- Generic-extractor video keys and store dirname collisions; range-run clipping and empty-transcript guard in the index; boundary-correct chunk folding; hostile-query safety and embedder-failure fallback; race-safe `embed_pending`; `moment` rejects bad timestamps cleanly; backfill keeps report ranges and full source paths; atomic rebuild; CLI hardening; subprocess tests isolated from the real config.
+- BACKLOG: "Report frame lines don't link to Immich" done; bundle save/load superseded by the store.
+
 ## [0.4.7] — 2026-10-23
 
 ### Added
