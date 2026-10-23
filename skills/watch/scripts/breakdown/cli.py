@@ -15,7 +15,7 @@ import cost
 from config import memory_paths
 from memory import index, retrieval
 
-from . import assemble
+from . import assemble, interchange
 
 EXIT_NOT_FOUND = 3
 EXIT_AMBIGUOUS = 4
@@ -67,8 +67,7 @@ def _cmd_breakdown(argv: list[str]) -> int:
         if formats:
             written = assemble.write_timelines(bd, out_dir, formats)
             if not written:
-                print("[watch] timeline writers are not available yet; no timeline files written",
-                      file=sys.stderr)
+                print(f"[watch] no timeline files written: {interchange.skip_reason(bd)}", file=sys.stderr)
     finally:
         conn.close()
     if a.json:

@@ -556,10 +556,12 @@ def store(conn, video_key: str, bd: dict, store_dir=None) -> Path:
     return out_dir
 
 
-# --------------------------------------------------------------------------- timelines (Task 7)
+# --------------------------------------------------------------------------- timelines
 
 def write_timelines(bd: dict, out_dir: Path, formats: list[str]) -> list[Path]:
-    """Hook for Task 7: write ``timeline.<fmt>`` for each of ``formats`` into ``out_dir``.
+    """Write ``timeline.<fmt>`` for each of ``formats`` into ``out_dir`` (OTIO / FCPXML / EDL).
 
-    Not implemented yet: returns no files."""
-    return []
+    Returns no files when the breakdown has no determined shots (see ``interchange.skip_reason``)."""
+    from . import interchange
+
+    return interchange.write_timelines(bd, out_dir, formats)
