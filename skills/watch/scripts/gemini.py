@@ -288,27 +288,41 @@ TRANSCRIPT_PROMPT = (
     "one line per sentence, covering the entire video to the end. No commentary."
 )
 
-_TS_LINE = re.compile(r"^\s*\[(\d{1,2}:)?\d{1,2}:\d{2}\]\s*(.+)$")
-_TS_BRACKET = re.compile(r"\[([\d:]+)\]")
+_TS = r"(?:\d{1,2}:)?\d{1,2}:\d{2}"
+# Optional "- " / "* " bullet, optional ** bold, [start] or [start - end] range.
+_TS_LINE = re.compile(
+    rf"^\s*(?:[-*]\s+)?(?:\*\*)?\[({_TS})(?:\s*[-\u2013]\s*{_TS})?\](?:\*\*)?\s*(.+)$"
+)
 _LAST_SEGMENT_SECONDS = 5.0
+# Plausibility guard: human speech tops out well under this; a denser transcript
+# means the model compressed its timestamps (seen with LOW media resolution).
+_MAX_PLAUSIBLE_WPM = 250.0
+_DURATION_SLACK = 1.05
+TRANSCRIPT_MAX_OUTPUT_TOKENS = 65536
+_MEDIA_RESOLUTIONS = {
+    "low": "MEDIA_RESOLUTION_LOW",
+    "medium": "MEDIA_RESOLUTION_MEDIUM",
+    "high": "MEDIA_RESOLUTION_HIGH",
+}
+DEFAULT_TRANSCRIPT_MEDIA_RESOLUTION: str | None = "low"
 
 
 def parse_timestamped_lines(text: str) -> list[dict]:
     """Parse `[MM:SS] text` / `[H:MM:SS] text` lines into transcript segments.
 
-    Non-matching lines are ignored. A line whose start is earlier than the
-    previous kept start is dropped; a line with the
-    same start is merged into the previous segment's text.
-    Each `end` is the next segment's `start`; the last is `start + 5.0`.
+    Also accepts a leading `- ` / `* ` bullet, `**` bold around the bracket,
+    and `[start - end]` ranges (the start is used). Non-matching lines are
+    ignored. A line whose start is earlier than the previous kept start is
+    dropped; a line with the same start is merged into the previous segment's
+    text. Each `end` is the next segment's `start`; the last is `start + 5.0`.
     """
     segs: list[dict] = []
     for line in (text or "").splitlines():
         m = _TS_LINE.match(line)
         if not m:
             continue
-        stamp = _TS_BRACKET.search(line).group(1)
         start = 0.0
-        for part in stamp.split(":"):
+        for part in m.group(1).split(":"):
             start = start * 60 + int(part)
         body = m.group(2).strip()
         if not body:
@@ -326,17 +340,36 @@ def parse_timestamped_lines(text: str) -> list[dict]:
     return segs
 
 
+def _implausible_reason(segments: list[dict], duration: float | None) -> str | None:
+    """Why these model timestamps look compressed/invented, or None if plausible."""
+    last = segments[-1]["start"]
+    if duration and duration > 0 and last > duration * _DURATION_SLACK:
+        return f"last timestamp {last:.0f}s is past the video duration {duration:.0f}s"
+    span = last - segments[0]["start"]
+    if span > 0:
+        words = sum(len(s["text"].split()) for s in segments)
+        wpm = words / (span / 60.0)
+        if wpm > _MAX_PLAUSIBLE_WPM:
+            return f"{wpm:.0f} words/min over {span:.0f}s"
+    return None
+
+
 def transcribe_youtube(
     url: str,
     model_name: str = DEFAULT_MODEL,
     api_key: str | None = None,
     client=None,
-) -> tuple[list[dict], str] | None:
+    duration: float | None = None,
+    media_resolution: str | None = DEFAULT_TRANSCRIPT_MEDIA_RESOLUTION,
+) -> tuple[list[dict], str, bool] | None:
     """Transcribe a YouTube video by handing its URL to Gemini (server-side fetch).
 
-    Never raises: returns (segments, model_name), or None on a missing SDK/key,
-    client/API error, blocked/empty reply, or a reply with no timestamped lines.
-    A MAX_TOKENS finish keeps the partial segments.
+    Never raises: returns (segments, model_name, approximate), or None on a
+    missing SDK/key, client/API error, blocked/empty reply, or a reply with no
+    timestamped lines. A MAX_TOKENS finish keeps the partial segments.
+    ``approximate`` is True when the timestamps fail the plausibility guard
+    (> 250 words/min, or the last start is past ``duration`` * 1.05).
+    ``media_resolution`` is "low"/"medium"/"high", or None for the API default.
     """
     try:
         from google.genai import types
@@ -362,12 +395,18 @@ def transcribe_youtube(
                 ],
             )
         ]
+        config_kwargs: dict = {
+            "temperature": 0,
+            "max_output_tokens": TRANSCRIPT_MAX_OUTPUT_TOKENS,
+        }
+        if media_resolution:
+            config_kwargs["media_resolution"] = getattr(
+                types.MediaResolution, _MEDIA_RESOLUTIONS[media_resolution.lower()]
+            )
         response = client.models.generate_content(
             model=model_name,
             contents=contents,
-            config=types.GenerateContentConfig(
-                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW
-            ),
+            config=types.GenerateContentConfig(**config_kwargs),
         )
         try:
             finish = str(getattr(response.candidates[0], "finish_reason", "") or "")
@@ -378,8 +417,22 @@ def transcribe_youtube(
                 "[watch] Gemini hit MAX_TOKENS — transcript may be truncated",
                 file=sys.stderr,
             )
-        segments = parse_timestamped_lines(getattr(response, "text", None) or "")
-        return (segments, model_name) if segments else None
+        text = getattr(response, "text", None) or ""
+        segments = parse_timestamped_lines(text)
+        if not segments:
+            if text.strip():
+                print(
+                    f"[watch] Gemini transcript reply had no timestamped lines: {text.strip()[:80]!r}",
+                    file=sys.stderr,
+                )
+            return None
+        reason = _implausible_reason(segments, duration)
+        if reason:
+            print(
+                f"[watch] Gemini timestamps look approximate ({reason})",
+                file=sys.stderr,
+            )
+        return segments, model_name, reason is not None
     except Exception as exc:  # never raise: callers fall through the chain
         print(
             f"[watch] Gemini transcript failed: {type(exc).__name__}: {exc}",

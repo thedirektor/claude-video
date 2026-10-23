@@ -21,11 +21,12 @@ def _setup(monkeypatch, subtitle_path=None):
                         lambda *a, **k: {"video_path": None, "subtitle_path": subtitle_path,
                                          "info": {"title": "T", "duration": 30}, "downloaded": False})
     monkeypatch.setattr(watch.transcriptapi, "load_api_key", lambda: None)
-    calls = {"gemini": 0, "download": 0}
+    calls = {"gemini": 0, "download": 0, "args": [], "approx": False}
 
     def fake_gemini(url, *a, **k):
         calls["gemini"] += 1
-        return (list(SEGS), "gemini-test")
+        calls["args"].append((url, k))
+        return (list(SEGS), "gemini-test", calls["approx"])
 
     def fake_download(*a, **k):
         calls["download"] += 1
@@ -91,3 +92,32 @@ def test_env_disables_gemini(monkeypatch, tmp_path, val):
     _argv(monkeypatch, tmp_path)
     assert watch.main() == 0
     assert calls["gemini"] == 0
+
+
+def test_gemini_gets_canonical_url_and_duration(monkeypatch, tmp_path):
+    calls = _setup(monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["watch.py", "https://youtu.be/m0Jk8aIDiJ8?si=track",
+                                      "--detail", "transcript", "--no-whisper",
+                                      "--out-dir", str(tmp_path)])
+    assert watch.main() == 0
+    url, kwargs = calls["args"][0]
+    assert url == YT
+    assert kwargs.get("duration") == 30
+
+
+def test_approximate_label_and_header(monkeypatch, tmp_path, capsys):
+    calls = _setup(monkeypatch)
+    calls["approx"] = True
+    _argv(monkeypatch, tmp_path)
+    assert watch.main() == 0
+    out = capsys.readouterr().out
+    assert "gemini (gemini-test, approximate timestamps)" in out
+    assert "Timestamps are model-generated and approximate" in out
+
+
+def test_exact_label_has_no_approx_header(monkeypatch, tmp_path, capsys):
+    _setup(monkeypatch)
+    _argv(monkeypatch, tmp_path)
+    assert watch.main() == 0
+    out = capsys.readouterr().out
+    assert "approximate" not in out

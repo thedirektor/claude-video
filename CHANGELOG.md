@@ -11,6 +11,25 @@ All notable changes to `/watch` are documented here.
   `--no-gemini-transcript` or `WATCH_GEMINI_TRANSCRIPT=0`. Why: datacenter IP
   blocks on yt-dlp and TranscriptAPI credit exhaustion.
 
+### Fixed (final review)
+- **Timestamp plausibility guard.** `transcribe_youtube` now returns
+  `(segments, model, approximate)`; > 250 words/min over the first→last span,
+  or a last start past the known duration × 1.05, logs one stderr line and
+  labels the source `gemini (model, approximate timestamps)` with a report note
+  "Timestamps are model-generated and approximate". `watch.py` passes the
+  info-json duration and the canonical URL.
+- **Deterministic request.** `temperature=0`, `max_output_tokens=65536`
+  (`gemini-3.1-flash-lite`'s `output_token_limit`). Media resolution stays
+  `LOW`: live A/B on XUqrvbsTfck (talk ends ≈19:40) gave identical results for
+  LOW and the API default — 156 segments, last start 19:40, 2953 words,
+  154.7 wpm — so the cheaper LOW is kept.
+- **Parser** accepts `- ` / `* ` bullets, `**` bold around the bracket and
+  `[start - end]` ranges; an unparseable non-empty reply logs its first 80 chars.
+- `--no-whisper` help notes Gemini still runs for YouTube.
+- **Service** (`/opt/watch`): `transcribe` returns the full `transcript_source`
+  label (nested parens no longer truncated); `watch`/`transcribe` MCP tools take
+  `no_gemini_transcript`; `transcribe` docstring lists the real chain.
+
 ## [0.4.6] — 2026-10-22
 
 ### Added

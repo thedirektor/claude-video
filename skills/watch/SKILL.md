@@ -297,7 +297,7 @@ Behavior:
 
 ## YouTube transcripts (TranscriptAPI)
 
-For **YouTube URLs**, `/watch` resolves the transcript in this order: **TranscriptAPI → yt-dlp captions → Gemini (URL) → Whisper**. TranscriptAPI (`transcriptapi.com`) runs the extraction on its own servers, so it clears YouTube's "confirm you're not a bot" / PO-token / nsig walls that block yt-dlp from datacenter/VPS IPs — with **zero Whisper spend** and no video download for `--detail transcript`. Set `TRANSCRIPTAPI_API_KEY` in `~/.config/watch/.env` (1 credit per transcript; video metadata is free). Language preference follows `--sub-lang` (default Spanish→English→auto). Pass `--no-transcriptapi` to force the yt-dlp path. If both miss, Gemini transcribes the video straight from its URL (needs `GEMINI_API_KEY`; Google fetches the video, so datacenter-IP blocks don't apply) and the run reports `via gemini (model)`; opt out with `--no-gemini-transcript` or `WATCH_GEMINI_TRANSCRIPT=0`. YouTube *frames* still require the (often gated) video download — these backends cover the transcript only.
+For **YouTube URLs**, `/watch` resolves the transcript in this order: **TranscriptAPI → yt-dlp captions → Gemini (URL) → Whisper**. TranscriptAPI (`transcriptapi.com`) runs the extraction on its own servers, so it clears YouTube's "confirm you're not a bot" / PO-token / nsig walls that block yt-dlp from datacenter/VPS IPs — with **zero Whisper spend** and no video download for `--detail transcript`. Set `TRANSCRIPTAPI_API_KEY` in `~/.config/watch/.env` (1 credit per transcript; video metadata is free). Language preference follows `--sub-lang` (default Spanish→English→auto). Pass `--no-transcriptapi` to force the yt-dlp path. If both miss, Gemini transcribes the video straight from its URL (needs `GEMINI_API_KEY`; Google fetches the video, so datacenter-IP blocks don't apply) and the run reports `via gemini (model)`; opt out with `--no-gemini-transcript` or `WATCH_GEMINI_TRANSCRIPT=0`. The Gemini transcript is always in the video's original language and always uses the default `gemini-3.1-flash-lite` model (it ignores `--sub-lang` and `--gemini-model`); its timestamps are model-generated, and a transcript that fails the plausibility check (> 250 words/min, or ending past the video's duration) is labelled `approximate timestamps`. `--no-whisper` does not disable it. YouTube *frames* still require the (often gated) video download — these backends cover the transcript only.
 
 ## Transcription
 
@@ -318,7 +318,7 @@ Because the transcript now fully resolves before any frame is extracted — for 
 
 The report header shows the backend used:
 - `via transcriptapi (lang)` — YouTube-only; fetched from TranscriptAPI before yt-dlp captions were attempted (see "YouTube transcripts (TranscriptAPI)" above)
-- `via gemini (model)` — YouTube-only; TranscriptAPI and captions both missed, so Gemini transcribed from the URL
+- `via gemini (model)` — YouTube-only; TranscriptAPI and captions both missed, so Gemini transcribed from the URL; `via gemini (model, approximate timestamps)` adds a report note that the timestamps are model-generated and approximate
 - `via captions` — yt-dlp pulled native subs
 - `via whisper (local, large-v3)` — local GPU
 - `via whisper (groq)` / `via whisper (openai)` — API

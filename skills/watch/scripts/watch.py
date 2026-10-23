@@ -41,6 +41,7 @@ from frames import (  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 import transcriptapi  # noqa: E402
 import gemini  # noqa: E402
+import identity  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
 from scenes import DEFAULT_THRESHOLD, detect_scenes  # noqa: E402
 from speech import DEFAULT_SPEECH_SHARE, compute_speech_windows, format_windows, two_pass_sample  # noqa: E402
@@ -376,7 +377,9 @@ def main() -> int:
     ap.add_argument(
         "--no-whisper",
         action="store_true",
-        help="Disable Whisper fallback. Report frames-only if no captions available.",
+        help="Disable Whisper fallback. Report frames-only if no captions available. "
+        "The Gemini URL transcript still runs for YouTube (disable it with "
+        "--no-gemini-transcript).",
     )
     ap.add_argument(
         "--no-transcriptapi",
@@ -594,11 +597,18 @@ def main() -> int:
             and audio_override is None
             and transcriptapi.is_youtube_url(args.source)
         ):
-            gm_result = gemini.transcribe_youtube(args.source)
+            _gm_duration = (dl.get("info") or {}).get("duration") or None
+            gm_result = gemini.transcribe_youtube(
+                identity.canonical_source(args.source), duration=_gm_duration
+            )
             if gm_result is not None:
-                transcript_segments, _gm_model = gm_result
+                transcript_segments, _gm_model, _gm_approx = gm_result
                 transcript_text = format_transcript(transcript_segments)
-                transcript_source = f"gemini ({_gm_model})"
+                transcript_source = (
+                    f"gemini ({_gm_model}, approximate timestamps)"
+                    if _gm_approx
+                    else f"gemini ({_gm_model})"
+                )
 
     # Persist a pre-download transcript (TranscriptAPI / captions) now, so a later
     # gated video-download failure doesn't discard it and a resume reuses it without
@@ -999,6 +1009,8 @@ def main() -> int:
             f"- **Transcript:** {len(transcript_segments)} segments{in_range} "
             f"(via {transcript_source or 'captions'})"
         )
+        if "approximate timestamps" in (transcript_source or ""):
+            emit("- **Note:** Timestamps are model-generated and approximate")
         if use_two_pass and speech_windows:
             speech_total = sum(e - s for s, e in speech_windows)
             denom = effective_duration if focused else full_duration
