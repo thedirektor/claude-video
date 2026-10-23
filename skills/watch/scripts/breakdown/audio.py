@@ -22,6 +22,9 @@ MIN_SECONDS = 3.0
 CHUNK_FRAMES = 8192
 PRIOR_BPM = 120.0
 OFFBEAT_RATIO = 0.6
+AMBIG_LOW = 0.35  # off/on ratio between this and OFFBEAT_RATIO cannot separate the octaves
+AMBIG_BPM = (80.0, 100.0)  # where a double-time reading (160-200) is also musically plausible
+AMBIG_CONF = 0.5
 SUPPORT_REL = 0.3
 STABILITY_MIN_S = 4.0
 STABILITY_TOL = 0.06
@@ -171,11 +174,11 @@ def _best_phase(e, period: float, np):
     return best_phase
 
 
-def _resolve_octave(env, hop_s: float, bpm: float, np) -> float:
-    """Half-time guard: if the slots midway between beats carry onsets nearly as strong as the
-    beats themselves (a backbeat), the true pulse is twice as fast."""
+def _resolve_octave(env, hop_s: float, bpm: float, np):
+    """Half-time guard. Returns ``(bpm, alt)``: ``alt`` is the other octave when the evidence
+    cannot separate them (slots midway between beats carry onsets of middling strength)."""
     if bpm * 2 > BPM_MAX:
-        return bpm
+        return bpm, None
     e = np.maximum(env - np.median(env), 0)
     period = 60.0 / bpm / hop_s
     win = max(1, int(round(period * 0.08)))
@@ -184,54 +187,105 @@ def _resolve_octave(env, hop_s: float, bpm: float, np) -> float:
     off = _slot_peaks(e, ph + period / 2, period, win, np)
     m = min(len(on), len(off))
     if m < 4:
-        return bpm
+        return bpm, None
     on_m, off_m = float(np.median(on[:m])), float(np.median(off[:m]))
-    return bpm * 2 if on_m > 0 and off_m >= OFFBEAT_RATIO * on_m else bpm
+    if on_m <= 0:
+        return bpm, None
+    ratio = off_m / on_m
+    if ratio >= OFFBEAT_RATIO:
+        return bpm * 2, None
+    if ratio >= AMBIG_LOW and AMBIG_BPM[0] <= bpm <= AMBIG_BPM[1]:
+        return bpm, bpm * 2
+    return bpm, None
+
+
+def _fold_score(e, per: float, np):
+    """Best phase and strength of ``e`` folded at a (fractional) period, half-frame phase bins."""
+    nb = int(per * 2) + 2
+    bins = (np.mod(np.arange(len(e)), per) * 2).astype(int)
+    sums = np.bincount(bins, weights=e, minlength=nb)
+    sm = sums + np.roll(sums, 1) + np.roll(sums, -1)
+    j = int(np.argmax(sm))
+    return float(sm[j]), j / 2.0
+
+
+def _refine_period(e, per0: float, np):
+    """Two-pass fractional search around the comb tempo: the 0.5 BPM grid alone drifts by
+    hundreds of ms over minutes. Returns ``(period_frames, phase_frames)``."""
+    best = (-1.0, per0, 0.0)
+    for rel in np.arange(-0.012, 0.01201, 0.0005):
+        sc, ph = _fold_score(e, per0 * (1 + rel), np)
+        if sc > best[0]:
+            best = (sc, per0 * (1 + rel), ph)
+    centre = best[1]
+    for rel in np.arange(-0.0005, 0.00051, 0.00005):
+        per = centre * (1 + rel)
+        sc, ph = _fold_score(e, per, np)
+        if sc > best[0]:
+            best = (sc, per, ph)
+    return best[1], best[2]
+
+
+def _snap(e, positions, win: int, np):
+    n = len(e)
+    out = []
+    for p in positions:
+        c = int(round(p))
+        lo, hi = max(0, c - win), min(n, c + win + 1)
+        if hi > lo:
+            j = lo + int(np.argmax(e[lo:hi]))
+            out.append((j, float(e[j])))
+        else:
+            out.append((c, 0.0))
+    return out
+
+
+def _fit(ks, ts, np):
+    a, b = np.polyfit(np.array(ks, dtype=float), np.array(ts, dtype=float), 1)
+    return a, b
 
 
 def _beat_grid(env, t0: float, hop_s: float, bpm: float, np):
-    period = 60.0 / bpm / hop_s  # in frames
     n = len(env)
     e = np.maximum(env - np.median(env), 0)
-    best_phase = _best_phase(e, period, np)
-    pos = np.arange(best_phase, n, period)
+    period, phase = _refine_period(e, 60.0 / bpm / hop_s, np)
     win = max(1, int(round(period * 0.15)))
-    peaks = []
-    for p in pos:
-        c = int(round(p))
-        lo, hi = max(0, c - win), min(n, c + win + 1)
-        j = lo + int(np.argmax(e[lo:hi])) if hi > lo else c
-        peaks.append((j, float(e[j]) if hi > lo else 0.0))
-    # support is relative to the typical slot, not the loudest hit: weaker true beats stay
-    thr = SUPPORT_REL * float(np.median([v for _, v in peaks]))
-    ks = [k for k, (_, v) in enumerate(peaks) if v >= thr and v > 0]
-    ts = [peaks[k][0] for k in ks]
-    if len(ks) < 3:
-        return None
-    # least-squares line over matched onsets refines the period and removes frame quantisation
-    a, b = np.polyfit(np.array(ks, dtype=float), np.array(ts, dtype=float), 1)
-    if a <= 0:
-        return None
+    a, b = period, phase
+    ks = []
+    for _ in range(2):  # re-snap against the fitted line so the fit cannot lock on a drifted grid
+        count = int((n - b) / a) + 1
+        peaks = _snap(e, b + a * np.arange(max(count, 0)), win, np)
+        if not peaks:
+            return None
+        # support is relative to the typical slot, not the loudest hit: weaker true beats stay
+        thr = SUPPORT_REL * float(np.median([v for _, v in peaks]))
+        ks = [k for k, (_, v) in enumerate(peaks) if v >= thr and v > 0]
+        if len(ks) < 3:
+            return None
+        a, b = _fit(ks, [peaks[k][0] for k in ks], np)
+        if a <= 0:
+            return None
     refined_bpm = 60.0 / (a * hop_s)
     beats = [round(max(0.0, float(t0 + (b + a * k) * hop_s)), 3) for k in range(ks[0], ks[-1] + 1)]
     return float(refined_bpm), beats
 
 
 def _stable(env, hop_s: float, np) -> str:
-    """"" when the tempo holds across sub-windows, else a note describing the disagreement."""
+    """"" when the tempo holds across sub-windows, else a note describing the disagreement.
+    Raw readings are compared with octaves folded: 70 and 140 are the same pulse."""
     n = len(env)
     if n * hop_s < 2 * STABILITY_MIN_S:
         return ""
     found = []
     for a, b in ((0.0, 0.5), (0.5, 1.0), (0.25, 0.75)):
-        seg = env[int(a * n):int(b * n)]
-        got = _comb_tempo(seg, hop_s, np)
+        got = _comb_tempo(env[int(a * n):int(b * n)], hop_s, np)
         if got is not None and got[1] >= MIN_STRENGTH:
-            found.append(_resolve_octave(seg, hop_s, got[0], np))
+            found.append(got[0])
     if len(found) < 2:
         return ""
     lo, hi = min(found), max(found)
-    if hi / lo > 1 + STABILITY_TOL:
+    x = math.log2(hi / lo)
+    if abs(x - round(x)) > math.log2(1 + STABILITY_TOL):
         return f"tempo changes within the clip ({lo:.0f} to {hi:.0f} BPM): no single tempo"
     return ""
 
@@ -261,7 +315,7 @@ def analyze(path: str, duration: float = 0.0) -> dict:
         change = _stable(env, hop_s, np)
         if change:
             return _nd(dur, [change], loud)
-        bpm0 = _resolve_octave(env, hop_s, tempo[0], np)
+        bpm0, alt = _resolve_octave(env, hop_s, tempo[0], np)
         grid = _beat_grid(env, t0, hop_s, bpm0, np)
         if grid is None:
             return _nd(dur, ["tempo candidate not supported by repeated onsets"], loud)
@@ -269,10 +323,16 @@ def analyze(path: str, duration: float = 0.0) -> dict:
         if not (BPM_MIN - 2 <= bpm <= BPM_MAX + 2):
             return _nd(dur, ["refined tempo outside the 60-200 BPM range"], loud)
         conf = min(0.95, tempo[1])
-        return {"tempo_bpm": round(bpm, 1), "beats": beats, "loudness": loud,
+        notes: list[str] = []
+        extra: dict = {}
+        if alt:
+            conf = min(conf, AMBIG_CONF)
+            notes.append("half/double-time ambiguous")
+            extra["tempo_alt"] = round(alt * bpm / bpm0, 1)
+        return {"tempo_bpm": round(bpm, 1), "beats": beats, "loudness": loud, **extra,
                 "evidence": _ev(beats[0], beats[-1], conf, periodicity=round(tempo[1], 3)),
                 "loudness_evidence": _loud_ev(loud, dur),
-                "notes": []}
+                "notes": notes}
     except Exception as exc:  # noqa: BLE001 - a command must never raise out of an analysis
         return _nd(duration, [f"audio analysis failed: {type(exc).__name__}"])
 

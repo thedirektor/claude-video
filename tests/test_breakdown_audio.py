@@ -232,3 +232,87 @@ def test_onset_envelope_memory_bounded():
     tracemalloc.stop()
     assert len(env) > 100000
     assert peak < 150e6, peak  # full-STFT version needed ~800 MB for 10 min
+
+
+# ---- fix round 2: octave-folded stability, ambiguity, long-track drift ----
+def _kit(seed=1):
+    rng = np.random.default_rng(seed)
+    tk = np.arange(int(0.15 * SR)) / SR
+    kick = np.sin(2 * np.pi * (60 + 90 * np.exp(-tk * 30)) * tk) * np.exp(-tk * 20)
+
+    def noise(n, decay, amp):
+        return rng.standard_normal(n) * np.exp(-np.arange(n) / SR * decay) * amp
+    return rng, kick, (lambda: noise(int(0.04 * SR), 80, 0.3)), (lambda: noise(int(0.12 * SR), 25, 0.5))
+
+
+def _put(x, s, t):
+    i = int(t * SR)
+    j = min(len(x), i + len(s))
+    if j > i:
+        x[i:j] += s[:j - i]
+
+
+def _slow(bpm, secs):
+    rng, kick, hat, snare = _kit()
+    x = rng.standard_normal(int(secs * SR)) * 0.03
+    p, t, b = 60 / bpm, 0.0, 0
+    while t < secs - 0.3:
+        _put(x, kick, t)
+        if b % 2:
+            _put(x, snare(), t)
+        _put(x, hat(), t)
+        _put(x, hat() * 0.7, t + p / 2)
+        t += p
+        b += 1
+    return x / np.abs(x).max() * 0.8
+
+
+def _dnb(bpm, secs):
+    rng, kick, hat, snare = _kit()
+    x = rng.standard_normal(int(secs * SR)) * 0.03
+    p = 60 / bpm
+    t = 0.0
+    while t < secs - 4 * p:
+        for off in (0, 2.5 * p):
+            _put(x, kick, t + off)
+        for off in (p, 3 * p):
+            _put(x, snare() * 1.4, t + off)
+        for k in range(8):
+            _put(x, hat() * 0.6, t + k * p / 2)
+        t += 4 * p
+    return x / np.abs(x).max() * 0.8
+
+
+@pytest.mark.parametrize("bpm", [70, 65])
+def test_slow_backbeat_with_hats_is_stable(tmp_path, bpm):
+    res = A.analyze(_wav(tmp_path / "s.wav", _slow(bpm, 60)), 60)
+    assert res["tempo_bpm"] != "not determined", res["notes"]
+    assert abs(res["tempo_bpm"] - bpm) <= 2 or abs(res["tempo_bpm"] - 2 * bpm) <= 4
+    assert not any("tempo changes" in n for n in res["notes"])
+
+
+def test_dnb_is_ambiguous_or_correct(tmp_path):
+    res = A.analyze(_wav(tmp_path / "d.wav", _dnb(172, 60)), 60)
+    t = res["tempo_bpm"]
+    if abs(t - 172) <= 2:
+        return
+    assert abs(t - 86) <= 2
+    assert abs(res["tempo_alt"] - 172) <= 4
+    assert res["evidence"]["confidence"] <= 0.5
+    assert "half/double-time ambiguous" in res["notes"]
+
+
+def test_four_on_the_floor_170_stays_confident(tmp_path):
+    res = A.analyze(_wav(tmp_path / "f.wav", _groove(170, 60)), 60)
+    assert abs(res["tempo_bpm"] - 170) <= 2 and res["evidence"]["confidence"] > 0.5
+    assert "tempo_alt" not in res
+
+
+@pytest.mark.parametrize("bpm,secs", [(150, 120), (128, 300)])
+def test_beats_do_not_drift_on_long_tracks(tmp_path, bpm, secs):
+    res = A.analyze(_wav(tmp_path / "l.wav", _groove(bpm, secs)), secs)
+    assert abs(res["tempo_bpm"] - bpm) <= 0.3
+    per = 60 / bpm
+    err = np.abs(np.array(res["beats"]) - np.round(np.array(res["beats"]) / per) * per)
+    assert err.max() < 0.03, err.max()
+    assert len(res["beats"]) >= 0.97 * secs / per
