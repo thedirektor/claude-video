@@ -650,6 +650,74 @@ def upload_to_paperless(files: list[str], title: str, cfg: dict) -> dict:
 # Router: content-type split + summary
 # --------------------------------------------------------------------------
 
+_REPORT_FRAME_LINE = re.compile(r"^- `([^`]+)`(.*)$", re.DOTALL)
+_OCR_TAIL = " \u2014 OCR: "
+
+
+def link_report_frames(report_path: str, frame_urls: dict[str, str]) -> int:
+    """Rewrite the report in place: on each ``- `<path>` ...`` frame line whose
+    path is in ``frame_urls``, insert `` \u2014 Immich: <url>`` before any
+    `` \u2014 OCR: `` tail (else at end of line). Returns the number of lines
+    changed. NEVER raises."""
+    try:
+        if not report_path or not frame_urls:
+            return 0
+        p = Path(report_path)
+        lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+        changed = 0
+        for i, line in enumerate(lines):
+            body = line.rstrip("\r\n")
+            eol = line[len(body):]
+            m = _REPORT_FRAME_LINE.match(body)
+            if not m:
+                continue
+            url = frame_urls.get(m.group(1))
+            if not url or " \u2014 Immich: " in body:
+                continue
+            link = f" \u2014 Immich: {url}"
+            rest = m.group(2)
+            head, sep, tail = rest.partition(_OCR_TAIL)
+            lines[i] = f"- `{m.group(1)}`{head}{link}{sep}{tail}{eol}"
+            changed += 1
+        if changed:
+            p.write_text("".join(lines), encoding="utf-8")
+        return changed
+    except Exception as exc:
+        print(f"[watch] library: could not link report frames: {exc}", file=sys.stderr)
+        return 0
+
+
+def resolve_paperless_doc(
+    task_id: str, cfg: dict, attempts: int = 3, delay: float = 1.0, sleep=time.sleep
+) -> int | None:
+    """Resolve a Paperless consumption task id to its document id via
+    ``GET /api/tasks/?task_id=<id>``. Returns ``related_document`` (int) once
+    the task reports SUCCESS, else None after ``attempts``. NEVER raises."""
+    try:
+        cfg = cfg or {}
+        token = cfg.get("PAPERLESS_TOKEN")
+        if not token or not task_id:
+            return None
+        base_url = (cfg.get("PAPERLESS_URL") or DEFAULT_PAPERLESS_URL).rstrip("/")
+        path = "/api/tasks/?task_id=" + urllib.parse.quote(str(task_id), safe="")
+        for attempt in range(max(1, attempts)):
+            try:
+                data = _paperless_get(base_url, token, path)
+                rows = data.get("results", []) if isinstance(data, dict) else data
+                if rows and isinstance(rows[0], dict) and rows[0].get("status") == "SUCCESS":
+                    doc = rows[0].get("related_document")
+                    if doc not in (None, ""):
+                        return int(doc)
+            except Exception as exc:
+                print(f"[watch] library: Paperless task lookup failed: {exc}", file=sys.stderr)
+                return None
+            if attempt < attempts - 1:
+                sleep(delay)
+        return None
+    except Exception:
+        return None
+
+
 def _put_ref(refs: dict | None, key: str, value) -> None:
     """Best-effort: record one target's refs. Never raises, never affects the
     summary — a bad refs argument must not turn a good save into a failure."""
@@ -722,14 +790,31 @@ def save_artifacts(
                     print(f"[watch] library: Immich uploader raised: {exc}", file=sys.stderr)
                 uploaded = result.get("uploaded", 0)
                 error = result.get("error")
+                path_assets = result.get("assets") or {}
                 if uploaded:
+                    frames_by_t_ms: dict[str, str] = {}
+                    frame_urls: dict[str, str] = {}
+                    immich_base = (cfg.get("IMMICH_BASE_URL") or DEFAULT_IMMICH_BASE_URL).rstrip("/")
+                    for frame in frames or []:
+                        try:
+                            fpath = str(frame.get("path"))
+                            asset_id = path_assets.get(fpath)
+                            if not asset_id:
+                                continue
+                            ts = frame.get("timestamp_seconds")
+                            if ts is not None:
+                                frames_by_t_ms[str(int(round(float(ts) * 1000)))] = asset_id
+                            frame_urls[fpath] = f"{immich_base}/photos/{asset_id}"
+                        except Exception:
+                            continue
                     _put_ref(refs, "immich", {
                         "album_id": result.get("album_id"),
                         "url": result.get("url"),
-                        "assets": {
-                            Path(k).name: v for k, v in (result.get("assets") or {}).items()
-                        },
+                        "assets": {Path(k).name: v for k, v in path_assets.items()},
+                        "frames": frames_by_t_ms,
                     })
+                    if report_path and frame_urls:
+                        link_report_frames(report_path, frame_urls)
                 if error and not uploaded:
                     summary.append(f"Immich: error ({error})")
                 elif error:

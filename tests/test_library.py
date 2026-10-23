@@ -638,3 +638,122 @@ def test_save_artifacts_refs_omit_skipped_targets(tmp_path):
     refs: dict = {}
     library.save_artifacts(None, [], str(report), {}, "T", "v1", cfg={}, refs=refs)
     assert "immich" not in refs and "nextcloud" not in refs and "paperless" not in refs
+
+
+# --------------------------------------------------------------------------
+# Task 8: t_ms-keyed Immich refs, report frame links, Paperless task -> doc
+# --------------------------------------------------------------------------
+
+def _immich_cfg():
+    return {"IMMICH_API_KEY": "k", "IMMICH_BASE_URL": "https://i", "WATCH_SAVE_FRAME_CAP": 0}
+
+
+def test_refs_immich_frames_keyed_by_t_ms(tmp_path, monkeypatch):
+    f1 = tmp_path / "f1.jpg"
+    f2 = tmp_path / "f2.jpg"
+    f1.write_bytes(b"x")
+    f2.write_bytes(b"x")
+    frames = [
+        {"path": str(f1), "timestamp_seconds": 5.0},
+        {"path": str(f2), "timestamp_seconds": 12.34},
+    ]
+    monkeypatch.setattr(
+        library, "upload_to_immich",
+        lambda files, name, cfg: {
+            "uploaded": 2, "error": None, "url": "https://i/albums/alb",
+            "album_id": "alb", "assets": {str(f1): "a1", str(f2): "a2"},
+        },
+    )
+    refs: dict = {}
+    library.save_artifacts(None, frames, None, {}, "T", "v1", cfg=_immich_cfg(), refs=refs)
+    assert refs["immich"]["frames"] == {"5000": "a1", "12340": "a2"}
+    assert refs["immich"]["assets"] == {"f1.jpg": "a1", "f2.jpg": "a2"}
+
+
+def test_link_report_frames_before_ocr_tail(tmp_path):
+    report = tmp_path / "report.md"
+    report.write_text(
+        "# R\n"
+        "- `/w/f1.jpg` (t=00:05, reason=keyframe) — OCR: a — b\n"
+        "- `/w/f2.jpg` (t=00:09, reason=scene)\n"
+        "- `/w/other.jpg` (t=00:11)\n",
+        encoding="utf-8",
+    )
+    n = library.link_report_frames(
+        str(report), {"/w/f1.jpg": "https://i/photos/a1", "/w/f2.jpg": "https://i/photos/a2"}
+    )
+    assert n == 2
+    lines = report.read_text(encoding="utf-8").splitlines()
+    assert lines[1] == (
+        "- `/w/f1.jpg` (t=00:05, reason=keyframe) — Immich: https://i/photos/a1 — OCR: a — b"
+    )
+    assert lines[2] == "- `/w/f2.jpg` (t=00:09, reason=scene) — Immich: https://i/photos/a2"
+    assert lines[3] == "- `/w/other.jpg` (t=00:11)"
+    # never raises on a missing file
+    assert library.link_report_frames(str(tmp_path / "nope.md"), {"x": "y"}) == 0
+
+
+def test_paperless_receives_linked_report(tmp_path, monkeypatch):
+    frame = tmp_path / "f1.jpg"
+    frame.write_bytes(b"x")
+    report = tmp_path / "report.md"
+    report.write_text(f"- `{frame}` (t=00:05, reason=keyframe)\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        library, "upload_to_immich",
+        lambda files, name, cfg: {
+            "uploaded": 1, "error": None, "url": None,
+            "album_id": "alb", "assets": {str(frame): "a1"},
+        },
+    )
+    seen = []
+    monkeypatch.setattr(library, "_resolve_tag", lambda *a: 7)
+    monkeypatch.setattr(
+        library, "_post_document",
+        lambda base, tok, path, title, tag: seen.append(Path(path).read_text(encoding="utf-8")) or (True, "t1"),
+    )
+    monkeypatch.setattr(
+        library, "upload_to_nextcloud", lambda files, folder, cfg: {"uploaded": 1, "error": None}
+    )
+    cfg = _immich_cfg() | {
+        "PAPERLESS_URL": "https://p.example", "PAPERLESS_TOKEN": "tok", "NEXTCLOUD_PASS": "x",
+    }
+    frames = [{"path": str(frame), "timestamp_seconds": 5.0}]
+    library.save_artifacts(None, frames, str(report), {}, "T", "v1", cfg=cfg)
+    assert seen and "Immich: https://i/photos/a1" in seen[0]
+
+
+def test_resolve_paperless_doc(monkeypatch):
+    cfg = {"PAPERLESS_URL": "https://p.example", "PAPERLESS_TOKEN": "tok"}
+    answers = iter([[{"status": "PENDING"}], [{"status": "SUCCESS", "related_document": "41"}]])
+    paths = []
+    monkeypatch.setattr(library, "_paperless_get", lambda b, t, p: paths.append(p) or next(answers))
+    sleeps = []
+    assert library.resolve_paperless_doc("tid", cfg, sleep=sleeps.append) == 41
+    assert paths[0] == "/api/tasks/?task_id=tid"
+    assert len(sleeps) == 1
+
+    def boom(*a):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(library, "_paperless_get", boom)
+    assert library.resolve_paperless_doc("tid", cfg, sleep=lambda s: None) is None
+
+
+def test_immich_album_id_none_does_not_crash(tmp_path, monkeypatch):
+    frame = tmp_path / "f1.jpg"
+    frame.write_bytes(b"x")
+    monkeypatch.setattr(
+        library, "upload_to_immich",
+        lambda files, name, cfg: {
+            "uploaded": 1, "error": "album failed", "url": None,
+            "album_id": None, "assets": {str(frame): "a1"},
+        },
+    )
+    refs: dict = {}
+    library.save_artifacts(
+        None, [{"path": str(frame), "timestamp_seconds": 1.5}], None, {}, "T", "v1",
+        cfg=_immich_cfg(), refs=refs,
+    )
+    assert refs["immich"]["album_id"] is None
+    assert refs["immich"]["frames"] == {"1500": "a1"}
