@@ -315,16 +315,26 @@ def test_plain_120_backbeat_stays_confident(tmp_path):
 
 
 def _never_confident_wrong(res, truth):
+    """Spec section 3: a steady groove gets a tempo, and a wrong octave is never confident.
+    Either the primary is right (any ``tempo_alt`` then names the other octave and the
+    confidence is <= 0.5), or the primary is the other octave, ``tempo_alt`` is the truth,
+    confidence <= 0.5 and the note says so."""
     t = res["tempo_bpm"]
+    assert t != "not determined", res["notes"]
+    conf = res["evidence"]["confidence"]
     if abs(t - truth) <= 2:
+        if "tempo_alt" in res:
+            assert min(abs(res["tempo_alt"] - 2 * t), abs(res["tempo_alt"] - t / 2)) <= 3, res
+            assert conf <= 0.5 and "half/double-time ambiguous" in res["notes"], res
         return
+    assert min(abs(t - 2 * truth), abs(t - truth / 2)) <= 3, res  # only octave errors are possible
     assert abs(res.get("tempo_alt", 0) - truth) <= 3, res
-    assert res["evidence"]["confidence"] <= 0.5
-    assert "half/double-time ambiguous" in res["notes"]
+    assert conf <= 0.5, res
+    assert "half/double-time ambiguous" in res["notes"], res
 
 
-def _pattern(bpm, secs, kicks, snares, hat_amp):
-    rng, kick, hat, snare = _kit()
+def _pattern(bpm, secs, kicks, snares, hat_amp, seed=1):
+    rng, kick, hat, snare = _kit(seed)
     x = rng.standard_normal(int(secs * SR)) * 0.03
     p = 60 / bpm
     t = 0.0
@@ -339,16 +349,41 @@ def _pattern(bpm, secs, kicks, snares, hat_amp):
     return x / np.abs(x).max() * 0.8
 
 
-@pytest.mark.parametrize("name,bpm,kicks,snares,hats", [
-    ("hiphop75_loud", 75, [0, 2.5], [1, 3], 1.0),
-    ("hiphop75_mid", 75, [0, 2.5], [1, 3], 0.6),
+# fix round 4: the probe set the octave rule is judged on (spec section 3)
+OCTAVE_PROBES = [
+    ("hiphop75_hats0.9", 75, [0, 2.5], [1, 3], 0.9),
+    ("hiphop75_hats0.6", 75, [0, 2.5], [1, 3], 0.6),
+    ("hiphop75_hats1.0", 75, [0, 2.5], [1, 3], 1.0),
+    ("hiphop75_hats0.9_seed2", 75, [0, 2.5], [1, 3], 0.9, 2),
+    ("hiphop75_hats0.6_seed3", 75, [0, 2.5], [1, 3], 0.6, 3),
+    ("kick_every_beat140_no_hats", 140, [0, 1, 2, 3], [1, 3], 0.0),
     ("dubstep140", 140, [0], [2], 0.5),
     ("dubstep150", 150, [0], [2], 0.5),
     ("loud_hats_90", 90, [0, 1, 2, 3], [1, 3], 1.2),
-])
-def test_octave_never_confidently_wrong(tmp_path, name, bpm, kicks, snares, hats):
-    res = A.analyze(_wav(tmp_path / "o.wav", _pattern(bpm, 60, kicks, snares, hats)), 60)
+]
+
+
+@pytest.mark.parametrize("case", OCTAVE_PROBES, ids=[c[0] for c in OCTAVE_PROBES])
+def test_octave_never_confidently_wrong(tmp_path, case):
+    _, bpm, kicks, snares, hats, *seed = case
+    res = A.analyze(_wav(tmp_path / "o.wav", _pattern(bpm, 60, kicks, snares, hats, *seed)), 60)
     _never_confident_wrong(res, bpm)
+
+
+def test_kick_every_beat_140_is_not_confidently_70(tmp_path):
+    # the reviewer's case: kick on every beat + snare on 2 and 4, no hats
+    res = A.analyze(_wav(tmp_path / "k.wav", _groove(140, 60, hats=False)), 60)
+    _never_confident_wrong(res, 140)
+
+
+def test_dnb_172_never_confidently_86(tmp_path):
+    _never_confident_wrong(A.analyze(_wav(tmp_path / "d.wav", _dnb(172, 60)), 60), 172)
+
+
+def test_120_backbeat_60s_correct_primary(tmp_path):
+    res = A.analyze(_wav(tmp_path / "b.wav", _groove(120, 60)), 60)
+    _never_confident_wrong(res, 120)
+    assert abs(res["tempo_bpm"] - 120) <= 2  # the right octave is the primary reading
 
 
 def test_170_backbeat_with_hats_is_correct_or_ambiguous(tmp_path):
@@ -356,12 +391,16 @@ def test_170_backbeat_with_hats_is_correct_or_ambiguous(tmp_path):
     _never_confident_wrong(res, 170)
 
 
-def test_octave_change_between_sections_is_flagged(tmp_path):
-    x = np.concatenate([_groove(90, 24, hats=False, seed=1), _groove(180, 24, hats=False, snares=False, seed=2)])
+@pytest.mark.parametrize("hats", [False, True], ids=["no_hats", "hats"])
+def test_octave_change_between_sections_is_flagged(tmp_path, hats):
+    x = np.concatenate([_groove(90, 24, hats=hats, seed=1), _groove(180, 24, hats=hats, snares=hats, seed=2)])
     res = A.analyze(_wav(tmp_path / "oc.wav", x), 48)
-    if res["tempo_bpm"] != "not determined":
-        assert res["evidence"]["confidence"] <= 0.5
-        assert "octave changes between sections" in res["notes"]
+    # unconditional: either no tempo at all, or a flagged low-confidence one; never a confident 90 or 180
+    if res["tempo_bpm"] == "not determined":
+        assert res["beats"] == [] and res["evidence"]["confidence"] == 0
+        return
+    assert res["evidence"]["confidence"] <= 0.5, res
+    assert "octave changes between sections" in res["notes"], res["notes"]
 
 
 @pytest.mark.parametrize("bpm,secs", [(150, 120), (128, 300)])
