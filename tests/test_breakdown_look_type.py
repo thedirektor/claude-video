@@ -97,13 +97,13 @@ def test_pillarbox_measured(tmp_path):
 _FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 
-def _title_clip(path, extra, size="48"):
+def _title_clip(path, extra, size="48", src="color=c=navy:s=640x360:r=25:d=5", pre=""):
     import subprocess
     if not Path(_FONT).is_file():
         pytest.skip("no font for drawtext")
-    dt = (f"drawtext=fontfile={_FONT}:text='HELLO WORLD':fontsize={size}:y=40:fontcolor=white:{extra}")
+    dt = (pre + f"drawtext=fontfile={_FONT}:text='HELLO WORLD':fontsize={size}:y=40:fontcolor=white:{extra}")
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
-                    "color=c=navy:s=640x360:r=25:d=5", "-vf", dt, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    src, "-vf", dt, "-c:v", "libx264", "-pix_fmt", "yuv420p",
                     "-crf", "18", str(path)], check=True)
     return str(path)
 
@@ -142,7 +142,24 @@ def test_exit_fade(tmp_path):
     assert t["exit"] == "fade" and abs(t["t_out"] - 2.6) <= 0.15
 
 
-def test_unclear_never_claims_cut(tmp_path):
-    t = _only(_title_clip(tmp_path / "f.mp4", "x=40:alpha='if(lt(t,1),0,if(lt(t,1.6),(t-1)/0.6,1))'"))
-    assert t["entrance"] != "cut"
+_MOVING = "testsrc2=s=640x360:r=25:d=5"
+_DIM = "eq=brightness=-0.45,boxblur=6,"  # keeps the motion, lets OCR read the title
+
+
+def test_moving_background_cut(tmp_path):
+    t = _only(_title_clip(tmp_path / "m1.mp4", "x=40:enable='between(t,1,3)'", src=_MOVING, pre=_DIM))
+    assert t["entrance"] in ("not determined", "cut")
+    assert abs(t["t_in"] - 1.0) <= 0.1
+
+
+def test_moving_background_fade(tmp_path):
+    t = _only(_title_clip(tmp_path / "m2.mp4", "x=40:alpha='if(lt(t,1),0,if(lt(t,1.6),(t-1)/0.6,1))'", src=_MOVING, pre=_DIM))
+    assert t["entrance"] in ("not determined", "fade")
+    assert abs(t["t_in"] - 1.0) <= 0.7  # OCR-bisected when the animation can't be measured
+
+
+def test_moving_background_never_invents_motion(tmp_path):
+    t = _only(_title_clip(tmp_path / "m3.mp4", "x=40:enable='between(t,1,3)'", src=_MOVING, pre=_DIM))
+    assert not t["entrance"].startswith("slide") and t["entrance"] != "scale"
+    assert not t["exit"].startswith("slide") and t["exit"] != "scale"
     assert t["font_family"] == "not determined"

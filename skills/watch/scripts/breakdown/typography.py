@@ -1,7 +1,6 @@
 """On-screen text tracks from OCR (pytesseract) sampled every ``step`` seconds.
 
-Per-line detections are merged into tracks (same normalised text, box IoU >= 0.6
-on consecutive samples). In/out times are refined by bisecting between the last
+Per-line detections are merged into tracks (same normalised text on adjacent samples). In/out times are refined by bisecting between the last
 sample that saw the text and the next one that did not. Font family is always
 ``"not determined"``; size (``height_rel``), colour, position and timing are
 measured. Entrance and exit come from pixels: every frame around the text's
@@ -24,6 +23,7 @@ MASK_T = 12  # grey-level change that counts as text pixels
 LEAD_S = 1.0  # window before / after a track when looking for its animation
 TAIL_S = 0.3  # extra look-ahead past the first sample without text (backgrounds often change soon after)
 CUT_FRAMES = 2
+BG_MOVE_MAX = 0.02  # share of off-band crop pixels allowed to change before text is 'animating'
 
 
 def _import_cv():
@@ -185,6 +185,15 @@ def _classify(np, grays) -> tuple[str, int | None]:
     h, w = fm.shape
     if area_f < 40 or area_f > 0.5 * h * w:
         return nd
+    # a text animation only moves along the settled box's row/column band; the four corners of
+    # the crop must stay put, otherwise the "appearance" is background motion, not text.
+    band = np.zeros((h, w), bool)
+    bx0, by0, bx1, by1 = _bbox(np, fm)
+    band[max(0, by0 - 2):by1 + 2, :] = True
+    band[:, max(0, bx0 - 2):bx1 + 2] = True
+    corners = ~band
+    if corners.sum() >= 50 and max(float(m[corners].mean()) for m in masks) > BG_MOVE_MAX:
+        return nd
     e = [float(d[fm].mean()) for d in diffs]
     boxes = [_bbox(np, m) for m in masks]
     bf = boxes[-1]
@@ -305,6 +314,8 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
                     dets.remove(m)
                     tr["last"] = t
                     tr["boxes"].append((t, m["box"]))
+                    still.append(tr)
+                elif t - tr["last"] < 2 * step - 1e-6:  # tolerate one missed OCR sample
                     still.append(tr)
                 else:
                     done.append(tr)
