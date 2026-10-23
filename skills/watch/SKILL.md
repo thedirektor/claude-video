@@ -487,6 +487,18 @@ After every indexed run `/watch` stores **chapters** (from transcript pauses ≥
 
 When the run is archived, the exports go to the Nextcloud folder, the merged PDF goes to **Paperless instead of report.md**, and the contact sheet joins the Immich album. Rebuild exports for any indexed video without re-watching: `watch.py export <video> [--formats …] [--out DIR] [--json]`.
 
+## Central memory (push from this machine)
+
+With `WATCH_REMOTE_URL` (the central service, e.g. `https://watch.example.com`) and `WATCH_REMOTE_TOKEN` in `~/.config/watch/.env`, every indexed local run is bundled (transcript, frames + OCR, notes, report) and pushed to `<remote>/runs/import`, so a video watched on a laptop is searchable everywhere. Pushes are idempotent; when the service is unreachable the bundle waits in `~/.local/share/watch/outbox/` and is retried on the next run. `watch.py push --all` sends the whole local history, `--retry` only the outbox. The service rebuilds chapters and exports, and archives to the library only if this machine did not.
+
+## Local MCP server (Claude Desktop)
+
+`watch.py mcp` is a dependency-free MCP server over stdio exposing `watch` (local files or URLs), `search`, `ask`, `moment` (with frame images), `videos`, `export`, `plan` and `doctor` against this machine's memory. Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{"mcpServers": {"watch": {"command": "python", "args": ["<SKILL_DIR>/scripts/watch.py", "mcp"]}}}
+```
+
 ## Batch (playlists, channels, lists)
 
 `watch.py batch <playlist|channel|file> [--limit N] [--force] [--json] [-- <watch flags>]` watches every entry serially as its own run (a channel lists newest first; a file holds one URL or path per line, `#` for comments). Videos already in the video memory are skipped unless `--force`. Flags after `--` go to each run, e.g. `watch.py batch https://www.youtube.com/@chan/videos --limit 5 -- --detail transcript`. The service adds subscriptions (new uploads watched automatically) on top of this.
