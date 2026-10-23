@@ -109,12 +109,13 @@ def _stamp_path() -> Path:
     return Path(base).expanduser() / "ytdlp-self-heal-stamp"
 
 
-def self_heal(clock=time.time) -> bool:
+def self_heal(clock=time.time, force: bool = False) -> bool:
     """Upgrade yt-dlp at most once per SELF_HEAL_WINDOW_S. Never raises.
 
     With WATCH_YTDLP_PYLIB set (the service: the image is read-only), installs into
     that directory, which ytdlp_cmd() then prefers; otherwise `pip install --user`.
-    WATCH_YTDLP_SELF_HEAL=0 disables it. Returns True when an upgrade ran successfully.
+    WATCH_YTDLP_SELF_HEAL=0 disables it; ``force`` (doctor --fix) skips the rate limit.
+    Returns True when an upgrade ran successfully.
     """
     if (setting("WATCH_YTDLP_SELF_HEAL") or "1").strip().lower() in ("0", "false", "no"):
         return False
@@ -122,7 +123,7 @@ def self_heal(clock=time.time) -> bool:
         stamp = _stamp_path()
         now = clock()
         try:
-            if now - float(stamp.read_text().strip()) < SELF_HEAL_WINDOW_S:
+            if not force and now - float(stamp.read_text().strip()) < SELF_HEAL_WINDOW_S:
                 return False
         except (OSError, ValueError):
             pass
