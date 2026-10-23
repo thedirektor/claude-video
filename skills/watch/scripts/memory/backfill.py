@@ -36,8 +36,8 @@ def _as_path(next_url: str, base: str) -> str:
 def _default_get_json(cfg: dict):
     base = (cfg.get("PAPERLESS_URL") or library.DEFAULT_PAPERLESS_URL).rstrip("/")
     token = cfg.get("PAPERLESS_TOKEN")
-    if not token:
-        raise RuntimeError("PAPERLESS_TOKEN is not set")
+    if not token or not base:
+        raise RuntimeError("PAPERLESS_TOKEN / PAPERLESS_URL is not set")
     return lambda path: library._paperless_get(base, token, path)
 
 

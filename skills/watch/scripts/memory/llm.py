@@ -38,7 +38,7 @@ def _timeout() -> float:
 def chain() -> list[str]:
     names = [n.strip().lower() for n in (setting("WATCH_LLM_CHAIN", DEFAULT_CHAIN) or "").split(",")]
     out = [n for n in names if n in KNOWN]
-    if not setting("WATCH_LLM_API_KEY"):
+    if not (setting("WATCH_LLM_API_KEY") and setting("WATCH_LLM_BASE_URL")):
         out = [n for n in out if n != "headroom"]
     return out
 
@@ -64,7 +64,7 @@ def _openai_compatible(base_url: str, api_key: str, model: str, system: str, use
 
 def _headroom(system: str, user: str, max_tokens: int) -> LLMReply | None:
     return _openai_compatible(
-        setting("WATCH_LLM_BASE_URL", "http://127.0.0.1:8789"), setting("WATCH_LLM_API_KEY"),
+        setting("WATCH_LLM_BASE_URL"), setting("WATCH_LLM_API_KEY"),
         setting("WATCH_LLM_MODEL", "gemini-3.1-flash-lite"), system, user, max_tokens, "headroom")
 
 

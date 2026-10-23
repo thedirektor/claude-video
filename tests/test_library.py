@@ -438,7 +438,7 @@ def test_load_config_paperless(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
 
     cfg = library.load_config()
-    assert cfg["PAPERLESS_URL"] == "https://paperless.example.com"
+    assert cfg["PAPERLESS_URL"] == ""
     assert cfg["PAPERLESS_TOKEN"] is None
 
     monkeypatch.setenv("PAPERLESS_TOKEN", "tok_env")
@@ -520,8 +520,8 @@ def test_load_config_defaults_and_env(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
 
     cfg = library.load_config()
-    assert cfg["IMMICH_BASE_URL"] == "https://immich.example.com"
-    assert cfg["NEXTCLOUD_URL"] == "https://nextcloud.example.com"
+    assert cfg["IMMICH_BASE_URL"] == ""
+    assert cfg["NEXTCLOUD_URL"] == ""
     assert cfg["NEXTCLOUD_USER"] == ""
     assert cfg["WATCH_SAVE_FRAME_CAP"] == 20
     assert cfg["IMMICH_API_KEY"] is None
@@ -757,3 +757,23 @@ def test_immich_album_id_none_does_not_crash(tmp_path, monkeypatch):
     )
     assert refs["immich"]["album_id"] is None
     assert refs["immich"]["frames"] == {"1500": "a1"}
+
+
+def test_no_builtin_library_hosts(monkeypatch):
+    """The fork ships no personal hosts: an unset URL skips the target."""
+    for key in ("IMMICH_BASE_URL", "NEXTCLOUD_URL", "NEXTCLOUD_USER", "PAPERLESS_URL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(library, "config_file_path", lambda: Path("/nonexistent/.env"))
+    monkeypatch.chdir("/")
+    cfg = library.load_config()
+    assert not cfg["IMMICH_BASE_URL"] and not cfg["NEXTCLOUD_URL"] and not cfg["PAPERLESS_URL"]
+    assert not cfg["NEXTCLOUD_USER"]
+
+    def boom(*a, **k):
+        raise AssertionError("network used without a configured URL")
+
+    monkeypatch.setattr(library.urllib.request, "urlopen", boom)
+    f = Path(library.__file__)  # any existing file
+    assert library.upload_to_immich([str(f)], "a", {"IMMICH_API_KEY": "k"})["error"] == "missing IMMICH_BASE_URL"
+    assert library.upload_to_nextcloud([str(f)], "a", {"NEXTCLOUD_PASS": "p"})["error"] == "missing NEXTCLOUD_URL"
+    assert library.upload_to_paperless([str(f)], "a", {"PAPERLESS_TOKEN": "t"})["error"] == "missing PAPERLESS_URL"

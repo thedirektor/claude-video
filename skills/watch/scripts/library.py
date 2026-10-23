@@ -49,10 +49,10 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):
         pass
 
-DEFAULT_IMMICH_BASE_URL = "https://immich.example.com"
-DEFAULT_NEXTCLOUD_URL = "https://nextcloud.example.com"
+DEFAULT_IMMICH_BASE_URL = ""  # no built-in hosts: set them in ~/.config/watch/.env
+DEFAULT_NEXTCLOUD_URL = ""
 DEFAULT_NEXTCLOUD_USER = ""
-DEFAULT_PAPERLESS_URL = "https://paperless.example.com"
+DEFAULT_PAPERLESS_URL = ""
 DEFAULT_FRAME_CAP = 20
 PAPERLESS_TAG = "watch"
 
@@ -283,7 +283,7 @@ def _iso8601(mtime: float) -> str:
 
 
 # --------------------------------------------------------------------------
-# Immich uploader — flow matches ~/.hermes/scripts/immich_upload.py
+# Immich uploader — standard Immich API flow
 # --------------------------------------------------------------------------
 
 def _device_asset_id(album_name: str, basename: str) -> str:
@@ -386,6 +386,9 @@ def upload_to_immich(files: list[str], album_name: str, cfg: dict) -> dict:
         if not api_key:
             result["error"] = "missing IMMICH_API_KEY"
             return result
+        if not base_url:
+            result["error"] = "missing IMMICH_BASE_URL"
+            return result
         if not files:
             return result
 
@@ -467,6 +470,9 @@ def upload_to_nextcloud(files: list[str], folder: str, cfg: dict) -> dict:
         password = cfg.get("NEXTCLOUD_PASS")
         if not password:
             result["error"] = "missing NEXTCLOUD_PASS"
+            return result
+        if not base_url or not user:
+            result["error"] = "missing NEXTCLOUD_URL" if not base_url else "missing NEXTCLOUD_USER"
             return result
         if not files:
             return result
@@ -613,6 +619,9 @@ def upload_to_paperless(files: list[str], title: str, cfg: dict) -> dict:
         if not token:
             result["error"] = "missing PAPERLESS_TOKEN"
             return result
+        if not base_url:
+            result["error"] = "missing PAPERLESS_URL"
+            return result
         if not files:
             return result
 
@@ -696,9 +705,9 @@ def resolve_paperless_doc(
     try:
         cfg = cfg or {}
         token = cfg.get("PAPERLESS_TOKEN")
-        if not token or not task_id:
-            return None
         base_url = (cfg.get("PAPERLESS_URL") or DEFAULT_PAPERLESS_URL).rstrip("/")
+        if not token or not task_id or not base_url:
+            return None
         path = "/api/tasks/?task_id=" + urllib.parse.quote(str(task_id), safe="")
         for attempt in range(max(1, attempts)):
             try:

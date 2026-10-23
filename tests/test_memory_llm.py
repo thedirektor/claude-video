@@ -10,11 +10,14 @@ from memory import llm
 from memory.llm import LLMReply
 
 
-def test_chain_default_skips_headroom_without_key(monkeypatch):
+def test_chain_default_skips_headroom_without_key_and_url(monkeypatch):
     monkeypatch.delenv("WATCH_LLM_CHAIN", raising=False)
     monkeypatch.delenv("WATCH_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("WATCH_LLM_BASE_URL", raising=False)
     assert llm.chain() == ["gemini", "openrouter"]
     monkeypatch.setenv("WATCH_LLM_API_KEY", "k")
+    assert llm.chain() == ["gemini", "openrouter"]  # no built-in headroom host
+    monkeypatch.setenv("WATCH_LLM_BASE_URL", "http://proxy.local:8789")
     assert llm.chain() == ["headroom", "gemini", "openrouter"]
 
 

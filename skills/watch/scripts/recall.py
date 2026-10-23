@@ -55,7 +55,7 @@ def search_paperless(query: str, cfg: dict, limit: int = 5) -> list[dict]:
     cfg = cfg or {}
     base = (cfg.get("PAPERLESS_URL") or library.DEFAULT_PAPERLESS_URL).rstrip("/")
     token = cfg.get("PAPERLESS_TOKEN")
-    if not token or not query:
+    if not token or not query or not base:
         return []
     headers = {"Authorization": f"Token {token}"}
     try:
@@ -102,7 +102,7 @@ def list_nextcloud_watch(cfg: dict) -> list[str]:
     base = (cfg.get("NEXTCLOUD_URL") or library.DEFAULT_NEXTCLOUD_URL).rstrip("/")
     user = cfg.get("NEXTCLOUD_USER") or library.DEFAULT_NEXTCLOUD_USER
     password = cfg.get("NEXTCLOUD_PASS")
-    if not password:
+    if not password or not base or not user:
         return []
     auth = library._nextcloud_auth_header(user, password)
     url = f"{base}/remote.php/dav/files/{urllib.parse.quote(user)}/Watch/"
@@ -132,7 +132,7 @@ def fetch_nextcloud_report(folder: str, cfg: dict) -> str | None:
     base = (cfg.get("NEXTCLOUD_URL") or library.DEFAULT_NEXTCLOUD_URL).rstrip("/")
     user = cfg.get("NEXTCLOUD_USER") or library.DEFAULT_NEXTCLOUD_USER
     password = cfg.get("NEXTCLOUD_PASS")
-    if not password:
+    if not password or not base or not user:
         return None
     auth = library._nextcloud_auth_header(user, password)
     url = (
