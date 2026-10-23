@@ -293,6 +293,15 @@ TRANSCRIPT_PROMPT = (
     "one line per sentence, covering the entire video to the end. No commentary."
 )
 
+VISUAL_LOG_PROMPT = (
+    "Describe what is visible on screen in this video over time, for someone who cannot see it. "
+    "Do not transcribe the speech. Output only lines of the form [MM:SS] description "
+    "(use [H:MM:SS] past one hour), one line each time the picture changes meaningfully: "
+    "people and what they do, objects, places, slides, charts, and any on-screen text quoted "
+    "verbatim. Cover the entire video to the end. No commentary."
+)
+VISUAL_LOG_MAX_OUTPUT_TOKENS = 16384
+
 _TS = r"(?:\d{1,2}:)?\d{1,2}:\d{2}"
 # Optional "- " / "* " bullet, optional ** bold, [start] or [start - end] range.
 _TS_LINE = re.compile(
@@ -357,6 +366,53 @@ def _implausible_reason(segments: list[dict], duration: float | None) -> str | N
         if wpm > _MAX_PLAUSIBLE_WPM:
             return f"{wpm:.0f} words/min over {span:.0f}s"
     return None
+
+
+def visual_log(
+    url: str,
+    duration: float | None = None,
+    model_name: str = DEFAULT_MODEL,
+    api_key: str | None = None,
+    client=None,
+    media_resolution: str | None = DEFAULT_TRANSCRIPT_MEDIA_RESOLUTION,
+) -> list[dict] | None:
+    """A timestamped log of what is on screen in a YouTube video (Gemini fetches the URL).
+
+    Never raises: returns segments ``{start, end, text}`` or None on a missing
+    SDK/key, an API error or a reply without timestamped lines. Lines past
+    ``duration`` (model overshoot) are dropped.
+    """
+    try:
+        from google.genai import types
+
+        if client is None:
+            from google import genai
+
+            key = api_key or load_api_key()
+            if not key:
+                return None
+            client = genai.Client(api_key=key)
+        print(f"[watch] asking Gemini ({model_name}) for a visual log of the YouTube video…", file=sys.stderr)
+        config_kwargs: dict = {"temperature": 0, "max_output_tokens": VISUAL_LOG_MAX_OUTPUT_TOKENS}
+        if media_resolution:
+            config_kwargs["media_resolution"] = getattr(
+                types.MediaResolution, _MEDIA_RESOLUTIONS[media_resolution.lower()]
+            )
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[types.Content(role="user", parts=[
+                types.Part(file_data=types.FileData(file_uri=url, mime_type="video/*")),
+                types.Part(text=VISUAL_LOG_PROMPT),
+            ])],
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+        segments = parse_timestamped_lines(getattr(response, "text", None) or "")
+        if duration:
+            segments = [s for s in segments if s["start"] <= float(duration) * _DURATION_SLACK]
+        return segments or None
+    except Exception as exc:  # never raise: the visual log is optional evidence
+        print(f"[watch] Gemini visual log failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
 
 
 def transcribe_youtube(

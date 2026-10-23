@@ -6,6 +6,10 @@ evidence times at 2x the hi-res width and OCR them again. Text that is new
 ``escalated`` frame + OCR row, and the video's evidence_version is bumped so
 cached answers are invalidated. Each time is attempted once (``escalations``),
 the whole call is bounded by ``WATCH_ESCALATE_BUDGET_S``, and nothing raises.
+
+``visual_log`` is the media-less counterpart for YouTube videos (the server is
+bot-walled from the media): Gemini watches the URL once per video and its
+timestamped on-screen log is stored as ``notes(kind=visual)``.
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ ZOOM_WIDTH = 2048  # 2x the plugin's 1024 px hi-res OCR frames
 MAX_TIMES = 3
 DUP_WINDOW_S = 2.0
 END_GUARD_S = 0.5  # seeking to the very last instant yields no frame
+VISUAL_T = -1.0  # escalations.t sentinel: "the visual log was fetched for this video"
 
 
 def _budget() -> float:
@@ -136,3 +141,60 @@ def escalate(conn, video_key: str, times: list[float], *, window: float = 5.0, b
     if added:
         bump_evidence(conn, video_key)
     return added
+
+
+def _default_describe(url: str, duration: float | None):
+    import gemini
+    import identity
+
+    return gemini.visual_log(identity.canonical_source(url), duration=duration)
+
+
+def visual_log(conn, video_key: str, *, describe=None, store_dir=None) -> int:
+    """Store Gemini's on-screen log for a media-less YouTube video, once. Never raises.
+
+    Returns the number of notes added. Skipped when WATCH_VISUAL_LOG is off, the
+    source is not YouTube, media is stored (model-free escalation covers that) or
+    it already ran. A None from ``describe`` (no key, API error) is not recorded,
+    so a later call can try again.
+    """
+    try:
+        if (setting("WATCH_VISUAL_LOG") or "1").strip().lower() in ("0", "false", "no"):
+            return 0
+        row = conn.execute("SELECT url, source, duration FROM videos WHERE video_key = ?",
+                           (video_key,)).fetchone()
+        if row is None:
+            return 0
+        url = row[0] or row[1] or ""
+        import gemini
+
+        if not gemini.is_youtube_url(url):
+            return 0
+        if _media(store_dir or memory_paths()["store_dir"], video_key) is not None:
+            return 0
+        if conn.execute("SELECT 1 FROM escalations WHERE video_key = ? AND t = ?",
+                        (video_key, VISUAL_T)).fetchone():
+            return 0
+        segments = (describe or _default_describe)(url, row[2])
+        if segments is None:
+            return 0
+        n = 0
+        with _tx(conn):
+            for seg in segments:
+                body = str(seg.get("text") or "").strip()
+                if not body:
+                    continue
+                text = f"[on screen] {body}"
+                cur = conn.execute(
+                    "INSERT INTO notes (video_key, run_id, kind, t_start, t_end, text) VALUES (?, NULL, 'visual', ?, ?, ?)",
+                    (video_key, seg.get("start"), seg.get("end"), text))
+                _fts_add(conn, "note", video_key, "notes", cur.lastrowid, seg.get("start"), text)
+                n += 1
+            conn.execute("INSERT INTO escalations (video_key, t, added, created) VALUES (?, ?, ?, ?)",
+                         (video_key, VISUAL_T, n, datetime.now(timezone.utc).isoformat(timespec="seconds")))
+        if n:
+            bump_evidence(conn, video_key)
+        return n
+    except Exception as exc:  # noqa: BLE001 - best-effort
+        print(f"[watch] visual log failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 0

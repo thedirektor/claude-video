@@ -38,6 +38,7 @@ os.environ["WATCH_EMBEDDINGS"] = "0"
 os.environ["WATCH_CONFIG_FILE"] = str(Path(_SESSION_MEM) / "no-such-config" / ".env")
 os.environ.pop("WATCH_QDRANT_INBOX", None)
 os.environ["WATCH_LLM_CHAIN"] = "none"  # grounded answers never reach a real LLM; tests inject fakes
+os.environ["WATCH_VISUAL_LOG"] = "0"  # the Gemini visual log is opted in per test
 os.environ.pop("WATCH_MODEL_DIR", None)
 
 import config as _config  # noqa: E402

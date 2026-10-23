@@ -1,6 +1,7 @@
 """Grounded answers over one video's evidence.
 
 cache → evidence pack → confidence → (low: model-free escalation, re-pack) →
+(still low, YouTube without media: Gemini visual log once per video, re-pack) →
 (still low: refusal + nearest moments, no LLM) → LLM over numbered evidence →
 citation guard → cache. Every timestamp in an answer is an evidence row's.
 """
@@ -35,9 +36,10 @@ def _refusal(base: dict) -> dict:
 
 
 def answer(conn, video_ref: str, question: str, k: int = 8, *, embedder=None, complete=None,
-           escalate_fn=None, budget_s: float | None = None) -> dict:
+           escalate_fn=None, visual_fn=None, budget_s: float | None = None) -> dict:
     complete = complete or llm.complete
     escalate_fn = escalate_fn or escalate.escalate
+    visual_fn = visual_fn or escalate.visual_log
     key = retrieval.resolve_video(conn, video_ref)["video_key"]
     cached = answers.lookup(conn, key, _evidence_version(conn, key), question, embedder=embedder)
     if cached is not None:
@@ -56,9 +58,17 @@ def answer(conn, video_ref: str, question: str, k: int = 8, *, embedder=None, co
                 embeddings.embed_pending(conn, embedder)
             pack = retrieval.ask(conn, key, question, k=k, embedder=embedder)
             conf = confidence.assess(question, pack["evidence"])
+    visual = 0
+    if conf["level"] == "low":
+        visual = visual_fn(conn, key)
+        if visual:
+            if embedder is not None:
+                embeddings.embed_pending(conn, embedder)
+            pack = retrieval.ask(conn, key, question, k=k, embedder=embedder)
+            conf = confidence.assess(question, pack["evidence"])
 
     base = {"video": pack["video"], "question": question, "answer": None, "found": None, "citations": [],
-            "confidence": conf, "provider": None, "model": None, "cached": False, "escalated": escalated,
+            "confidence": conf, "provider": None, "model": None, "cached": False, "escalated": escalated, "visual": visual,
             "evidence": pack["evidence"], "rule": pack["rule"], "mode": pack["mode"]}
     ev = _evidence_version(conn, key)
 
