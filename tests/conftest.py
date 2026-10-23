@@ -37,6 +37,7 @@ os.environ["WATCH_STORE_DIR"] = str(Path(_SESSION_MEM) / "store")
 os.environ["WATCH_EMBEDDINGS"] = "0"
 os.environ["WATCH_CONFIG_FILE"] = str(Path(_SESSION_MEM) / "no-such-config" / ".env")
 os.environ.pop("WATCH_QDRANT_INBOX", None)
+os.environ["WATCH_LLM_CHAIN"] = "none"  # grounded answers never reach a real LLM; tests inject fakes
 os.environ.pop("WATCH_MODEL_DIR", None)
 
 import config as _config  # noqa: E402
