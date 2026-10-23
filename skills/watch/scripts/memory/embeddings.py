@@ -14,6 +14,8 @@ from config import embeddings_enabled, memory_paths
 
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DIM = 384
+# fastembed defaults to 256 per batch (~1.1-1.5 GB RSS); 16 keeps it ~676 MB at the same speed.
+FASTEMBED_BATCH = 16
 
 _notified = False
 
@@ -40,7 +42,7 @@ class _FastEmbedder:
         self._model = model
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        return [[float(x) for x in v] for v in self._model.embed(texts)]
+        return [[float(x) for x in v] for v in self._model.embed(texts, batch_size=FASTEMBED_BATCH)]
 
 
 def get_embedder(model_dir: Path | None = None, local_only: bool = False) -> Embedder | None:

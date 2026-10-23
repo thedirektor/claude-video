@@ -121,3 +121,23 @@ def test_cosine_many_without_numpy(monkeypatch):
 
 def test_pack_roundtrip():
     assert unpack(pack([0.5, -2.0]), 2) == [0.5, -2.0]
+
+
+def test_fastembed_embed_uses_small_batches(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeTextEmbedding:
+        def __init__(self, **kw):
+            pass
+
+        def embed(self, texts, **kw):
+            calls.append(kw)
+            return [[0.0] * embeddings.DIM for _ in texts]
+
+    import types
+    monkeypatch.setenv("WATCH_EMBEDDINGS", "1")
+    monkeypatch.setitem(sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding))
+    emb = get_embedder(model_dir=tmp_path)
+    assert emb is not None
+    assert len(emb.embed(["a", "b"])) == 2
+    assert calls == [{"batch_size": embeddings.FASTEMBED_BATCH}] and embeddings.FASTEMBED_BATCH == 16
