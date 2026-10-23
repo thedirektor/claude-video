@@ -42,6 +42,8 @@ from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 import transcriptapi  # noqa: E402
 import gemini  # noqa: E402
 import identity  # noqa: E402
+from memory import writer as memory_writer  # noqa: E402
+from memory.index import RunRecord, frame_kind  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
 from scenes import DEFAULT_THRESHOLD, detect_scenes  # noqa: E402
 from speech import DEFAULT_SPEECH_SHARE, compute_speech_windows, format_windows, two_pass_sample  # noqa: E402
@@ -61,6 +63,210 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 HIRES_WIDTH = 1024
+
+ORIGINS = ("skill", "service", "ingest", "import", "backfill")
+
+
+def should_save(*, backend: str, origin: str, detail: str, save: bool, no_save: bool,
+                env_no_save: bool) -> bool:
+    """Whether this run is archived to the library (Immich/Nextcloud/Paperless +
+    Qdrant inbox). Indexing is independent of this (only --no-index skips it)."""
+    if no_save or env_no_save:
+        return False
+    if save:
+        return True
+    if backend in ("gemini", "openrouter"):
+        return False
+    if origin == "ingest" and detail == "transcript":
+        return False
+    return True
+
+
+def _env_no_save() -> bool:
+    # WATCH_NO_SAVE (any non-empty, non-"0"/"false"/"no" value) force-disables
+    # library saving even without --no-save. The test suite sets it so e2e runs
+    # never upload fixtures to the real Immich/Nextcloud/Paperless library.
+    return os.environ.get("WATCH_NO_SAVE", "").strip().lower() not in ("", "0", "false", "no")
+
+
+def _run_should_save(args, backend: str, detail: str) -> bool:
+    return should_save(
+        backend=backend, origin=args.origin, detail=detail, save=args.save,
+        no_save=args.no_save, env_no_save=_env_no_save(),
+    )
+
+
+def _save_library(args, work: Path, *, media_path: str | None, frames: list[dict],
+                  ocr_text: dict, info: dict) -> dict:
+    """Push this run's artifacts to the library; returns the refs (may be empty).
+    Never raises — save must never fail the run."""
+    video_id = info.get("id") or hashlib.sha1(args.source.encode("utf-8")).hexdigest()[:8]
+    title = info.get("title") or Path(args.source).name
+    refs: dict = {}
+    try:
+        summary = library.save_artifacts(
+            media_path, frames, str(work / "report.md"), ocr_text, title, video_id,
+            refs=refs,
+        )
+        for line in summary or []:
+            print(f"[watch] {line}", file=sys.stderr)
+        if refs:
+            (work / "library.json").write_text(json.dumps(refs, indent=2), encoding="utf-8")
+    except Exception as exc:  # belt: save must never fail the run
+        print(f"[watch] library save skipped ({exc})", file=sys.stderr)
+    return refs
+
+
+def _memory_title(source: str, info: dict) -> str | None:
+    """Title for the index: metadata title, else the file name for local
+    files; None for URLs without metadata (yt-dlp is often bot-gated)."""
+    title = (info or {}).get("title")
+    if title:
+        return str(title)
+    return None if is_url(source) else Path(source).name
+
+
+def _remember(args, work: Path, *, backend: str, detail: str, info: dict,
+              transcript_source: str | None, segments: list[dict], frames: list[dict],
+              notes: list[dict], media_path: str | None, rng: tuple[float, float] | None,
+              refs: dict, archive: bool) -> None:
+    """Index this run (unless --no-index) and write work/memory.json. Never raises."""
+    if args.no_index:
+        return
+    try:
+        info = info or {}
+        run = RunRecord(
+            video_key=identity.video_key(args.source, info),
+            source=args.source,
+            origin=args.origin,
+            backend=backend,
+            detail=detail,
+            title=_memory_title(args.source, info),
+            url=identity.canonical_source(args.source) if is_url(args.source) else None,
+            duration=info.get("duration"),
+            channel=info.get("channel") or info.get("uploader"),
+            upload_date=info.get("upload_date"),
+            transcript_source=transcript_source if segments else None,
+            range=rng,
+            segments=list(segments or []),
+            frames=list(frames or []),
+            notes=list(notes or []),
+            report_path=str(work / "report.md") if (work / "report.md").is_file() else None,
+            media_path=media_path,
+            library=refs or None,
+        )
+        result = memory_writer.remember(run, archive=archive)
+        if result is not None:
+            (work / "memory.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+            print(
+                f"[watch] video memory: {result['video_key']} "
+                f"(evidence v{result['evidence_version']}, {result['mode']})",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001 - memory must never fail a run
+        print(f"[watch] memory: not indexed ({type(exc).__name__}: {exc})", file=sys.stderr)
+
+
+def _finish_backend_run(args, work: Path, *, backend_label: str, answer: str,
+                        segments: list[dict], transcript_source: str | None, info: dict,
+                        media_path: str | None, frames: list[dict]) -> None:
+    """Shared tail of the Gemini/OpenRouter backends: write work/report.md (the
+    stdout report plus a transcript section — stdout itself stays answer-only),
+    archive only when should_save allows, then index the run."""
+    question = " ".join(args.question).strip()
+    lines = [
+        f"# watch: video report ({backend_label} backend)",
+        "",
+        f"- **Source:** {args.source}",
+        f"- **Question:** {question}",
+        "",
+        f"## {backend_label} response",
+        "",
+        answer or "",
+        "",
+        "## Transcript",
+        "",
+    ]
+    if segments:
+        lines += [f"_Source: {transcript_source or 'captions'}._", "", "```",
+                  format_transcript(segments), "```"]
+    else:
+        lines.append("_No transcript available._")
+    (work / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    backend = backend_label.lower()
+    detail = getattr(args, "resolved_detail", None) or args.detail or "balanced"
+    saved = _run_should_save(args, backend, detail)
+    refs: dict = {}
+    if saved:
+        refs = _save_library(args, work, media_path=media_path,
+                             frames=[f for f in frames if f.get("path")], ocr_text={}, info=info)
+    note = {"kind": "backend_answer", "t_start": None, "t_end": None,
+            "text": f"Q: {question}\n\n{answer or ''}"}
+    _remember(
+        args, work, backend=backend, detail=detail, info=info,
+        transcript_source=transcript_source, segments=segments,
+        frames=[{"t": f["timestamp_seconds"], "path": f.get("path"), "kind": frame_kind(f), "ocr": None}
+                for f in frames],
+        notes=[note], media_path=media_path, rng=getattr(args, "memory_range", None),
+        refs=refs, archive=saved,
+    )
+
+
+def _gemini_free_transcript(args, work: Path, *, youtube: bool, dl: dict | None,
+                            media_path: str | None) -> tuple[list[dict], str | None, dict, str | None]:
+    """Free transcript for the Gemini backend: yt-dlp captions only (no
+    TranscriptAPI, no extra Gemini call); Whisper only with an explicit
+    --whisper. Returns (segments, source, info, media_path). Never raises."""
+    info: dict = dict((dl or {}).get("info") or {})
+    subtitle_path = (dl or {}).get("subtitle_path")
+    try:
+        if youtube:
+            caps = fetch_captions(
+                args.source,
+                work / "download",
+                sub_langs=args.sub_lang or DEFAULT_SUB_LANGS,
+                cookies_from_browser=args.cookies_from_browser,
+                cookies_file=args.cookies,
+            )
+            info = dict(caps.get("info") or {}) or info
+            subtitle_path = caps.get("subtitle_path")
+        if subtitle_path:
+            segs = parse_vtt(subtitle_path)
+            if segs:
+                return segs, "captions", info, media_path
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - best effort
+        print(f"[watch] caption fetch for memory failed: {exc}", file=sys.stderr)
+    if args.whisper and not args.no_whisper:
+        try:
+            if media_path is None and is_url(args.source):
+                dl2 = download(
+                    args.source, work / "download", audio_only=True,
+                    sub_langs=args.sub_lang or DEFAULT_SUB_LANGS,
+                    cookies_from_browser=args.cookies_from_browser, cookies_file=args.cookies,
+                )
+                media_path = dl2.get("video_path")
+                info = info or dict(dl2.get("info") or {})
+            backend, api_key, hint = resolve_backend(args.whisper)
+            if backend and media_path:
+                segs, used = transcribe_video(
+                    media_path, work / "audio.mp3", backend=backend, api_key=api_key,
+                    model_name=args.whisper_model if backend == "local" else None,
+                    enable_diarization=args.diarize if backend == "assemblyai" else False,
+                    use_cache=not args.fresh,
+                )
+                if used == "local":
+                    label = f"local, {args.whisper_model}"
+                elif used == "assemblyai":
+                    label = "assemblyai, diarized" if args.diarize else "assemblyai"
+                else:
+                    label = used
+                return segs, f"whisper ({label})", info, media_path
+            if hint:
+                print(f"[watch] {hint}", file=sys.stderr)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - best effort
+            print(f"[watch] whisper transcription failed: {exc}", file=sys.stderr)
+    return [], None, info, media_path
 
 
 def _run_gemini_backend(args, work: Path) -> int:
@@ -90,6 +296,8 @@ def _run_gemini_backend(args, work: Path) -> int:
 
     source = args.source
     youtube = is_youtube_url(source)
+    dl: dict | None = None
+    media_path: str | None = None
 
     if youtube:
         gemini_source = source
@@ -98,9 +306,11 @@ def _run_gemini_backend(args, work: Path) -> int:
         print("[watch] downloading via yt-dlp before Gemini upload…", file=sys.stderr)
         dl = download(source, work / "download")
         gemini_source = dl["video_path"]
+        media_path = dl["video_path"]
         mode_label = "yt-dlp download → Gemini Files API upload"
     else:
         gemini_source = source
+        media_path = source
         mode_label = "local file → Gemini Files API upload"
 
     response_text = generate_with_video(
@@ -124,6 +334,23 @@ def _run_gemini_backend(args, work: Path) -> int:
     print()
     print("---")
     print(f"_Work dir: `{work}` — delete when done._")
+    sys.stdout.flush()
+
+    # Memory side (stdout above is the whole contract for ingest/Hermes): only a
+    # FREE transcript (yt-dlp captions) is fetched, and only when the run is
+    # indexed or archived — never TranscriptAPI or a second Gemini call.
+    detail = getattr(args, "resolved_detail", None) or args.detail or "balanced"
+    segments: list[dict] = []
+    tx_source: str | None = None
+    info: dict = {}
+    if not args.no_index or _run_should_save(args, "gemini", detail):
+        segments, tx_source, info, media_path = _gemini_free_transcript(
+            args, work, youtube=youtube, dl=dl, media_path=media_path
+        )
+    _finish_backend_run(
+        args, work, backend_label="Gemini", answer=response_text, segments=segments,
+        transcript_source=tx_source, info=info, media_path=media_path, frames=[],
+    )
     return 0
 
 
@@ -272,6 +499,14 @@ def _run_openrouter_backend(args, work: Path) -> int:
     print()
     print("---")
     print(f"_Work dir: `{work}` — delete when done._")
+    sys.stdout.flush()
+
+    args.memory_range = (effective_start, effective_end) if focused else None
+    _finish_backend_run(
+        args, work, backend_label="OpenRouter", answer=response_text,
+        segments=transcript_segments, transcript_source=transcript_source, info=info,
+        media_path=video_path, frames=frames,
+    )
     return 0
 
 
@@ -402,6 +637,26 @@ def main() -> int:
         "Saving is on by default.",
     )
     ap.add_argument(
+        "--save",
+        action="store_true",
+        help="Archive this run to the library even where it is off by default "
+        "(--backend gemini/openrouter, ingest transcript runs). --no-save / "
+        "WATCH_NO_SAVE still win.",
+    )
+    ap.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Do not record this run in the video memory (index + store). "
+        "Indexing is on by default, even with --no-save.",
+    )
+    ap.add_argument(
+        "--origin",
+        choices=list(ORIGINS),
+        default="skill",
+        help="Who started this run (recorded in the video memory; ingest "
+        "transcript runs are indexed but not archived). Default: skill.",
+    )
+    ap.add_argument(
         "--no-ocr",
         action="store_true",
         help="Disable OCR pass. Skips text detection on frames and the high-res re-extract.",
@@ -500,6 +755,7 @@ def main() -> int:
         state.clear_stages(work)
         print("[watch] --fresh: cleared resume state", file=sys.stderr)
 
+    args.resolved_detail = detail
     if args.backend == "gemini":
         return _run_gemini_backend(args, work)
     if args.backend == "openrouter":
@@ -1109,25 +1365,24 @@ def main() -> int:
 
     (work / "report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
-    # WATCH_NO_SAVE (any non-empty, non-"0"/"false" value) force-disables library
-    # saving even without --no-save. The test suite sets it so e2e runs never
-    # upload fixtures to the real Immich/Nextcloud/Paperless library.
-    env_no_save = os.environ.get("WATCH_NO_SAVE", "").strip().lower() not in ("", "0", "false", "no")
-    if not args.no_save and not env_no_save:
-        video_id = info.get("id") or hashlib.sha1(args.source.encode("utf-8")).hexdigest()[:8]
-        title = info.get("title") or Path(args.source).name
-        try:
-            refs: dict = {}
-            summary = library.save_artifacts(
-                video_path, frames, str(work / "report.md"), ocr_text, title, video_id,
-                refs=refs,
-            )
-            for line in summary:
-                print(f"[watch] {line}", file=sys.stderr)
-            if refs:
-                (work / "library.json").write_text(json.dumps(refs, indent=2), encoding="utf-8")
-        except Exception as exc:  # belt: save must never fail the run
-            print(f"[watch] library save skipped ({exc})", file=sys.stderr)
+    saved = _run_should_save(args, "claude", detail)
+    refs: dict = {}
+    if saved:
+        refs = _save_library(args, work, media_path=video_path, frames=frames,
+                             ocr_text=ocr_text, info=info)
+
+    _remember(
+        args, work, backend="claude", detail=detail, info=info,
+        transcript_source=transcript_source, segments=transcript_segments,
+        frames=[
+            {"t": f["timestamp_seconds"], "path": f.get("path"), "kind": frame_kind(f),
+             "ocr": ocr_text.get(f.get("path"))}
+            for f in frames
+        ],
+        notes=[], media_path=video_path,
+        rng=(effective_start, effective_end) if focused else None,
+        refs=refs, archive=saved,
+    )
 
     return 0
 

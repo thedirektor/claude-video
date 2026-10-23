@@ -146,3 +146,63 @@ class FakeEmbedder:
 
 def embedding_models(conn) -> set[str]:
     return {r[0] for r in conn.execute("SELECT DISTINCT model FROM embeddings")}
+
+
+# --- Task 9: in-process watch.py runs ---------------------------------------
+
+
+def run_watch(argv: list[str]) -> int:
+    """Run ``watch.main()`` in-process with ``argv`` (sys.argv restored after)."""
+    import sys
+
+    import watch
+
+    old = sys.argv
+    sys.argv = ["watch.py", *argv]
+    try:
+        return watch.main()
+    finally:
+        sys.argv = old
+
+
+def store_dir() -> Path:
+    from config import memory_paths
+
+    return memory_paths()["store_dir"]
+
+
+def _query(sql: str, args: tuple = ()) -> list:
+    from memory.index import connect
+
+    c = connect()
+    try:
+        return c.execute(sql, args).fetchall()
+    finally:
+        c.close()
+
+
+def frame_count(video_row: dict) -> int:
+    return _query("SELECT count(*) FROM frames WHERE video_key = ?", (video_row["video_key"],))[0][0]
+
+
+def segment_count() -> int:
+    return _query("SELECT count(*) FROM segments")[0][0]
+
+
+def note_texts() -> list[str]:
+    return [r[0] for r in _query("SELECT text FROM notes ORDER BY id")]
+
+
+class Spy:
+    """Callable stand-in that records ``(args, kwargs)`` in ``.calls``."""
+
+    def __init__(self, return_value=None, raises: BaseException | None = None):
+        self.return_value = return_value
+        self.raises = raises
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if self.raises is not None:
+            raise self.raises
+        return self.return_value
