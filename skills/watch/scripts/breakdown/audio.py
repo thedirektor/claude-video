@@ -21,9 +21,10 @@ MIN_STRENGTH = 0.35  # comb-averaged normalised autocorrelation needed to call a
 MIN_SECONDS = 3.0
 CHUNK_FRAMES = 8192
 PRIOR_BPM = 120.0
-OFFBEAT_RATIO = 0.6
-AMBIG_LOW = 0.35  # off/on ratio between this and OFFBEAT_RATIO cannot separate the octaves
-AMBIG_BPM = (80.0, 100.0)  # where a double-time reading (160-200) is also musically plausible
+OFFBEAT_RATIO = 0.9
+AMBIG_LOW = 0.35  # off/on ratio at or below: only the slower octave is a pulse
+PRIOR_DECISIVE = 1.6  # prior ratio between the octaves that settles a middling off/on ratio
+PRIOR_MIN_RATIO = 0.5  # ...provided the off-beats carry at least this much of the on-beat strength
 AMBIG_CONF = 0.5
 SUPPORT_REL = 0.3
 STABILITY_MIN_S = 4.0
@@ -175,12 +176,19 @@ def _best_phase(e, period: float, np):
 
 
 def _resolve_octave(env, hop_s: float, bpm: float, np):
-    """Half-time guard. Returns ``(bpm, alt)``: ``alt`` is the other octave when the evidence
-    cannot separate them (slots midway between beats carry onsets of middling strength)."""
-    if bpm * 2 > BPM_MAX:
+    """Pick between the octaves ``lo`` and ``2*lo`` when both fall inside 60-200 BPM.
+
+    The off/on ratio compares the slots midway between ``lo`` beats with the ``lo`` beats
+    themselves. Faster is confident only when off-beats really are beats (ratio >= 0.9),
+    slower only when they are nearly empty (<= 0.35). In between the tempo prior settles it
+    only if it strongly favours one octave; otherwise returns ``(bpm, alt)`` with the other
+    octave as ``alt`` (the caller reports it as ambiguous). ``alt`` is None when settled."""
+    lo = bpm if bpm * 2 <= BPM_MAX else (bpm / 2 if bpm / 2 >= BPM_MIN else None)
+    if lo is None:
         return bpm, None
+    hi = lo * 2
     e = np.maximum(env - np.median(env), 0)
-    period = 60.0 / bpm / hop_s
+    period = 60.0 / lo / hop_s
     win = max(1, int(round(period * 0.08)))
     ph = _best_phase(e, period, np)
     on = _slot_peaks(e, ph, period, win, np)
@@ -193,10 +201,12 @@ def _resolve_octave(env, hop_s: float, bpm: float, np):
         return bpm, None
     ratio = off_m / on_m
     if ratio >= OFFBEAT_RATIO:
-        return bpm * 2, None
-    if ratio >= AMBIG_LOW and AMBIG_BPM[0] <= bpm <= AMBIG_BPM[1]:
-        return bpm, bpm * 2
-    return bpm, None
+        return hi, None
+    if ratio <= AMBIG_LOW:
+        return lo, None
+    if ratio >= PRIOR_MIN_RATIO and _prior(hi) / _prior(lo) >= PRIOR_DECISIVE:
+        return hi, None
+    return bpm, (lo if abs(bpm - hi) < abs(bpm - lo) else hi)
 
 
 def _fold_score(e, per: float, np):
@@ -270,24 +280,34 @@ def _beat_grid(env, t0: float, hop_s: float, bpm: float, np):
     return float(refined_bpm), beats
 
 
-def _stable(env, hop_s: float, np) -> str:
-    """"" when the tempo holds across sub-windows, else a note describing the disagreement.
-    Raw readings are compared with octaves folded: 70 and 140 are the same pulse."""
+def _stable(env, hop_s: float, np):
+    """``(change_note, octave_flag)``. ``change_note`` is non-empty when the window tempi
+    disagree even with octaves folded. ``octave_flag`` is True when they agree only after
+    folding and the octave decisions were confident and different (a real 2:1 change)."""
     n = len(env)
     if n * hop_s < 2 * STABILITY_MIN_S:
-        return ""
-    found = []
+        return "", False
+    raw, res = [], []
     for a, b in ((0.0, 0.5), (0.5, 1.0), (0.25, 0.75)):
-        got = _comb_tempo(env[int(a * n):int(b * n)], hop_s, np)
+        seg = env[int(a * n):int(b * n)]
+        got = _comb_tempo(seg, hop_s, np)
         if got is not None and got[1] >= MIN_STRENGTH:
-            found.append(got[0])
-    if len(found) < 2:
-        return ""
-    lo, hi = min(found), max(found)
+            raw.append(got[0])
+            res.append(_resolve_octave(seg, hop_s, got[0], np))
+    if len(raw) < 2:
+        return "", False
+    lo, hi = min(raw), max(raw)
     x = math.log2(hi / lo)
     if abs(x - round(x)) > math.log2(1 + STABILITY_TOL):
-        return f"tempo changes within the clip ({lo:.0f} to {hi:.0f} BPM): no single tempo"
-    return ""
+        return f"tempo changes within the clip ({lo:.0f} to {hi:.0f} BPM): no single tempo", False
+    for i in range(len(res)):
+        for j in range(i + 1, len(res)):
+            (bi, ai), (bj, aj) = res[i], res[j]
+            if abs(math.log2(bi / bj)) > math.log2(1 + STABILITY_TOL):
+                # differing octave readings: harmless if either side admitted it was ambiguous
+                if ai is None and aj is None:
+                    return "", True
+    return "", False
 
 
 def analyze(path: str, duration: float = 0.0) -> dict:
@@ -312,7 +332,7 @@ def analyze(path: str, duration: float = 0.0) -> dict:
         if tempo is None or tempo[1] < MIN_STRENGTH:
             strength = 0.0 if tempo is None else tempo[1]
             return _nd(dur, [f"no steady pulse found (periodicity {strength:.2f} < {MIN_STRENGTH})"], loud)
-        change = _stable(env, hop_s, np)
+        change, octave_flip = _stable(env, hop_s, np)
         if change:
             return _nd(dur, [change], loud)
         bpm0, alt = _resolve_octave(env, hop_s, tempo[0], np)
@@ -325,6 +345,9 @@ def analyze(path: str, duration: float = 0.0) -> dict:
         conf = min(0.95, tempo[1])
         notes: list[str] = []
         extra: dict = {}
+        if octave_flip:
+            conf = min(conf, AMBIG_CONF)
+            notes.append("octave changes between sections")
         if alt:
             conf = min(conf, AMBIG_CONF)
             notes.append("half/double-time ambiguous")
