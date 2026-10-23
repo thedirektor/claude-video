@@ -163,3 +163,29 @@ def test_interior_hold_fade_single_entry(tmp_path):
     _ff("-i", str(a), "-i", str(b), "-filter_complex", "[0][1]concat=n=2:v=1", *ENC, str(p))
     _, out = _series(p)
     assert [e["kind"] for e in out] == ["fade_to_black", "fade_from_black"]
+
+
+def _concat(tmp_path, name, a_src, a_vf, b_src, b_vf):
+    a, b, p = tmp_path / "a.mp4", tmp_path / "b.mp4", tmp_path / f"{name}.mp4"
+    _ff("-f", "lavfi", "-i", a_src, "-vf", a_vf, *ENC, str(a))
+    _ff("-f", "lavfi", "-i", b_src, "-vf", b_vf, *ENC, str(b))
+    _ff("-i", str(a), "-i", str(b), "-filter_complex", "[0][1]concat=n=2:v=1", *ENC, str(p))
+    return p
+
+
+def test_fade_in_then_cut(tmp_path):
+    p = _concat(tmp_path, "fc", "testsrc2=s=320x180:r=25:d=2", "fade=t=in:st=1:d=1",
+                "mandelbrot=s=320x180:r=25,trim=duration=3", "null")
+    _, out = _series(p)
+    assert [e["kind"] for e in out] == ["fade_from_black", "cut"]
+    assert abs(out[1]["t"] - 2.0) <= 0.04 + 1e-6
+    assert out[0]["evidence"]["t_end"] <= 2.0 + 1e-6 and out[0]["evidence"]["t_start"] >= 0.9
+
+
+def test_cut_then_fade_out(tmp_path):
+    p = _concat(tmp_path, "cf", "mandelbrot=s=320x180:r=25,trim=duration=2", "null",
+                "testsrc2=s=320x180:r=25:d=2", "fade=t=out:st=0:d=1")
+    _, out = _series(p, 4.0)
+    assert [e["kind"] for e in out] == ["cut", "fade_to_black"]
+    assert abs(out[0]["t"] - 2.0) <= 0.04 + 1e-6
+    assert out[1]["evidence"]["t_start"] >= 2.0 - 1e-6

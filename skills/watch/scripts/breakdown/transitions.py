@@ -56,12 +56,21 @@ def _blend_residual(thumb: list, i0: int, i1: int) -> float | None:
     return sum(res) / len(res)
 
 
-def _walk(y: list[float], i: int, step: int, sign: int) -> int:
-    """Follow luma monotonically away from an extreme (2-frame lookahead rides over plateaus)."""
+def _walk(y: list[float], i: int, step: int, sign: int, cuts: frozenset = frozenset()) -> int:
+    """Follow luma monotonically away from an extreme (2-frame lookahead rides over plateaus).
+
+    Never crosses a hard cut (index c = first frame after the cut).
+    """
     n = len(y)
+
+    def crosses(a: int, b: int) -> bool:
+        return any(min(a, b) < c <= max(a, b) for c in cuts)
+
     while True:
         j2, j1 = i + 2 * step, i + step
-        if 0 <= j2 < n and sign * (y[j2] - y[i]) > TREND_STEP and sign * (y[j1] - y[i]) > -TREND_STEP:
+        if crosses(i, j1):
+            return i
+        if 0 <= j2 < n and not crosses(i, j2) and sign * (y[j2] - y[i]) > TREND_STEP and sign * (y[j1] - y[i]) > -TREND_STEP:
             i = j1
         elif 0 <= j1 < n and sign * (y[j1] - y[i]) > TREND_STEP:
             i = j1
@@ -69,7 +78,17 @@ def _walk(y: list[float], i: int, step: int, sign: int) -> int:
             return i
 
 
-def _fades(series: dict) -> tuple[list[dict], list[tuple[float, float]]]:
+def _on_ramp(y: list[float], c: int) -> bool:
+    """A "cut" that is just one step of a steep fade ramp (same direction, similar size)."""
+    if c < 2 or c + 1 >= len(y):
+        return False
+    d0, d1, d2 = y[c - 1] - y[c - 2], y[c] - y[c - 1], y[c + 1] - y[c]
+    if min(abs(d0), abs(d1), abs(d2)) < 2.0 or d0 * d1 <= 0 or d1 * d2 <= 0:
+        return False
+    return abs(d1) <= 1.5 * max(abs(d0), abs(d2))
+
+
+def _fades(series: dict, cuts: frozenset = frozenset()) -> tuple[list[dict], list[tuple[float, float]]]:
     """Fades at clip edges and dips through black / white inside the clip.
 
     A dip is two entries: fade_to_<c> at its start and fade_from_<c> at its end.
@@ -92,8 +111,8 @@ def _fades(series: dict) -> tuple[list[dict], list[tuple[float, float]]]:
             j += 1
         sign = 1 if k == "black" else -1
         ext = min(y[i:j + 1]) if k == "black" else max(y[i:j + 1])
-        a = _walk(y, i, -1, sign) if i > 0 else i
-        b = _walk(y, j, 1, sign) if j < n - 1 else j
+        a = _walk(y, i, -1, sign, cuts) if i > 0 else i
+        b = _walk(y, j, 1, sign, cuts) if j < n - 1 else j
         to_ok = i > 0 and i - a >= MIN_FRAMES and sign * (y[a] - ext) >= MIN_DROP
         from_ok = j < n - 1 and b - j >= MIN_FRAMES and sign * (y[b] - ext) >= MIN_DROP
         if to_ok:
@@ -134,15 +153,28 @@ def classify(series: dict, shots: list[dict]) -> list[dict]:
     """One entry per boundary, plus clip-edge fades and dips. Sorted by time."""
     if not series or len(series.get("t", [])) < 2:
         return []
-    fades, spans = _fades(series)
+    tt = series["t"]
+    y = series["yavg"]
+    cuts = set()
+    for sh in shots or []:
+        bd = sh.get("boundary")
+        if bd and bd["kind"] == "cut":
+            c = bisect.bisect_left(tt, bd["t"] - 1e-9)
+            if not _on_ramp(y, c):
+                cuts.add(c)
+    cuts = frozenset(cuts)
+    fades, spans = _fades(series, cuts)
     out: list[dict] = list(fades)
     for shot in shots or []:
         b = shot.get("boundary")
         if not b:
             continue
         ev = b["evidence"]
-        if any(ev["t_start"] <= hi + 1e-9 and ev["t_end"] >= lo - 1e-9 for lo, hi in spans):
-            continue  # a boundary on a fade / dip is that fade itself
+        if b["kind"] == "gradual":
+            if any(ev["t_start"] <= hi + 1e-9 and ev["t_end"] >= lo - 1e-9 for lo, hi in spans):
+                continue  # a gradual boundary on a fade / dip is that fade itself
+        elif any(lo + 1e-9 < b["t"] < hi - 1e-9 for lo, hi in spans):
+            continue  # a cut strictly inside a fade / dip belongs to it
         if b["kind"] == "cut":
             out.append(_entry(b["t"], "cut", 0.0, ev["t_start"], ev["t_end"], ev["confidence"]))
         elif b["kind"] == "gradual":
