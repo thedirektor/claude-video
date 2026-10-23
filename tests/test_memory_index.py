@@ -68,7 +68,7 @@ def test_transcript_rank_order():
 
 def test_migrations_idempotent(tmp_path):
     connect(tmp_path / "i.db").close(); c = connect(tmp_path / "i.db")
-    assert meta(c, "schema_version") == "1" and c.execute("pragma journal_mode").fetchone()[0] == "wal"
+    assert meta(c, "schema_version") == str(index.SCHEMA_VERSION) and c.execute("pragma journal_mode").fetchone()[0] == "wal"
 
 
 # --- extra coverage beyond the brief -----------------------------------------

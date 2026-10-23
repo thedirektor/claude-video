@@ -22,7 +22,7 @@ from config import memory_paths
 from memory.chunking import chunk_segments
 from memory.textnorm import normalize_for_search
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # MIGRATIONS[i] upgrades the schema from version i to i + 1.
 MIGRATIONS: list[str] = [
@@ -129,10 +129,39 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX embeddings_video ON embeddings (video_key);
     """,
+    # v2 (0.5.1): grounded-answer cache + escalation attempts
+    """
+    CREATE TABLE answers (
+        id                INTEGER PRIMARY KEY,
+        video_key         TEXT NOT NULL,
+        evidence_version  INTEGER,
+        question_norm     TEXT,
+        q_model           TEXT,
+        q_dim             INTEGER,
+        q_vec             BLOB,
+        result            TEXT,
+        provider          TEXT,
+        tokens_in         INTEGER NOT NULL DEFAULT 0,
+        tokens_out        INTEGER NOT NULL DEFAULT 0,
+        created           TEXT,
+        hits              INTEGER NOT NULL DEFAULT 0,
+        tokens_saved      INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX answers_video_ev ON answers (video_key, evidence_version);
+    CREATE TABLE escalations (
+        id         INTEGER PRIMARY KEY,
+        video_key  TEXT NOT NULL,
+        t          REAL,
+        added      INTEGER NOT NULL DEFAULT 0,
+        created    TEXT
+    );
+    CREATE INDEX escalations_video_t ON escalations (video_key, t);
+    """,
 ]
 
 # Tables holding per-video rows (forget() clears all of them).
-_VIDEO_TABLES = ("segments", "ocr_blocks", "frames", "notes", "chunks", "embeddings", "fts", "runs", "videos")
+_VIDEO_TABLES = ("segments", "ocr_blocks", "frames", "notes", "chunks", "embeddings", "fts", "runs",
+                 "answers", "escalations", "videos")
 _LIBRARY_COLS = frozenset({"immich_album_id", "nextcloud_path", "paperless_doc_id", "paperless_task_id"})
 # A frame within this many seconds of an existing one is a dedup candidate.
 FRAME_DEDUP_WINDOW_S = 1.0
@@ -482,6 +511,14 @@ def forget(conn: sqlite3.Connection, video_key: str) -> bool:
         for table in _VIDEO_TABLES:
             conn.execute(f"DELETE FROM {table} WHERE video_key = ?", (video_key,))
     return existed
+
+
+def bump_evidence(conn: sqlite3.Connection, video_key: str) -> int:
+    """Mark the video's evidence set as changed (invalidates cached answers)."""
+    with _tx(conn):
+        conn.execute("UPDATE videos SET evidence_version = evidence_version + 1 WHERE video_key = ?", (video_key,))
+        row = conn.execute("SELECT evidence_version FROM videos WHERE video_key = ?", (video_key,)).fetchone()
+    return int(row[0]) if row else 0
 
 
 def set_library_ref(conn: sqlite3.Connection, video_key: str, **cols) -> None:
