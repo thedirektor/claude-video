@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.5.2"
+version: "0.5.3"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -478,6 +478,14 @@ Settings (env or `~/.config/watch/.env`):
 Archived report frame lines now link to their Immich assets, and a Paperless upload's task id is resolved to its document id.
 
 **Visual questions without media (0.5.2).** When `ask --answer` is still low-confidence after the model-free escalation and the video is a YouTube URL with no stored media, Gemini watches the URL once and its timestamped on-screen log (`[on screen] …`) is stored permanently as `notes(kind=visual)`; the answer is then re-packed and can cite those times. Once per video, needs `GEMINI_API_KEY`, opt out with `WATCH_VISUAL_LOG=0`. Local files never go to Gemini this way.
+
+## Outputs: chapters, notes and exports (0.5.3)
+
+After every indexed run `/watch` stores **chapters** (from transcript pauses ≥ 2.5 s, speaker changes and scene cuts; ~1 per 150 s, 2–12) as `notes(kind=chapter)` and writes **`notes.md`** — 2–5 bullets per chapter, each ending `(MM:SS)` copied from the transcript/OCR row it came from. `--llm-titles` (or `WATCH_LLM_TITLES=1`) rewrites chapter titles with one cheap LLM call.
+
+`--exports FORMATS` builds documents from the video memory (`<store>/<video>/exports/`): `pdf` (report + storyboard deck merged, searchable), `docx` (report: chapters, key frames, cited notes, transcript appendix), `pptx` (one slide per chapter with its key frame; speaker notes = that chapter's transcript), `xlsx` (Transcript / OCR / Chapters / Frames sheets), `viewer` (single-file offline HTML: chapter timeline, frames, click-to-time transcript + OCR, cached answers), `json`, `contact` (contact sheet PNG), or `all` / `none`. Default: `WATCH_EXPORTS`, else `pdf,pptx` when the ArtCraft CLIs are installed, else none. The office formats need `wordcraft-cli`, `deckcraft-cli`, `gridcraft-cli`, `pdfcraft-cli` (PATH, `WATCH_CRAFT_BIN_DIR`, or `~/.local/opt/artcraft/<app>-<ver>/bin`); a missing CLI only skips its format.
+
+When the run is archived, the exports go to the Nextcloud folder, the merged PDF goes to **Paperless instead of report.md**, and the contact sheet joins the Immich album. Rebuild exports for any indexed video without re-watching: `watch.py export <video> [--formats …] [--out DIR] [--json]`.
 
 ## Blocked YouTube downloads (storyboards, self-heal, doctor)
 

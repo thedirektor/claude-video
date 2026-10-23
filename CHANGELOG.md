@@ -2,11 +2,15 @@
 
 All notable changes to `/watch` are documented here.
 
-## [Unreleased]
+## [0.5.3] — 2026-10-23
+
+Outputs from the video memory.
 
 ### Added
+- **Chapters + cited notes** (`memory/extract.py`): deterministic boundaries (pauses, speaker changes, scene cuts) snapped to an even split, first-sentence titles (caption credit lines skipped), optional LLM titles; `notes(kind=chapter)` + `notes.md` with `(MM:SS)` from source rows.
+- **Exports** (`exports.py`): `docx`/`pdf`/`pptx`/`xlsx` via the ArtCraft CLIs, merged searchable PDF (deck at 96 dpi + text layer), offline `viewer.html` (≤ 25 MB inlined frames), `json`, contact sheet (ffmpeg). Built from the index + store; `--exports`, `WATCH_EXPORTS`, `watch.py export`.
+- **Library routing**: exports → Nextcloud folder, merged PDF → Paperless (replaces report.md), contact sheet → Immich album (`library.save_exports`).
 - **Fallback proxy** (`WATCH_YTDLP_FALLBACK_PROXY`, `WATCH_FALLBACK_MAX_MB`): a blocked download is retried once through a residential HTTP proxy (≤480p, size cap, 20 s socket timeout); `doctor` probes it. Storyboards remain the next fallback.
-- **Chapters + cited notes** (`memory/extract.py`).
 
 ## [0.5.2] — 2026-10-23
 
