@@ -140,3 +140,26 @@ def test_dip_through_black(tmp_path):
     _, out = _series(p)
     assert [e["kind"] for e in out] == ["fade_to_black", "fade_from_black"]
     assert out[0]["t"] < out[1]["t"]
+
+
+def test_hold_then_fade_in_single_entry(tmp_path):
+    p = tmp_path / "h.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=5", "-vf", "fade=t=in:st=1:d=1", *ENC, str(p))
+    _, out = _series(p)
+    assert [e["kind"] for e in out] == ["fade_from_black"]
+
+
+def test_fade_out_then_hold_single_entry(tmp_path):
+    p = tmp_path / "o.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=5", "-vf", "fade=t=out:st=3:d=1", *ENC, str(p))
+    _, out = _series(p)
+    assert [e["kind"] for e in out] == ["fade_to_black"]
+
+
+def test_interior_hold_fade_single_entry(tmp_path):
+    a, b, p = tmp_path / "a.mp4", tmp_path / "b.mp4", tmp_path / "c.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=2", "-vf", "fade=t=out:st=1:d=1", *ENC, str(a))
+    _ff("-f", "lavfi", "-i", "testsrc=s=320x180:r=25:d=3", "-vf", "fade=t=in:st=1:d=1", *ENC, str(b))
+    _ff("-i", str(a), "-i", str(b), "-filter_complex", "[0][1]concat=n=2:v=1", *ENC, str(p))
+    _, out = _series(p)
+    assert [e["kind"] for e in out] == ["fade_to_black", "fade_from_black"]

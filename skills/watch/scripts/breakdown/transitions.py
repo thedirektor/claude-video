@@ -100,6 +100,10 @@ def _fades(series: dict) -> tuple[list[dict], list[tuple[float, float]]]:
             out.append(_entry((t[a] + t[i]) / 2, f"fade_to_{k}", t[i] - t[a], t[a], t[i], 0.85))
         if from_ok:
             out.append(_entry((t[j] + t[b]) / 2, f"fade_from_{k}", t[b] - t[j], t[j], t[b], 0.85))
+        if to_ok:
+            spans.append((t[a], t[i]))
+        if from_ok:
+            spans.append((t[j], t[b]))
         if to_ok and from_ok:
             spans.append((t[a], t[b]))
         i = j + 1
@@ -134,9 +138,11 @@ def classify(series: dict, shots: list[dict]) -> list[dict]:
     out: list[dict] = list(fades)
     for shot in shots or []:
         b = shot.get("boundary")
-        if not b or any(lo - 1e-9 <= b["t"] <= hi + 1e-9 for lo, hi in spans):
-            continue  # a boundary inside a dip is the dip itself
+        if not b:
+            continue
         ev = b["evidence"]
+        if any(ev["t_start"] <= hi + 1e-9 and ev["t_end"] >= lo - 1e-9 for lo, hi in spans):
+            continue  # a boundary on a fade / dip is that fade itself
         if b["kind"] == "cut":
             out.append(_entry(b["t"], "cut", 0.0, ev["t_start"], ev["t_end"], ev["confidence"]))
         elif b["kind"] == "gradual":
