@@ -2,6 +2,22 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.5.2] — 2026-10-23
+
+Acquisition resilience without accounts or paid proxies.
+
+### Added
+- **Storyboard frames** (`storyboard.py`): a blocked YouTube media download on a non-transcript run falls back to the public storyboard (`sb0`…`sb3`), split into tiles with ffmpeg `untile`, timed from the format's fps, honouring `--start/--end` and the frame cap; indexed as frame kind `storyboard`. No storyboard + a transcript → the run completes frameless instead of exiting.
+- **yt-dlp self-heal** (`download.py`): breakage classification (extractor errors, not 403/bot walls), one upgrade per 6 h (`WATCH_YTDLP_PYLIB` target or `pip --user`; `WATCH_YTDLP_SELF_HEAL=0` off) and a single retry, for both downloads and caption fetches.
+- **Gemini visual log** (`gemini.visual_log`, `memory/escalate.visual_log`): low-confidence answers on media-less YouTube videos get Gemini's timestamped on-screen log once per video, stored as `notes(kind=visual)`; `WATCH_VISUAL_LOG=0` off.
+- **`watch.py doctor [--fix] [--json] [--offline]`**: dependency, canary, model, storage, endpoint and key-presence checks; safe repairs.
+
+### Changed
+- Personal hosts are no longer built-in defaults: `IMMICH_BASE_URL`, `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `PAPERLESS_URL` and `WATCH_LLM_BASE_URL` must be configured (a target without them is skipped).
+
+### Not done (closed no-go)
+- PO-token provider, Deno/EJS and self-hosted cobalt could not fetch most YouTube media from a datacenter IP without a logged-in account; the residential-proxy fallback was dropped (paid).
+
 ## [0.5.1] — 2026-10-23
 
 Grounded answers over the video memory.
