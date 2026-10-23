@@ -79,3 +79,10 @@ def test_import_rejects_oversize(tmp_path, monkeypatch):
     monkeypatch.setattr(bundle, "MAX_BUNDLE_BYTES", 10)
     with pytest.raises(bundle.BundleError):
         bundle.import_bundle(z, embedder=None)
+
+
+def test_import_rejects_non_zip(tmp_path):
+    p = tmp_path / "x.zip"
+    p.write_bytes(b"not-a-zip")
+    with pytest.raises(bundle.BundleError):
+        bundle.import_bundle(p, embedder=None)

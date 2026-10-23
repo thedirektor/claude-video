@@ -82,6 +82,8 @@ def make_bundle(conn, key: str, out_path: Path, *, store_dir=None, host: str | N
 def _safe_extract(zip_path: Path, dest: Path) -> None:
     if zip_path.stat().st_size > _max_bytes():
         raise BundleError(f"bundle larger than {_max_bytes() // (1024 * 1024)} MB")
+    if not zipfile.is_zipfile(zip_path):
+        raise BundleError("not a zip bundle")
     with zipfile.ZipFile(zip_path) as z:
         total = 0
         for m in z.infolist():
