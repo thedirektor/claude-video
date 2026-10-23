@@ -19,6 +19,8 @@ from __future__ import annotations
 import os
 import re
 import sys
+
+import spend
 import time
 from pathlib import Path
 import sys as _sys
@@ -272,6 +274,7 @@ def generate_with_video(
             f"Gemini generate_content failed: {type(exc).__name__}: {exc}"
         )
 
+    spend.record_gemini(response, model_name, "answer (gemini backend)")
     text = getattr(response, "text", None) or ""
     if not text:
         # Surface finish_reason / safety info when the model returned nothing
@@ -406,6 +409,7 @@ def visual_log(
             ])],
             config=types.GenerateContentConfig(**config_kwargs),
         )
+        spend.record_gemini(response, model_name, "visual log")
         segments = parse_timestamped_lines(getattr(response, "text", None) or "")
         if duration:
             segments = [s for s in segments if s["start"] <= float(duration) * _DURATION_SLACK]
@@ -469,6 +473,7 @@ def transcribe_youtube(
             contents=contents,
             config=types.GenerateContentConfig(**config_kwargs),
         )
+        spend.record_gemini(response, model_name, "transcript (Gemini via URL)")
         try:
             finish = str(getattr(response.candidates[0], "finish_reason", "") or "")
         except (AttributeError, IndexError, TypeError):

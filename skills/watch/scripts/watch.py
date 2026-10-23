@@ -46,6 +46,8 @@ import identity  # noqa: E402
 import storyboard  # noqa: E402
 import doctor  # noqa: E402
 import exports  # noqa: E402
+import cost  # noqa: E402
+import spend  # noqa: E402
 from memory import writer as memory_writer  # noqa: E402
 from memory.index import RunRecord, frame_kind  # noqa: E402
 from ocr import is_significant, run_ocr  # noqa: E402
@@ -104,6 +106,42 @@ def _library_name(args, info: dict) -> tuple[str, str]:
     """(title, video_id) naming this run's library entry (album / folder / document)."""
     video_id = info.get("id") or hashlib.sha1(args.source.encode("utf-8")).hexdigest()[:8]
     return info.get("title") or Path(args.source).name, video_id
+
+
+def _probe(args) -> dict:
+    """Cheap metadata for the cost plan: duration, captions, audio. Never raises."""
+    try:
+        if not is_url(args.source):
+            meta = get_metadata(str(Path(args.source).expanduser()))
+            return {"duration": meta.get("duration_seconds") or 0, "has_audio": bool(meta.get("has_audio")),
+                    "youtube": False, "has_captions": False}
+        from download import run_ytdlp
+
+        r = run_ytdlp(["--skip-download", "--dump-single-json", "--no-warnings", "--no-playlist", "--", args.source])
+        info = json.loads(r.stdout or "{}") if getattr(r, "stdout", None) else {}
+        subs = info.get("subtitles") or {}
+        auto = info.get("automatic_captions") or {}
+        wanted = ("es", "en")
+        has_captions = bool(subs) or any(k.split("-")[0] in wanted or k.endswith("-orig") for k in auto)
+        return {"duration": info.get("duration") or 0, "has_captions": has_captions, "has_audio": True,
+                "youtube": transcriptapi.is_youtube_url(args.source)}
+    except Exception as exc:  # noqa: BLE001 - an unknown duration plans as 0 s
+        print(f"[watch] cost plan: metadata probe failed ({exc})", file=sys.stderr)
+        return {"duration": 0, "youtube": is_url(args.source) and transcriptapi.is_youtube_url(args.source)}
+
+
+def _cost_gate(args, work: Path) -> int | None:
+    """--plan prints the cost plan and returns 0; otherwise enforce the ceiling
+    (WATCH_COST_CEILING_USD; 0 disables) before any paid call. None = go on."""
+    if not args.plan and (args.allow_cost or cost.ceiling() <= 0):
+        return None
+    p = cost.plan(args, _probe(args))
+    (work / "plan.json").write_text(json.dumps(p, indent=2), encoding="utf-8")
+    if args.plan:
+        print(cost.render(p))
+        return 0
+    cost.enforce(p, allow=args.allow_cost)
+    return None
 
 
 def _planned_exports(args) -> list[str]:
@@ -296,6 +334,7 @@ def _finish_backend_run(args, work: Path, *, backend_label: str, answer: str,
         refs=refs, archive=saved,
     )
     _outputs(args, work, result, saved=saved, info=info)
+    spend.flush(work)
 
 
 def _gemini_free_transcript(args, work: Path, *, youtube: bool, dl: dict | None,
@@ -740,6 +779,17 @@ def main() -> int:
         "WATCH_NO_SAVE still win.",
     )
     ap.add_argument(
+        "--plan",
+        action="store_true",
+        help="Print the cost plan (duration, frames, transcript route, $ per paid provider, "
+        "what leaves the box) and exit without doing anything else.",
+    )
+    ap.add_argument(
+        "--allow-cost",
+        action="store_true",
+        help="Run even when the cost plan exceeds WATCH_COST_CEILING_USD (default 1.00).",
+    )
+    ap.add_argument(
         "--exports",
         default=None,
         metavar="FORMATS",
@@ -866,6 +916,10 @@ def main() -> int:
         print("[watch] --fresh: cleared resume state", file=sys.stderr)
 
     args.resolved_detail = detail
+    spend.reset()
+    gated = _cost_gate(args, work)
+    if gated is not None:
+        return gated
     if args.backend == "gemini":
         return _run_gemini_backend(args, work)
     if args.backend == "openrouter":
@@ -931,6 +985,7 @@ def main() -> int:
                 print(f"[watch] fetching transcript via TranscriptAPI (lang: {ta_langs})…", file=sys.stderr)
                 ta_result = transcriptapi.fetch_transcript(args.source, ta_key, language=ta_langs)
                 if ta_result is not None:
+                    spend.record("transcriptapi", "transcript", usd=0.0, credits=1)
                     transcript_segments, _resolved_lang = ta_result
                     transcript_text = format_transcript(transcript_segments)
                     transcript_source = (
@@ -1111,6 +1166,10 @@ def main() -> int:
                     filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 )
                 transcript_text = format_transcript(transcript_segments)
+                if used_backend != "local":
+                    spend.record(used_backend, "transcript (Whisper)", seconds=effective_duration,
+                                 price_key={"groq": "groq:whisper-large-v3", "openai": "openai:whisper-1",
+                                            "assemblyai": "assemblyai:universal"}.get(used_backend))
                 # Fold per-backend extras into a single label so the transcript header
                 # says exactly what produced it: "local, large-v3", "assemblyai,
                 # diarized", plain "groq", and a "--audio" suffix for external tracks.
@@ -1520,6 +1579,7 @@ def main() -> int:
         refs=refs, archive=saved,
     )
     _outputs(args, work, result, saved=saved, info=info)
+    spend.flush(work)
 
     return 0
 

@@ -152,6 +152,13 @@ def _llm_titles(chapters: list[dict], segs: list[dict], complete) -> list[str] |
         return None
     if reply is None:
         return None
+    try:
+        import spend
+
+        spend.record(reply.provider, "chapter titles", price_key=f"{reply.provider}:{reply.model}",
+                     tokens_in=reply.tokens_in, tokens_out=reply.tokens_out)
+    except Exception:  # noqa: BLE001
+        pass
     got: dict[int, str] = {}
     for line in (reply.text or "").splitlines():
         m = re.match(r"^\s*(\d+)[.)]\s*(.+?)\s*$", line)

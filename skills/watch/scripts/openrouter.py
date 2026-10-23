@@ -21,6 +21,8 @@ import mimetypes
 import os
 import ssl
 import sys
+
+import spend
 import time
 import urllib.error
 import uuid
@@ -448,6 +450,11 @@ def analyze_with_frames(
             pass
         if not text:
             raise SystemExit(f"OpenRouter vision returned empty response: {raw[:400]}")
+        usage = data.get("usage") or {}
+        spend.record("openrouter", f"answer ({vision_model})",
+                     usd=usage.get("cost") if isinstance(usage.get("cost"), (int, float)) else None,
+                     price_key=f"openrouter:{vision_model}",
+                     tokens_in=int(usage.get("prompt_tokens") or 0), tokens_out=int(usage.get("completion_tokens") or 0))
         return text
 
     raise SystemExit(
