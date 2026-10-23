@@ -4,17 +4,26 @@ Per-line detections are merged into tracks (same normalised text, box IoU >= 0.6
 on consecutive samples). In/out times are refined by bisecting between the last
 sample that saw the text and the next one that did not. Font family is always
 ``"not determined"``; size (``height_rel``), colour, position and timing are
-measured. The entrance is ``"cut"`` only when the first frame carrying the text
-already shows it complete; anything else is ``"not determined"``.
+measured. Entrance and exit come from pixels: every frame around the text's
+appearance is diffed against a text-free background frame and the changed
+region's box and contrast ramp are classified (cut / fade / slide_* / scale);
+anything unclear is ``"not determined"``. ``slide_left`` means the text moves
+leftwards. The per-sample OCR boxes are kept in ``evidence["box_track"]``.
 """
 from __future__ import annotations
 
+import math
 import re
 
 NOT_DETERMINED = "not determined"
 MIN_CONF = 60
 IOU_MERGE = 0.6
 REFINE_STEPS = 4
+WORK_W = 320
+MASK_T = 12  # grey-level change that counts as text pixels
+LEAD_S = 1.0  # window before / after a track when looking for its animation
+TAIL_S = 0.3  # extra look-ahead past the first sample without text (backgrounds often change soon after)
+CUT_FRAMES = 2
 
 
 def _import_cv():
@@ -91,19 +100,19 @@ def _detect(ocr, img, cv2) -> list[dict]:
     return out
 
 
-def _present(ocr, cv2, cap, t: float, norm: str, box) -> bool:
+def _present(ocr, cv2, cap, t: float, norm: str) -> bool:
     img = _read(cap, cv2, t)
     if img is None:
         return False
-    return any(d["norm"] == norm and _iou(d["box"], box) >= IOU_MERGE for d in _detect(ocr, img, cv2))
+    return any(d["norm"] == norm for d in _detect(ocr, img, cv2))
 
 
-def _bisect(ocr, cv2, cap, t_seen: float, t_unseen: float, norm, box) -> float:
+def _bisect(ocr, cv2, cap, t_seen: float, t_unseen: float, norm) -> float:
     """Boundary between a time the text is seen and one it is not."""
     lo, hi = t_seen, t_unseen
     for _ in range(REFINE_STEPS):
         mid = (lo + hi) / 2.0
-        if _present(ocr, cv2, cap, mid, norm, box):
+        if _present(ocr, cv2, cap, mid, norm):
             lo = mid
         else:
             hi = mid
@@ -128,16 +137,136 @@ def _color_hex(cv2, np, img, box) -> str:
     return "#%02x%02x%02x" % tuple(int(round(v)) for v in top.mean(axis=0))
 
 
-def _entrance(ocr, cv2, cap, t_in: float, fps: float, norm, box) -> str:
-    """'cut' iff the text is absent one frame before t_in and complete one frame after."""
-    if not fps or fps <= 0:
-        return NOT_DETERMINED
-    dt = 1.0 / fps
-    if t_in - 2 * dt < 0:
-        return NOT_DETERMINED
-    before = _present(ocr, cv2, cap, t_in - 2 * dt, norm, box)
-    after = _present(ocr, cv2, cap, t_in + 2 * dt, norm, box)
-    return "cut" if (not before and after) else NOT_DETERMINED
+def _gray_frames(cv2, cap, fps: float, t0: float, t1: float, box):
+    """[(t, small gray)] for every source frame in [t0, t1], cropped around ``box``.
+
+    The crop (the settled box plus one box-width / three box-heights of margin) keeps
+    other on-screen text and background changes elsewhere out of the diff.
+    """
+    i0, i1 = int(t0 * fps + 1e-6), int(math.ceil(t1 * fps - 1e-6)) + 1
+    cap.set(cv2.CAP_PROP_POS_FRAMES, i0)
+    out = []
+    for i in range(i0, i1 + 1):
+        ok, img = cap.read()
+        if not ok or img is None:
+            break
+        h, w = img.shape[:2]
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hk = max(2, int(round(h * WORK_W / w)))
+        g = cv2.resize(g, (WORK_W, hk), interpolation=cv2.INTER_AREA)
+        x0 = max(0, int((box[0] - box[2]) * WORK_W))
+        x1 = min(WORK_W, int(math.ceil((box[0] + 2 * box[2]) * WORK_W)))
+        y0 = max(0, int((box[1] - 3 * box[3]) * hk))
+        y1 = min(hk, int(math.ceil((box[1] + 4 * box[3]) * hk)))
+        out.append((i / fps, g[y0:y1, x0:x1]))
+    return out
+
+
+def _bbox(np, m):
+    ys, xs = np.where(m)
+    if len(xs) == 0:
+        return None
+    return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
+def _classify(np, grays) -> tuple[str, int | None]:
+    """Entrance class for a frame sequence [text-free background, ..., settled text].
+
+    Returns (class, index of the first frame showing text) or ("not determined", None).
+    """
+    nd = (NOT_DETERMINED, None)
+    if len(grays) < 3:
+        return nd
+    bg = grays[0].astype(np.int16)
+    diffs = [np.abs(g.astype(np.int16) - bg) for g in grays]
+    masks = [d > MASK_T for d in diffs]
+    fm = masks[-1]
+    area_f = int(fm.sum())
+    h, w = fm.shape
+    if area_f < 40 or area_f > 0.5 * h * w:
+        return nd
+    e = [float(d[fm].mean()) for d in diffs]
+    boxes = [_bbox(np, m) for m in masks]
+    bf = boxes[-1]
+    area = [int(m.sum()) for m in masks]
+    thr = max(8, 0.03 * area_f)
+    start = next((i for i in range(1, len(grays)) if area[i] >= thr and (i + 1 >= len(grays) or area[i + 1] >= thr)), None)
+    if start is None:
+        return nd
+
+    def same(b):
+        return (b is not None and abs(b[0] - bf[0]) <= 1.5 and abs(b[1] - bf[1]) <= 1.5
+                and abs(b[2] - bf[2]) <= 1.5 and abs(b[3] - bf[3]) <= 1.5)
+
+    settle = len(grays) - 1
+    while settle - 1 >= start and same(boxes[settle - 1]) and e[settle - 1] >= 0.9 * e[-1]:
+        settle -= 1
+    if settle - start <= CUT_FRAMES - 1:
+        return "cut", start
+    seq = list(range(start, settle + 1))
+    live = [i for i in seq if boxes[i] is not None]
+    if len(live) < 3:
+        return nd
+    fw, fh = bf[2] - bf[0], bf[3] - bf[1]
+    free = [i for i in live if boxes[i][0] > 0 and boxes[i][1] > 0 and boxes[i][2] < w and boxes[i][3] < h]
+    cx = [(boxes[i][0] + boxes[i][2]) / 2 for i in live]
+    cy = [(boxes[i][1] + boxes[i][3]) / 2 for i in live]
+    # the text's own box is only trustworthy once it is a clear majority of the final one
+    if len(free) >= 2 and all(
+            abs((boxes[i][2] - boxes[i][0]) / fw - 1) > 0.15 and abs((boxes[i][3] - boxes[i][1]) / fh - 1) > 0.15
+            for i in free[:max(1, len(free) // 2)]):
+        return "scale", start
+    dx, dy = cx[-1] - cx[0], cy[-1] - cy[0]
+    if max(abs(dx), abs(dy)) >= 8:
+        axis, delta, series = (0, dx, cx) if abs(dx) >= abs(dy) else (1, dy, cy)
+        other = abs(dy) if axis == 0 else abs(dx)
+        steps = [b - a for a, b in zip(series, series[1:])]
+        sgn = 1 if delta > 0 else -1
+        if other * 3 <= abs(delta) and all(sgn * st >= -1.5 for st in steps):
+            if axis == 0:
+                return ("slide_right" if delta > 0 else "slide_left"), start
+            return ("slide_down" if delta > 0 else "slide_up"), start
+        return nd
+    ramp = [e[i] / e[-1] for i in live]
+    still = all(abs(c - cx[-1]) <= 2 and abs(d - cy[-1]) <= 2 for c, d in zip(cx, cy))
+    if still and len(set(round(r, 1) for r in ramp)) >= 3 and all(b >= a - 0.08 for a, b in zip(ramp, ramp[1:])):
+        return "fade", start
+    return nd
+
+
+_FLIP = {"slide_left": "slide_right", "slide_right": "slide_left", "slide_up": "slide_down", "slide_down": "slide_up"}
+
+
+def _entrance(cv2, np, cap, fps, t_first, t_settled, duration, box) -> tuple[str, float | None]:
+    """(class, animation start time) from the frames before the text settles."""
+    if not fps or fps <= 0 or t_first <= 0:
+        return NOT_DETERMINED, None
+    w0 = max(0.0, t_first - LEAD_S)
+    frames = _gray_frames(cv2, cap, fps, w0, min(duration, t_settled), box)
+    cls, i = _classify(np, [g for _, g in frames])
+    return (cls, frames[i][0]) if i is not None else (NOT_DETERMINED, None)
+
+
+def _exit(cv2, np, cap, fps, t_settled, t_end, duration, box) -> tuple[str, float | None]:
+    """(class, time the text is gone) from the frames after the text starts leaving."""
+    if not fps or fps <= 0 or t_end >= duration - 1.0 / fps:
+        return NOT_DETERMINED, None
+    frames = _gray_frames(cv2, cap, fps, t_settled, min(duration, t_end + TAIL_S), box)
+    frames.reverse()
+    cls, i = _classify(np, [g for _, g in frames])
+    if i is None:
+        return NOT_DETERMINED, None
+    return _FLIP.get(cls, cls), frames[i][0] + 1.0 / fps
+
+
+def _modal(boxes):
+    """Indices of the largest group of samples whose boxes agree (IoU >= 0.9), later wins ties."""
+    best = []
+    for i, (_, b) in enumerate(boxes):
+        grp = [j for j, (_, c) in enumerate(boxes) if _iou(b, c) >= 0.9]
+        if len(grp) >= len(best):
+            best = grp
+    return best
 
 
 def text_tracks(path: str, duration: float, step: float = 0.5) -> tuple[list[dict], list[str]]:
@@ -170,41 +299,53 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
             dets = _detect(ocr, img, cv2) if img is not None else []
             still = []
             for tr in open_tracks:
-                m = next((d for d in dets if d["norm"] == tr["norm"] and _iou(d["box"], tr["box"]) >= IOU_MERGE), None)
+                cands = [d for d in dets if d["norm"] == tr["norm"]]
+                m = max(cands, key=lambda d: _iou(d["box"], tr["boxes"][-1][1])) if cands else None
                 if m:
                     dets.remove(m)
-                    tr["last"], tr["box"], tr["frames"] = t, m["box"], tr["frames"] + 1
-                    tr["mid_img"] = img
+                    tr["last"] = t
+                    tr["boxes"].append((t, m["box"]))
                     still.append(tr)
                 else:
                     done.append(tr)
             for d in dets:
-                still.append({"text": d["text"], "norm": d["norm"], "box": d["box"], "first": t, "last": t,
-                              "frames": 1, "mid_img": img})
+                still.append({"text": d["text"], "norm": d["norm"], "first": t, "last": t, "boxes": [(t, d["box"])]})
             open_tracks = still
         done.extend(open_tracks)
         out = []
         for tr in done:
+            grp = _modal(tr["boxes"])
+            t_set_in, box = tr["boxes"][grp[0]]
+            t_set_out = tr["boxes"][grp[-1]][0]
             t_first, t_last = tr["first"], tr["last"]
             nxt = t_last + step
             if nxt < duration - 1e-9:
-                t_out = _bisect(ocr, cv2, cap, t_last, nxt, tr["norm"], tr["box"])
+                t_out = _bisect(ocr, cv2, cap, t_last, nxt, tr["norm"])
             else:
                 t_out = duration
             prv = t_first - step
-            t_in = _bisect(ocr, cv2, cap, t_first, prv, tr["norm"], tr["box"]) if prv >= 0 else 0.0
-            entrance = _entrance(ocr, cv2, cap, t_in, fps, tr["norm"], tr["box"])
-            conf = min(0.95, 0.5 + 0.1 * tr["frames"])
+            t_in = _bisect(ocr, cv2, cap, t_first, prv, tr["norm"]) if prv >= 0 else 0.0
+            entrance, a_in = _entrance(cv2, np, cap, fps, t_first, t_set_in, duration, box)
+            if a_in is not None:
+                t_in = a_in
+            ex, a_out = _exit(cv2, np, cap, fps, t_set_out, t_last + step, duration, box) if nxt < duration - 1e-9 \
+                else (NOT_DETERMINED, None)
+            if a_out is not None:
+                t_out = a_out
+            ref = _read(cap, cv2, t_set_out)  # latest sample with the settled box: fully opaque
+            conf = min(0.95, 0.5 + 0.1 * len(tr["boxes"]))
             out.append({
                 "text": tr["text"],
                 "t_in": round(t_in, 3), "t_out": round(t_out, 3),
-                "box": [round(v, 4) for v in tr["box"]],
-                "height_rel": round(tr["box"][3], 4),
-                "color_hex": _color_hex(cv2, np, tr["mid_img"], tr["box"]),
+                "box": [round(v, 4) for v in box],
+                "height_rel": round(box[3], 4),
+                "color_hex": _color_hex(cv2, np, ref, box) if ref is not None else NOT_DETERMINED,
                 "entrance": entrance,
+                "exit": ex,
                 "font_family": NOT_DETERMINED,
                 "evidence": {"t_start": round(t_in, 3), "t_end": round(t_out, 3), "method": "ocr",
-                             "confidence": round(conf, 3), "samples": tr["frames"]},
+                             "confidence": round(conf, 3), "samples": len(tr["boxes"]),
+                             "box_track": [[round(tt, 3)] + [round(v, 4) for v in b] for tt, b in tr["boxes"]]},
             })
         out.sort(key=lambda r: (r["t_in"], r["box"][1], r["box"][0]))
         return out

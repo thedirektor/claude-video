@@ -105,22 +105,30 @@ def _palette(np, rgb):  # rgb float 0..1 (n,3)
     return out[:PALETTE_K]
 
 
+def _bars(np, black):
+    n = len(black)
+    lo = 0
+    while lo < n and black[lo]:
+        lo += 1
+    hi = 0
+    while hi < n - lo and black[n - 1 - hi]:
+        hi += 1
+    return lo / n, hi / n
+
+
 def _letterbox(np, grays):
-    """{"top","bottom"} bar heights (fraction) shared by every sampled frame, else None."""
-    h = grays[0].shape[0]
-    black = np.all([(g.max(axis=1) < BLACK_LUMA) for g in grays if g.shape[0] == h], axis=0)
-    top = 0
-    while top < h and black[top]:
-        top += 1
-    bottom = 0
-    while bottom < h - top and black[h - 1 - bottom]:
-        bottom += 1
-    tf, bf = top / h, bottom / h
-    if top == h or tf > BAR_MAX or bf > BAR_MAX:
+    """Bar sizes (fraction of height / width) black in every sampled frame, else None."""
+    gs = [g for g in grays if g.shape == grays[0].shape]
+    rows = np.all([(g.max(axis=1) < BLACK_LUMA) for g in gs], axis=0)
+    cols = np.all([(g.max(axis=0) < BLACK_LUMA) for g in gs], axis=0)
+    if rows.all() or cols.all():
         return None
-    if tf < BAR_MIN and bf < BAR_MIN:
+    (tf, bf), (lf, rf) = _bars(np, rows), _bars(np, cols)
+    if max(tf, bf, lf, rf) > BAR_MAX:
         return None
-    return {"top": round(tf, 4), "bottom": round(bf, 4)}
+    out = {k: (round(v, 4) if v >= BAR_MIN else 0.0) for k, v in
+           (("top", tf), ("bottom", bf), ("left", lf), ("right", rf))}
+    return out if any(out.values()) else None
 
 
 def _measure(cv2, np, path: str, shot: dict) -> dict:
