@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,29 @@ for _k in (
     "PAPERLESS_URL", "PAPERLESS_TOKEN",
 ):
     os.environ.pop(_k, None)
+
+# Video-memory isolation (Review Focus 1). ASSIGN, never setdefault: a host
+# env pointing at the central index/store must not leak into tests. The session
+# dir is a safety net; the autouse fixture below gives each test its own.
+_SESSION_MEM = tempfile.mkdtemp(prefix="watch-test-mem-")
+os.environ["WATCH_INDEX_DB"] = str(Path(_SESSION_MEM) / "index.db")
+os.environ["WATCH_STORE_DIR"] = str(Path(_SESSION_MEM) / "store")
+os.environ["WATCH_EMBEDDINGS"] = "0"
+os.environ.pop("WATCH_QDRANT_INBOX", None)
+os.environ.pop("WATCH_MODEL_DIR", None)
+
+import config as _config  # noqa: E402
+
+# Otherwise popped vars fall through to the host's ~/.config/watch/.env.
+_config.CONFIG_FILE = Path(_SESSION_MEM) / "no-such-config" / ".env"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_memory(tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCH_INDEX_DB", str(tmp_path / "index.db"))
+    monkeypatch.setenv("WATCH_STORE_DIR", str(tmp_path / "store"))
+    yield
+
 
 # 14 visually distinct fills → 14 abrupt cuts → x264 emits a keyframe per cut.
 COLORS = [

@@ -72,3 +72,32 @@ def frame_cap(detail: str) -> int | None:
     if detail == "transcript":
         return None
     return 100
+
+
+def setting(name: str, default: str | None = None) -> str | None:
+    """Env var first, then the ``~/.config/watch/.env`` file, else ``default``."""
+    value = os.environ.get(name)
+    if value is not None and value != "":
+        return value
+    value = read_env_file().get(name)
+    if value is not None and value != "":
+        return value
+    return default
+
+
+def memory_paths() -> dict[str, Path]:
+    """Locations of the video-memory index, store and embedding-model cache."""
+    share = Path.home() / ".local" / "share" / "watch"
+
+    def _p(name: str, default: Path) -> Path:
+        return Path(setting(name) or default).expanduser()
+
+    return {
+        "index_db": _p("WATCH_INDEX_DB", share / "index.db"),
+        "store_dir": _p("WATCH_STORE_DIR", share / "store"),
+        "model_dir": _p("WATCH_MODEL_DIR", share / "models"),
+    }
+
+
+def embeddings_enabled() -> bool:
+    return (setting("WATCH_EMBEDDINGS", "1") or "1").strip().lower() not in {"0", "false", "no"}
