@@ -644,6 +644,10 @@ MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index", "stats", "export"
 def main() -> int:
     if sys.argv[1:2] == ["doctor"]:
         return doctor.main(sys.argv[2:])
+    if sys.argv[1:2] == ["batch"] and not os.path.exists("batch"):
+        import playlist
+
+        return playlist.main(sys.argv[2:])
     # Video-memory read path: `watch.py search|ask|moment|list|index ...`, unless the
     # word is an existing path (a file literally named "search" is still watched).
     if len(sys.argv) > 1 and sys.argv[1] in MEMORY_COMMANDS and not os.path.exists(sys.argv[1]):
