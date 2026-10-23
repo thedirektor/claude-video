@@ -52,6 +52,16 @@ def _isolated_memory(tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture
+def conn(tmp_path):
+    """A fresh, migrated video-memory index for one test."""
+    from memory import index
+
+    c = index.connect(tmp_path / "index.db")
+    yield c
+    c.close()
+
+
 # 14 visually distinct fills → 14 abrupt cuts → x264 emits a keyframe per cut.
 COLORS = [
     "red", "green", "blue", "white", "black", "yellow", "cyan",

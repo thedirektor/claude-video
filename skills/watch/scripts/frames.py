@@ -503,6 +503,37 @@ def _thumb_frames(paths: list[Path]) -> list[bytes]:
     return [data[i * chunk:(i + 1) * chunk] for i in range(len(paths))]
 
 
+def thumb_fingerprint(path: str | Path | None) -> bytes | None:
+    """Single-file sibling of ``_thumb_frames``: the ``DEDUP_THUMB``-square
+    grayscale thumbnail of one image, comparable with ``_frame_delta``.
+
+    Fail-open: ``None`` path, a missing file, no ffmpeg, a decode error or a
+    byte-count mismatch all return ``None`` (callers treat it as "no phash").
+    """
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(p),
+        "-frames:v", "1",
+        "-vf", f"scale={DEDUP_THUMB}:{DEDUP_THUMB},format=gray",
+        "-f", "rawvideo",
+        "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+    except OSError:
+        return None
+    if result.returncode != 0 or len(result.stdout) != DEDUP_THUMB * DEDUP_THUMB:
+        return None
+    return result.stdout
+
+
 def dedupe_perceptual(
     candidates: list[dict], threshold: float = DEDUP_THRESHOLD
 ) -> tuple[list[dict], int]:
