@@ -8,6 +8,8 @@ function, never raises: on any parse problem it returns ``source.strip()``.
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
@@ -46,8 +48,57 @@ def canonical_source(source: str) -> str:
         if video_id:
             return f"https://www.youtube.com/watch?v={video_id}"
         userinfo, at, hostport = parts.netloc.rpartition("@")
-        port = f":{parts.port}" if parts.port else ""
+        scheme = parts.scheme.lower()
+        port_num = parts.port  # ValueError if out of range -> caught below
+        default = {"http": 80, "https": 443}[scheme]
+        port = f":{port_num}" if port_num is not None and port_num != default else ""
+        if ":" in host:  # IPv6 literal: hostname strips the brackets
+            host = f"[{host}]"
         netloc = f"{userinfo}{at}{host}{port}"
-        return urlunsplit((parts.scheme.lower(), netloc, parts.path, parts.query, ""))
+        return urlunsplit((scheme, netloc, parts.path, parts.query, ""))
     except ValueError:
         return stripped
+
+
+def _sha16(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _file_sha16(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()[:16]
+
+
+def video_key(source: str, info: dict | None = None) -> str:
+    """Stable identity of one video across spellings and runs. Never raises.
+
+    file:<sha256(content)[:16]> for an existing local file, yt:<id> for
+    YouTube, <extractor>:<id> when yt-dlp info supplies both, else
+    url:<sha256(canonical_source)[:16]>.
+    """
+    try:
+        stripped = (source or "").strip()
+        try:
+            if stripped and os.path.isfile(stripped):
+                return "file:" + _file_sha16(stripped)
+        except OSError:
+            pass
+        canon = canonical_source(stripped)
+        m = re.fullmatch(r"https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})", canon)
+        if m:
+            return f"yt:{m.group(1)}"
+        if isinstance(info, dict):
+            ek, vid = info.get("extractor_key"), info.get("id")
+            if ek and vid:
+                return f"{str(ek).lower()}:{vid}"
+        return "url:" + _sha16(canon.encode("utf-8", "surrogateescape"))
+    except Exception:
+        return "url:" + _sha16(repr(source).encode("utf-8", "replace"))
+
+
+def store_dirname(video_key: str) -> str:
+    """Windows-safe directory name for a video_key."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", video_key)
