@@ -46,6 +46,7 @@ class Hit:
     dup_count: int = 1
     t_first: float | None = None
     t_last: float | None = None
+    cos: float | None = None  # raw cosine to the query (None when not a vector candidate)
 
 
 class Hits(list):
@@ -222,6 +223,7 @@ def search(conn, query: str, video_key: str | None = None, k: int = 8, embedder=
         if h is None:
             continue
         h.score = sc
+        h.cos = vec.get(key)
         if key in seg_t:
             h.t = seg_t[key]
         hits.append(h)
@@ -423,6 +425,7 @@ def ask(conn, video_ref: str, question: str, k: int = 8, embedder=None) -> dict:
             "context": _context(conn, key, h.t, h.t_end),
             "frame": _frame_dict(f, root, base) if f is not None else None,
             "score": round(float(h.score), 6),
+            "cos": round(float(h.cos), 4) if h.cos is not None else None,
         })
     _index.touch(conn, key)
     return {"video": _video_info(v), "question": question, "evidence": evidence, "rule": RULE,
