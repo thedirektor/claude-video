@@ -487,6 +487,10 @@ After every indexed run `/watch` stores **chapters** (from transcript pauses ≥
 
 When the run is archived, the exports go to the Nextcloud folder, the merged PDF goes to **Paperless instead of report.md**, and the contact sheet joins the Immich album. Rebuild exports for any indexed video without re-watching: `watch.py export <video> [--formats …] [--out DIR] [--json]`.
 
+## Batch (playlists, channels, lists)
+
+`watch.py batch <playlist|channel|file> [--limit N] [--force] [--json] [-- <watch flags>]` watches every entry serially as its own run (a channel lists newest first; a file holds one URL or path per line, `#` for comments). Videos already in the video memory are skipped unless `--force`. Flags after `--` go to each run, e.g. `watch.py batch https://www.youtube.com/@chan/videos --limit 5 -- --detail transcript`. The service adds subscriptions (new uploads watched automatically) on top of this.
+
 ## Cost plan and ceiling
 
 `watch.py <source> --plan [flags]` prints what a run would cost and does nothing else: duration, frames, the transcript route (TranscriptAPI → captions → Gemini → Whisper, decided from a metadata probe), dollars per paid provider (list prices; override with `WATCH_PRICES='{"openai:whisper-1": {"per_hour": 0.36}}'`), prepaid credits, and what leaves the machine. Every run checks the same plan first: if it exceeds `WATCH_COST_CEILING_USD` (default `1.00`; `0` turns the check off) it stops **before any paid call** and prints the plan — re-run with `--allow-cost` when the user accepts it. Only money /watch itself spends counts; the image tokens of the calling Claude session are shown as information. What a run actually spent is written to `work/spend.json` (tokens, audio seconds, credits, dollars). Mention the plan's total when a user asks about cost, and never pass `--allow-cost` without the user's go-ahead.
