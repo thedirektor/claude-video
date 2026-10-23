@@ -23,6 +23,9 @@ MASK_T = 12  # grey-level change that counts as text pixels
 LEAD_S = 1.0  # window before / after a track when looking for its animation
 TAIL_S = 0.3  # extra look-ahead past the first sample without text (backgrounds often change soon after)
 CUT_FRAMES = 2
+POST_S = 0.3  # seconds of settled text that must look identical to the settled frame
+MIN_POST = 2
+POST_MAX = 0.002  # share of crop pixels allowed to change across those frames
 BG_MOVE_MAX = 0.02  # share of off-band crop pixels allowed to change before text is 'animating'
 
 
@@ -169,12 +172,26 @@ def _bbox(np, m):
     return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
 
 
-def _classify(np, grays) -> tuple[str, int | None]:
-    """Entrance class for a frame sequence [text-free background, ..., settled text].
+def _classify(np, grays, fi: int | None = None) -> tuple[str, int | None]:
+    """Entrance class for a frame sequence [text-free background, ..., settled text, ...].
 
-    Returns (class, index of the first frame showing text) or ("not determined", None).
+    ``grays[fi]`` is the settled frame (default: the last one); frames after it must be
+    unchanged from it over the whole crop (moving video behind the text breaks that and
+    the result is "not determined"). Returns (class, index of the first frame showing
+    text) or ("not determined", None).
     """
     nd = (NOT_DETERMINED, None)
+    if fi is None:
+        fi = len(grays) - 1
+    post = grays[fi + 1:]
+    if post:
+        if len(post) < MIN_POST or any(
+                float((np.abs(g.astype(np.int16) - grays[fi].astype(np.int16)) > MASK_T).mean()) > POST_MAX
+                for g in post):
+            return nd
+    else:
+        return nd  # nothing after the text settled: cannot tell it from background motion
+    grays = grays[:fi + 1]
     if len(grays) < 3:
         return nd
     bg = grays[0].astype(np.int16)
@@ -246,26 +263,41 @@ def _classify(np, grays) -> tuple[str, int | None]:
 _FLIP = {"slide_left": "slide_right", "slide_right": "slide_left", "slide_up": "slide_down", "slide_down": "slide_up"}
 
 
-def _entrance(cv2, np, cap, fps, t_first, t_settled, duration, box) -> tuple[str, float | None]:
+_SETTLE_AT = (0.5, 0.25, 0.75)  # where in the stable-box span to look for a settled frame
+
+
+def _entrance(cv2, np, cap, fps, t_first, t_in_set, t_out_set, duration, box) -> tuple[str, float | None]:
     """(class, animation start time) from the frames before the text settles."""
     if not fps or fps <= 0 or t_first <= 0:
         return NOT_DETERMINED, None
     w0 = max(0.0, t_first - LEAD_S)
-    frames = _gray_frames(cv2, cap, fps, w0, min(duration, t_settled), box)
-    cls, i = _classify(np, [g for _, g in frames])
-    return (cls, frames[i][0]) if i is not None else (NOT_DETERMINED, None)
+    for frac in _SETTLE_AT:
+        t_f = t_in_set + frac * (t_out_set - t_in_set)
+        frames = _gray_frames(cv2, cap, fps, w0, min(duration, t_out_set, t_f + POST_S), box)
+        fi = next((i for i, (t, _) in enumerate(frames) if t >= t_f - 1e-6), None)
+        if fi is None:
+            continue
+        cls, i = _classify(np, [g for _, g in frames], fi)
+        if i is not None:
+            return cls, frames[i][0]
+    return NOT_DETERMINED, None
 
 
-def _exit(cv2, np, cap, fps, t_settled, t_end, duration, box) -> tuple[str, float | None]:
+def _exit(cv2, np, cap, fps, t_in_set, t_out_set, t_end, duration, box) -> tuple[str, float | None]:
     """(class, time the text is gone) from the frames after the text starts leaving."""
     if not fps or fps <= 0 or t_end >= duration - 1.0 / fps:
         return NOT_DETERMINED, None
-    frames = _gray_frames(cv2, cap, fps, t_settled, min(duration, t_end + TAIL_S), box)
-    frames.reverse()
-    cls, i = _classify(np, [g for _, g in frames])
-    if i is None:
-        return NOT_DETERMINED, None
-    return _FLIP.get(cls, cls), frames[i][0] + 1.0 / fps
+    for frac in _SETTLE_AT:
+        t_f = t_in_set + frac * (t_out_set - t_in_set)
+        frames = _gray_frames(cv2, cap, fps, max(t_in_set, t_f - POST_S), min(duration, t_end + TAIL_S), box)
+        frames.reverse()
+        fi = next((i for i, (t, _) in enumerate(frames) if t <= t_f + 1e-6), None)
+        if fi is None:
+            continue
+        cls, i = _classify(np, [g for _, g in frames], fi)
+        if i is not None:
+            return _FLIP.get(cls, cls), frames[i][0] + 1.0 / fps
+    return NOT_DETERMINED, None
 
 
 def _modal(boxes):
@@ -336,14 +368,14 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
                 t_out = duration
             prv = t_first - step
             t_in = _bisect(ocr, cv2, cap, t_first, prv, tr["norm"]) if prv >= 0 else 0.0
-            entrance, a_in = _entrance(cv2, np, cap, fps, t_first, t_set_in, duration, box)
+            entrance, a_in = _entrance(cv2, np, cap, fps, t_first, t_set_in, t_set_out, duration, box)
             if a_in is not None:
                 t_in = a_in
-            ex, a_out = _exit(cv2, np, cap, fps, t_set_out, t_last + step, duration, box) if nxt < duration - 1e-9 \
+            ex, a_out = _exit(cv2, np, cap, fps, t_set_in, t_set_out, t_last + step, duration, box) if nxt < duration - 1e-9 \
                 else (NOT_DETERMINED, None)
             if a_out is not None:
                 t_out = a_out
-            ref = _read(cap, cv2, t_set_out)  # latest sample with the settled box: fully opaque
+            ref = _read(cap, cv2, (t_set_in + t_set_out) / 2.0)  # middle of the stable span: fully opaque
             conf = min(0.95, 0.5 + 0.1 * len(tr["boxes"]))
             out.append({
                 "text": tr["text"],

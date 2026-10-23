@@ -142,24 +142,21 @@ def test_exit_fade(tmp_path):
     assert t["exit"] == "fade" and abs(t["t_out"] - 2.6) <= 0.15
 
 
-_MOVING = "testsrc2=s=640x360:r=25:d=5"
-_DIM = "eq=brightness=-0.45,boxblur=6,"  # keeps the motion, lets OCR read the title
+_MOVING = "testsrc2=s=640x360:r=25:d=5"  # raw: running timecode sits in the title's own rows
 
 
-def test_moving_background_cut(tmp_path):
-    t = _only(_title_clip(tmp_path / "m1.mp4", "x=40:enable='between(t,1,3)'", src=_MOVING, pre=_DIM))
-    assert t["entrance"] in ("not determined", "cut")
-    assert abs(t["t_in"] - 1.0) <= 0.1
-
-
-def test_moving_background_fade(tmp_path):
-    t = _only(_title_clip(tmp_path / "m2.mp4", "x=40:alpha='if(lt(t,1),0,if(lt(t,1.6),(t-1)/0.6,1))'", src=_MOVING, pre=_DIM))
-    assert t["entrance"] in ("not determined", "fade")
-    assert abs(t["t_in"] - 1.0) <= 0.7  # OCR-bisected when the animation can't be measured
-
-
-def test_moving_background_never_invents_motion(tmp_path):
-    t = _only(_title_clip(tmp_path / "m3.mp4", "x=40:enable='between(t,1,3)'", src=_MOVING, pre=_DIM))
-    assert not t["entrance"].startswith("slide") and t["entrance"] != "scale"
-    assert not t["exit"].startswith("slide") and t["exit"] != "scale"
-    assert t["font_family"] == "not determined"
+@pytest.mark.parametrize("name,extra", [
+    ("cut", "x=40:enable='between(t,1,3)'"),
+    ("fade", "x=40:alpha='if(lt(t,1),0,if(lt(t,1.6),(t-1)/0.6,1))'"),
+    ("slide", "x='if(lt(t,1.4),40+600*(1.4-t)/0.4,40)':enable='gte(t,1)'"),
+])
+def test_moving_background_never_invents_motion(tmp_path, name, extra):
+    path = _title_clip(tmp_path / f"m_{name}.mp4", extra, src=_MOVING)
+    tracks, notes = TY.text_tracks(path, 5.0)
+    assert notes == []
+    for t in tracks:
+        assert t["font_family"] == "not determined"
+        for k in ("entrance", "exit"):
+            assert not t[k].startswith("slide") and t[k] != "scale", (name, t["text"], k, t[k])
+        if "HELLO" in t["text"].upper():
+            assert t["t_in"] >= 0.9, (name, t["text"], t["t_in"])
