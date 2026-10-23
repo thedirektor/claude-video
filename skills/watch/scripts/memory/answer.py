@@ -22,6 +22,14 @@ def _nearest(evidence: list[dict]) -> list[dict]:
             for e in evidence[:NEAREST]]
 
 
+def _frame_times(conn, key: str, n: int) -> list[float]:
+    """n stored frame times spread across the video (first, middle, last …)."""
+    ts = [r[0] for r in conn.execute("SELECT DISTINCT t FROM frames WHERE video_key = ? ORDER BY t", (key,))]
+    if len(ts) <= n:
+        return ts
+    return [ts[round(i * (len(ts) - 1) / (n - 1))] for i in range(n)]
+
+
 def _refusal(base: dict) -> dict:
     return {**base, "answer": REFUSAL, "found": False, "citations": [], "nearest": _nearest(base["evidence"])}
 
@@ -38,9 +46,11 @@ def answer(conn, video_ref: str, question: str, k: int = 8, *, embedder=None, co
     pack = retrieval.ask(conn, key, question, k=k, embedder=embedder)
     conf = confidence.assess(question, pack["evidence"])
     escalated = 0
-    if conf["level"] == "low" and pack["evidence"]:
+    if conf["level"] == "low":
         times = [e["t"] for e in pack["evidence"] if e.get("t") is not None][:escalate.MAX_TIMES]
-        escalated = escalate_fn(conn, key, times, budget_s=budget_s)
+        if not pack["evidence"]:  # nothing matched at all: look around stored frames instead
+            times = _frame_times(conn, key, escalate.MAX_TIMES)
+        escalated = escalate_fn(conn, key, times, budget_s=budget_s) if times else 0
         if escalated:
             if embedder is not None:
                 embeddings.embed_pending(conn, embedder)

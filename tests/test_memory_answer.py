@@ -110,3 +110,21 @@ def test_watch_py_dispatches_stats(capsys):
     from memory_fakes import run_watch
     assert run_watch(["stats", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["answers"] == 0
+
+
+def test_answer_no_evidence_escalates_around_stored_frames(conn):
+    from memory_fakes import fr
+    record_run(conn, fake_run(title="Mudo", frames=[fr(t, None, None) for t in (1.0, 4.0, 7.0, 10.0, 13.0)]))
+    seen = []
+
+    def fake_escalate(c, key, times, **kw):
+        seen.append(times)
+        cur = c.execute("INSERT INTO ocr_blocks (video_key, t, text) VALUES (?, 7.0, 'PRECIO ESPECIAL 42 EUROS')", (key,))
+        _fts_add(c, "ocr", key, "ocr_blocks", cur.lastrowid, 7.0, "PRECIO ESPECIAL 42 EUROS")
+        c.commit()
+        bump_evidence(c, key)
+        return 1
+
+    r = answer(conn, "Mudo", "¿cuál es el precio especial en euros?", complete=FakeLLM("Cuesta 42 euros [E1]."),
+               escalate_fn=fake_escalate)
+    assert seen == [[1.0, 7.0, 13.0]] and r["found"] is True and "[E1 00:07]" in r["answer"]
