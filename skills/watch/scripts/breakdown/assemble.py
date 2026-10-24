@@ -456,6 +456,8 @@ def _trans(tr: dict | None) -> str:
 def _bars(lb) -> str:
     if not lb:
         return ""
+    if not isinstance(lb, dict):  # the shot's look was not determined
+        return f" · letterbox {_v(lb)}"
     return " · letterbox " + " ".join(f"{k} {lb.get(k, 0):.1%}" for k in ("top", "bottom", "left", "right"))
 
 

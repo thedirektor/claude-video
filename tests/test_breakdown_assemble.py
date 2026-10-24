@@ -255,3 +255,12 @@ def test_cli_success_path(conn, stored, monkeypatch, capsys):
     assert data["schema"] == "watch.breakdown/1"
     out = store.video_dir(stored, KEY) / "breakdown"
     assert (out / "breakdown.json").is_file() and (out / "breakdown.md").is_file()
+
+
+def test_brief_renders_shot_with_undetermined_look():
+    """Real-media e2e regression: a shot whose look is not determined (letterbox is the string)."""
+    from breakdown import look
+
+    shot = {"start": 0.0, "end": 1.0}
+    nd = look._nd(shot, "frame unreadable")
+    assert assemble._bars(nd["letterbox"]) == " · letterbox _not determined_"
