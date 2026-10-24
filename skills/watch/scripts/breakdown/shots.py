@@ -438,6 +438,12 @@ def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
         if i is None or i < 1:
             out.append(b)
             continue
+        y = series["yavg"]
+        if 3 <= i:  # the luma has been falling / rising for several frames up to this one: a fade
+            run = [y[i - k] - y[i - k - 1] for k in range(3)]
+            if all(abs(v) >= 2.0 for v in run) and (all(v > 0 for v in run) or all(v < 0 for v in run)):
+                out.append(b)  # transitions.classify owns fades
+                continue
         near = sorted(d[k] for k in range(max(1, i - 5), min(len(d), i + 6)) if k != i)
         med = near[len(near) // 2] if near else 0.0
         if med > 0 and d[i] < CUT_STAND_OUT * med:
