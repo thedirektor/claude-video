@@ -32,6 +32,7 @@ NOTE_KIND = "breakdown"
 NOTE_CHARS = 2000
 MAX_TILES = 48
 EPS = 1e-6
+BRIEF_MIN_TEXT_CONF = 0.5  # OCR tracks below this are listed in breakdown.json only
 SAMPLING_NOTE = f"sampled every {typography.STEP_S:g} s; shorter or stylised text may be missed"
 BLIND_SPOT_NOTE = "dissolves between two moving shots can go undetected: cuts and shots are what was measured"
 FOLD_MAX_S = 1.0  # a fade between two cuts this close is one dip, not a shot
@@ -508,7 +509,14 @@ def brief_md(bd: dict) -> str:
         out.append(_v(NOT_DETERMINED))
     elif not tracks:
         out.append(f"No on-screen text found in the samples ({SAMPLING_NOTE}).")
-    for tr in tracks if isinstance(tracks, list) else []:
+    shown = [t for t in tracks if t["evidence"]["confidence"] >= BRIEF_MIN_TEXT_CONF] if isinstance(tracks, list) else []
+    hidden = len(tracks) - len(shown) if isinstance(tracks, list) else 0
+    if isinstance(tracks, list) and tracks and not shown:
+        out.append(f"No confidently read on-screen text ({SAMPLING_NOTE}).")
+    if hidden:
+        out.append(f"{hidden} low-confidence OCR reading(s) left out of this brief (likely texture or fragments, "
+                   "not text to rebuild); they are listed in breakdown.json.")
+    for tr in shown:
         lc = _lc(tr["evidence"])
         out.append(f"- \"{tr['text']}\" {_t(tr['t_in'])} - {_t(tr['t_out'])} · box {tr['box']} · "
                    f"height {tr['height_rel']} of frame · colour {_v(tr['color_hex'])} · "
@@ -530,7 +538,7 @@ def brief_md(bd: dict) -> str:
                + (f" on the primary grid, {cob['share_alt']:.0%} on the other half/double-time grid "
                   "(tempo octave ambiguous)" if "share_alt" in cob else "") + _lc(cob["evidence"]))
     sg = a["segments"]
-    out.append("- speech: " + (_v(sg["speech"]) if sg["speech"] == NOT_DETERMINED
+    out.append("- voice (speech or sung lyrics, from the transcript): " + (_v(sg["speech"]) if sg["speech"] == NOT_DETERMINED
                                else ", ".join(f"{_t(x['t_start'])}-{_t(x['t_end'])}" for x in sg["speech"][:40]))
                + _lc(sg["evidence"]))
     mu = sg["music"]

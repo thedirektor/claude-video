@@ -264,3 +264,19 @@ def test_brief_renders_shot_with_undetermined_look():
     shot = {"start": 0.0, "end": 1.0}
     nd = look._nd(shot, "frame unreadable")
     assert assemble._bars(nd["letterbox"]) == " · letterbox _not determined_"
+
+
+def test_brief_leaves_low_confidence_ocr_out(bd):
+    """Real-media e2e regression: OCR texture readings ("AVA", "wet") listed as text to rebuild."""
+    import copy
+
+    def tr(text, c):
+        return {"text": text, "t_in": 1.0, "t_out": 2.0, "box": [0, 0, 0.1, 0.1], "height_rel": 0.1,
+                "color_hex": "#ffffff", "entrance": "cut", "exit": "cut", "font_family": "not determined",
+                "evidence": {"t_start": 1.0, "t_end": 2.0, "method": "ocr", "confidence": c}}
+
+    b = copy.deepcopy(bd)
+    b["typography"]["tracks"] = [tr("SALE 50%", 0.9), tr("AVA", 0.38)]
+    md = assemble.brief_md(b)
+    assert '"SALE 50%"' in md and '"AVA"' not in md and "1 low-confidence OCR reading(s)" in md
+    assert "voice (speech or sung lyrics" in md
