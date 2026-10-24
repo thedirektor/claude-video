@@ -34,6 +34,7 @@ BAND_MIN_LEVEL = 3.0  # slot medians below this many times the band mean: the ba
 MIX_R_CHANGE = 2.0  # mean off/on of a band must change by this factor between halves for a real section change
 MIX_R_DELTA = 0.3
 AMBIG_CONF = 0.5
+THREE_TWO_RATIO = 0.8  # comb score at 1.5x the tempo vs the chosen tempo's: at or above is a 3:2 ambiguity
 SUPPORT_REL = 0.3
 STABILITY_MIN_S = 4.0
 STABILITY_TOL = 0.06
@@ -196,6 +197,20 @@ def _pulse(env, bands, hop_s: float, np):
         if low is not None and low[1] >= LOW_BAND_MIN_STRENGTH:
             return bands[0], low
     return env, got
+
+
+def _three_two_rival(env, hop_s: float, bpm: float, np):
+    """The tempo 1.5x ``bpm`` when its comb periodicity is nearly as strong as ``bpm``'s (a 3:2
+    misread: a half-time groove's hats and snare can make a 2/3 tempo win), else None. The 2/3
+    direction is not tested: a true tempo always scores high there (every other beat of 2/3)."""
+    rival = bpm * 1.5
+    ac = _autocorr(env, np)
+    if rival > BPM_MAX or ac is None:
+        return None
+    base = _comb_at(ac, 60.0 / bpm / hop_s)
+    if base <= 0:
+        return None
+    return rival if _comb_at(ac, 60.0 / rival / hop_s) >= THREE_TWO_RATIO * base else None
 
 
 def _slot_peaks(e, start: float, period: float, win: int, np):
@@ -457,6 +472,13 @@ def analyze(path: str, duration: float = 0.0) -> dict:
             notes.append("half/double-time ambiguous")
             extra["tempo_alt"] = round(alt * bpm / bpm0, 1)
             extra["tempo_alt_ratio"] = round(extra["tempo_alt"] / bpm, 3)
+        rival = _three_two_rival(env, hop_s, tempo[0], np)
+        if rival is not None:
+            conf = min(conf, AMBIG_CONF)
+            notes.append("tempo ambiguous at 3:2")
+            if "tempo_alt" not in extra:
+                extra["tempo_alt"] = round(rival * bpm / bpm0, 1)
+                extra["tempo_alt_ratio"] = round(extra["tempo_alt"] / bpm, 3)
         return {"tempo_bpm": round(bpm, 1), "beats": beats, "loudness": loud, **extra,
                 "evidence": _ev(beats[0], beats[-1], conf, periodicity=round(tempo[1], 3)),
                 "loudness_evidence": _loud_ev(loud, dur),

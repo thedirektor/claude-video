@@ -513,3 +513,34 @@ def test_half_time_groove_is_never_confidently_the_slower_octave(tmp_path, bpm, 
     res = A.analyze(_wav(tmp_path / "h.wav", _halftime(bpm, 60, hat_amp=hat, accent=accent, k808=k808)), 60)
     if res["tempo_bpm"] != "not determined":
         _never_confident_wrong(res, bpm)
+
+
+# ---- fix round 2: a 3:2 misread must never be confident ----
+def _ht_hats(bpm, secs, hat_s, kicks=(0,)):
+    rng, kick, hat, snare = _kit()
+    x = rng.standard_normal(int(secs * SR)) * 0.03
+    p = 60 / bpm
+    t = 0.0
+    while t < secs - 4 * p:
+        for o in kicks:
+            _put(x, kick, t + o * p)
+        _put(x, snare(), t + 2 * p)
+        for i in range(8):
+            o = i / 2
+            _put(x, hat() * ((0.3 if o in (0.0, 2.0) else hat_s) / 0.3), t + o * p)
+        t += 4 * p
+    return x / np.abs(x).max() * 0.8
+
+
+@pytest.mark.parametrize("bpm,hat_s,kicks", [(170, 0.22, (0,)), (170, 0.26, (0,)), (170, 0.22, (0, 2)),
+                                              (160, 0.22, (0,)), (160, 0.26, (0,)), (160, 0.26, (0, 2))])
+def test_three_to_two_misread_is_never_confident(tmp_path, bpm, hat_s, kicks):
+    res = A.analyze(_wav(tmp_path / "t.wav", _ht_hats(bpm, 60, hat_s, kicks)), 60)
+    if res["tempo_bpm"] == "not determined":
+        return
+    t = res["tempo_bpm"]
+    right = min(abs(t - r) for r in (bpm, bpm / 2)) <= 3
+    if not right:
+        assert res["evidence"]["confidence"] <= 0.5, res
+        assert abs(res.get("tempo_alt", 0) - bpm) <= 4 or abs(res.get("tempo_alt", 0) - bpm / 2) <= 3, res
+        assert any("3:2" in n or "half/double" in n for n in res["notes"]), res

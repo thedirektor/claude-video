@@ -13,6 +13,7 @@ PALETTE_K = 5
 TEMP_DELTA = 0.06  # mean (R-B)/255 beyond which the shot reads warm / cool
 BLACK_LUMA = 20  # 0-255 luma under which a row counts as a letterbox bar
 BAR_MIN = 0.02  # a bar must cover at least this fraction of the height
+BAR_EDGE_SKIP = 6  # rows / columns next to the picture left out of the flatness test
 BAR_FLAT = 8  # luma spread allowed inside a bar (codec noise); a gradient spreads wider
 BAR_MAX = 0.4  # more than this per side is a black frame, not a letterbox
 
@@ -138,6 +139,9 @@ def _letterbox(np, profiles):
     def uniform(frac, rng, n, side):  # a bar is flat black, not the dark end of a gradient
         k = int(round(frac * n))
         if k == 0:
+            return True
+        k -= BAR_EDGE_SKIP  # codec ringing / chroma bleed next to the picture reaches ~19 luma
+        if k <= 0:
             return True
         sl = slice(0, k) if side == 0 else slice(n - k, n)
         hi = max(float(p[rng][sl].max()) for p in ps)

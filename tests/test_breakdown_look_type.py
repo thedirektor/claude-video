@@ -292,7 +292,7 @@ def test_low_frame_rate_sources_are_stamped_with_real_times(tmp_path, r):
     assert hit and abs(hit[0]["t_in"] - 5.0) <= 0.3 and abs(hit[0]["t_out"] - 6.0) <= 0.3, (r, tracks)
 
 
-def test_variable_frame_rate_source_is_found_or_flagged(tmp_path):
+def test_variable_frame_rate_source_places_text_at_its_real_time(tmp_path):
     import subprocess
     src = _title_clip(tmp_path / "v0.mp4", "x=40:enable='between(t,5,6)'", src="color=c=navy:s=640x360:r=25:d=8")
     p = tmp_path / "vfr.mp4"
@@ -300,21 +300,39 @@ def test_variable_frame_rate_source_is_found_or_flagged(tmp_path):
                     "-fps_mode", "vfr", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)], check=True)
     tracks, notes = TY.text_tracks(str(p), 8.0)
     hit = [t for t in tracks if "HELLO" in t["text"].upper()]
-    assert (hit and abs(hit[0]["t_in"] - 5.0) <= 0.3) or notes, (tracks, notes)
+    assert notes == [] and hit, (tracks, notes)
+    assert abs(hit[0]["t_in"] - 5.0) <= 0.6 and abs(hit[0]["t_out"] - 6.0) <= 1.1, hit[0]
+    assert "variable-frame-rate" in hit[0]["evidence"].get("timing_note", ""), hit[0]["evidence"]
+
+
+def test_audio_longer_than_video_does_not_lose_the_text(tmp_path):
+    import subprocess
+    p = tmp_path / "av.mp4"
+    if not Path(_FONT).is_file():
+        pytest.skip("no font for drawtext")
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "color=c=navy:s=640x360:r=25:d=8", "-f", "lavfi", "-i", "sine=d=10",
+                    "-vf", f"drawtext=fontfile={_FONT}:text='HELLO WORLD':fontsize=48:y=40:fontcolor=white:x=40:"
+                    "enable='between(t,2,4)'", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(p)],
+                   check=True)
+    tracks, notes = TY.text_tracks(str(p), 10.0)  # container duration (audio) is longer than the picture
+    hit = [t for t in tracks if "HELLO" in t["text"].upper()]
+    assert notes == [] and hit and abs(hit[0]["t_in"] - 2.0) <= 0.1, (tracks, notes)
 
 
 def test_sampling_note_is_worded_per_path(tmp_path):
     from breakdown import assemble
     assert TY.scan_available(_fps_clip(tmp_path, 25), 8.0) is True
-    assert TY.scan_available(_fps_clip(tmp_path, 5), 8.0) is False
+    assert TY.scan_available(_fps_clip(tmp_path, 5), 8.0) is True  # a slow source still scans, per frame
     assert "seeking" in assemble.SAMPLING_NOTE_SEEK and "word-shape scan" not in assemble.SAMPLING_NOTE_SEEK
 
 
 @pytest.mark.parametrize("a", [2.13, 2.27, 2.41])
 def test_short_title_over_moving_footage_is_timed_or_flagged_approximate(tmp_path, a):
-    path = _title_clip(tmp_path / "bm.mp4", f"x=40:enable='between(t,{a},{a + 0.4:.2f})'", src=_MOVING)
+    path = _title_clip(tmp_path / "bm.mp4", f"x=40:enable='between(t,{a},{a + 0.4:.2f})':box=1:boxcolor=black@0.6", src=_MOVING)
     tracks, _ = TY.text_tracks(path, 5.0)
     hit = [t for t in tracks if "HELLO" in t["text"].upper()]
+    assert hit, (a, tracks)
     for t in hit:
         late = t["t_in"] - a
         assert late <= 0.15 or (t["evidence"]["confidence"] <= 0.4
@@ -327,3 +345,24 @@ def test_dark_gradient_edge_is_not_a_pillarbox(tmp_path):
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
                     "rgbtestsrc=s=1280x720:r=25:d=2", "-pix_fmt", "yuv420p", str(p)], check=True)
     assert L.shot_look(str(p), {"start": 0.0, "end": 2.0})["letterbox"] is None
+
+
+@pytest.mark.parametrize("name,W,H,box,crf", [
+    ("1080_bars", 1920, 1080, ("0:0:1920:138", "0:942:1920:138"), "23"),
+    ("1080_pillar", 1920, 1080, ("0:0:241:1080", "1681:0:239:1080"), "23"),
+    ("720_crf40", 1280, 720, ("0:0:1280:90", "0:630:1280:90"), "40"),
+    ("480_odd", 854, 480, ("0:0:854:61", "0:421:854:59"), "23"),
+])
+def test_real_bars_survive_codec_ringing(tmp_path, name, W, H, box, crf):
+    import subprocess
+    p = tmp_path / f"{name}.mp4"
+    vf = ",".join(f"drawbox=x={b.split(':')[0]}:y={b.split(':')[1]}:w={b.split(':')[2]}:h={b.split(':')[3]}:color=black:t=fill"
+                  for b in box) + ",format=yuv420p"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    f"testsrc2=s={W}x{H}:r=25:d=2", "-vf", vf, "-c:v", "libx264", "-crf", crf, str(p)], check=True)
+    lb = L.shot_look(str(p), {"start": 0.0, "end": 2.0})["letterbox"]
+    assert lb, name
+    for key, b in zip(("top", "bottom") if "pillar" not in name else ("left", "right"), box):
+        size = int(b.split(":")[3] if "pillar" not in name else b.split(":")[2])
+        frac = size / (H if "pillar" not in name else W)
+        assert abs(lb[key] - frac) < 0.006, (name, key, lb)

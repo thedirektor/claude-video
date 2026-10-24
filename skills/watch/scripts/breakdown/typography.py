@@ -413,13 +413,6 @@ def text_tracks(path: str, duration: float, step: float = STEP_S) -> tuple[list[
         ocr = _load_ocr()
     except RuntimeError as exc:
         return [], [f"{exc}; typography not determined (tesseract/pytesseract required)"]
-    cap = cv2.VideoCapture(str(path))
-    try:
-        vfr = _vfr(cv2, cap, float(cap.get(cv2.CAP_PROP_FPS) or 0.0), float(duration))
-    finally:
-        cap.release()
-    if vfr:
-        return [], ["variable frame rate: on-screen text cannot be placed in time; typography not determined"]
     try:
         return _run(cv2, np, ocr, str(path), float(duration), float(step)), []
     except Exception as exc:  # never raise out of a command
@@ -456,20 +449,22 @@ def _new_blob(cv2, np, m0, m1, m2) -> bool:
     return float(new.mean()) >= NEW_BLOB_MIN
 
 
-def scan_usable(cv2, cap, fps: float, duration: float) -> bool:
-    """Sequential sampling needs a steady frame rate: frame time is index / fps. A source slower
-    than the scan cadence, or whose frame count disagrees with its duration (variable frame rate,
-    dropped duplicates), is sampled by seeking instead, without the short-title scan."""
-    return bool(fps) and fps >= 1.0 / SCAN_S and not _vfr(cv2, cap, fps, duration)
-
-
-def _vfr(cv2, cap, fps: float, duration: float) -> bool:
-    """Frame count x fps disagrees with the duration: a variable-frame-rate source, whose frames
-    cannot be placed in time by index or reliably by seeking."""
-    n = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
-    if not fps or n <= 0 or duration <= 0:
-        return False
-    return abs(n / fps - duration) > max(0.05 * duration, min(2.0 / fps, 0.5))
+def _stamps_ok(cv2, path: str, n: int = 40) -> bool:
+    """Do the first frames carry strictly increasing presentation times? Sequential decoding then
+    stamps every frame with its own time (constant or variable frame rate alike)."""
+    cap = cv2.VideoCapture(str(path))
+    try:
+        last, got = -1.0, 0
+        for _ in range(n):
+            if not cap.grab():
+                break
+            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if t <= last:
+                return False
+            last, got = t, got + 1
+        return got >= 2
+    finally:
+        cap.release()
 
 
 def scan_available(path: str, duration: float) -> bool:
@@ -478,34 +473,38 @@ def scan_available(path: str, duration: float) -> bool:
         cv2, _ = _import_cv()
     except Exception:
         return False
-    cap = cv2.VideoCapture(str(path))
-    try:
-        return scan_usable(cv2, cap, float(cap.get(cv2.CAP_PROP_FPS) or 0.0), float(duration))
-    finally:
-        cap.release()
+    return _stamps_ok(cv2, path)
 
 
 def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
-    """``[(t, detections)]`` in time order: one entry per base sample (every ``step``), plus the
-    extra OCR runs the text-likeness scan asked for between them.
+    """``(samples, mode)``. ``samples`` is ``[(t, detections, is_extra)]`` in time order: one entry
+    per base sample (every ``step``), plus the extra OCR runs the text-likeness scan asked for.
+    ``mode`` is ``"cfr"`` (frame times follow index / fps), ``"vfr"`` (they drift from it: a
+    variable frame rate, so seeking cannot be trusted) or ``"seek"`` (the decoder gives no usable
+    frame times: sampled by seeking, no extras).
 
-    One sequential decode, each frame stamped with its own time (index / fps). A base sample whose
-    frame did not change since the last OCR run reuses that run's detections. Falls back to seeking
-    (no extras) when the source frame rate is unusable (see :func:`scan_usable`)."""
+    One sequential decode, each frame stamped with its own presentation time. A base sample whose
+    frame did not change since the last OCR run reuses that run's detections."""
     nbase = int(math.ceil(duration / step - 1e-9)) if duration > 0 else 0
-    cap = cv2.VideoCapture(path)
-    try:
-        if not scan_usable(cv2, cap, fps, duration):
+    if not _stamps_ok(cv2, path):
+        cap = cv2.VideoCapture(path)
+        try:
             out = []
             for k in range(nbase):
                 t = round(k * step, 6)
                 img = _read(cap, cv2, t)
                 out.append((t, _detect(ocr, img, cv2) if img is not None else [], False))
-            return out
+            return out, "seek"
+        finally:
+            cap.release()
+    cap = cv2.VideoCapture(path)
+    try:
         sub = max(1, int(math.ceil(step / SCAN_S - 1e-9)))
         scan = step / sub
+        tol = min(0.5 / fps, 0.5 * scan) if fps and fps > 0 else 0.5 * scan
         out: list = []
         idx, k = 0, 0  # k: next scan slot (slot k is due at k * scan)
+        drift_lo, drift_hi = 1e9, -1e9
         last_g = None
         last_dets: list = []
         last_ocr_t = -1e9
@@ -515,11 +514,13 @@ def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
         while True:
             if not cap.grab():
                 break
-            t_frame = idx / fps
+            t_frame = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if fps and fps > 0:
+                drift_lo, drift_hi = min(drift_lo, t_frame - idx / fps), max(drift_hi, t_frame - idx / fps)
             idx += 1
             if t_frame >= duration - 1e-9:
                 break
-            if t_frame < k * scan - 0.5 / fps:
+            if t_frame < k * scan - tol:
                 continue
             ok, img = cap.retrieve()
             kk = k
@@ -550,7 +551,8 @@ def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
                 last_g, last_ocr_t = g, ts
                 out.append((ts, list(last_dets), is_extra))
             masks = [masks[1], m]
-        return out
+        vfr = not fps or fps <= 0 or (drift_hi - drift_lo) > min(1.5 / fps, 0.25)
+        return out, "vfr" if vfr else "cfr"
     finally:
         cap.release()
 
@@ -578,9 +580,9 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
     cap = cv2.VideoCapture(path)
     try:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        samples = _sample(cv2, np, ocr, path, duration, step, fps)
+        samples, mode = _sample(cv2, np, ocr, path, duration, step, fps)
+        vfr = mode == "vfr"
         stamps = [x[0] for x in samples]
-        extra_at = {x[0] for x in samples if x[2]}
         open_tracks: list[dict] = []
         done: list[dict] = []
         for t, found, _x in samples:
@@ -616,24 +618,33 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
             prv = stamps[i_prev - 1] if i_prev >= 1 else None  # last sample before its first sighting
             # the bisected boundaries are the fallback times AND bound the settle window of a
             # track that only one or two OCR samples saw
-            t_out_b = _bisect(ocr, cv2, cap, t_last, nxt, tr["norm"], box) if nxt is not None else duration
-            t_in_b = _bisect(ocr, cv2, cap, t_first, prv, tr["norm"], box) if prv is not None else 0.0
-            t_in, t_out = t_in_b, t_out_b
-            entrance, a_in = _entrance(cv2, np, cap, fps, t_first, t_set_in, t_set_out, duration, box,
-                                       t_out_b - _BISECT_MARGIN)
-            if a_in is not None:
-                t_in = a_in
-            ex, a_out = _exit(cv2, np, cap, fps, t_set_in, t_set_out, nxt, duration, box,
-                              t_in_b + _BISECT_MARGIN) if nxt is not None and nxt < duration - 1e-9 \
-                else (NOT_DETERMINED, None)
-            if a_out is not None:
-                t_out = a_out
-            ref = _read(cap, cv2, (t_set_in + t_set_out) / 2.0)  # middle of the stable span: fully opaque
-            conf = _track_conf(len(tr["boxes"]), sum(tr["confs"]) / len(tr["confs"]))
             timing_note = None
-            if t_first in extra_at and entrance == NOT_DETERMINED and _busy_around(cv2, np, cap, fps, t_first, box):
-                # found by the between-samples scan over a moving picture, with no measurable
-                # animation: the start can sit up to a scan step or two late
+            if vfr:
+                # frames cannot be placed by seeking in a variable-frame-rate source: the
+                # boundaries are the midpoints between the stamped samples around the text
+                entrance = ex = NOT_DETERMINED
+                t_in = (prv + t_first) / 2.0 if prv is not None else t_first
+                t_out = (t_last + nxt) / 2.0 if nxt is not None else t_last
+                timing_note = "variable-frame-rate source: start and end are approximate"
+            else:
+                t_out_b = _bisect(ocr, cv2, cap, t_last, nxt, tr["norm"], box) if nxt is not None else duration
+                t_in_b = _bisect(ocr, cv2, cap, t_first, prv, tr["norm"], box) if prv is not None else 0.0
+                t_in, t_out = t_in_b, t_out_b
+                entrance, a_in = _entrance(cv2, np, cap, fps, t_first, t_set_in, t_set_out, duration, box,
+                                           t_out_b - _BISECT_MARGIN)
+                if a_in is not None:
+                    t_in = a_in
+                ex, a_out = _exit(cv2, np, cap, fps, t_set_in, t_set_out, nxt, duration, box,
+                                  t_in_b + _BISECT_MARGIN) if nxt is not None and nxt < duration - 1e-9 \
+                    else (NOT_DETERMINED, None)
+                if a_out is not None:
+                    t_out = a_out
+            ref = _read(cap, cv2, (t_set_in + t_set_out) / 2.0) if not vfr else None  # middle of the stable span: fully opaque
+            conf = _track_conf(len(tr["boxes"]), sum(tr["confs"]) / len(tr["confs"]))
+            if (not vfr and entrance == NOT_DETERMINED and t_first - t_in <= SCAN_S + 1e-6
+                    and _busy_around(cv2, np, cap, fps, t_first, box)):
+                # over a moving picture with no measurable animation the start is only known to
+                # the sampling grid: it can sit a scan step or two late
                 conf = min(conf, LATE_START_CONF)
                 timing_note = "start time approximate (busy background)"
             out.append({
