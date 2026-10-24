@@ -23,7 +23,12 @@ from . import audio, media, shots
 NOT_DETERMINED = "not determined"
 GRID = 0.01  # alignment resolution, seconds
 MIN_OVERLAP_S = 2.0
-AUDIO_MIN_SCORE = 0.2  # correlation below this: the clips share no usable audio
+AUDIO_MIN_SCORE = 0.5  # coverage-weighted correlation below this: the clips share no usable audio
+VIS_MIN_SCORE = 0.5  # picture cross-correlation needed to align on the picture alone
+VIS_CHECK = 0.2  # picture agreement an onset alignment must reach to keep its confidence
+UNCONFIRMED_CONF = 0.2
+ONSET_MAX_CONF = 0.6  # one event aligns the clips; its own timing difference is absorbed
+AMBIG_PARTNER_S = 0.15  # a second partner this close in |delta| makes a pairing ambiguous
 PEAK_ALIKE = 0.85  # peaks scoring within this share of the best are alternatives
 PEAK_SEP = 0.05  # seconds: closer peaks are the same alignment
 VIS_MARGIN = 0.1  # picture correlation lead needed to pick between alike audio peaks
@@ -116,6 +121,18 @@ def _to_grid(values, fps: float, duration: float, np):
     return values[idx]
 
 
+def _impulses(values, fps: float, duration: float, np):
+    """A per-frame change series as impulses at each frame's start time on the GRID clock, smoothed
+    by the same 30 ms Gaussian for every clip (holding a 25 fps value for 40 ms but a 60 fps one
+    for 17 ms would bias the cross-correlation peak)."""
+    out = np.zeros(int(max(duration, GRID) / GRID) + 1, dtype=np.float64)
+    idx = np.clip((np.arange(len(values)) / fps / GRID).round().astype(int), 0, len(out) - 1)
+    np.maximum.at(out, idx, values)
+    k = np.arange(-9, 10)
+    g = np.exp(-0.5 * (k * GRID / 0.03) ** 2)
+    return np.convolve(out, g / g.sum(), mode="same")
+
+
 def _audio_grid(path: str, duration: float, np):
     x, note = audio._decode(path)
     if x is None:
@@ -133,6 +150,13 @@ def _audio_grid(path: str, duration: float, np):
 
 # ---- alignment --------------------------------------------------------------
 
+def _need(na: int, nb: int) -> int:
+    """Minimum overlap in grid samples: half the shorter clip, and MIN_OVERLAP_S when the clips are
+    long enough to afford it (short game clips are still comparable)."""
+    short = min(na, nb)
+    return max(int(0.5 * short), min(int(MIN_OVERLAP_S / GRID), int(0.8 * short)))
+
+
 def _xcorr(a, b, np):
     """``(lags, score)``: overlap-normalised correlation, cand index = ref index + lag."""
     a = (a - a.mean()) / (a.std() or 1.0)
@@ -143,9 +167,10 @@ def _xcorr(a, b, np):
     lags = np.arange(-(na - 1), nb)
     vals = np.concatenate([c[size - (na - 1):], c[:nb]]) if na > 1 else c[:nb]
     overlap = np.minimum(na, nb - lags) - np.maximum(0, -lags)
-    need = max(int(MIN_OVERLAP_S / GRID), int(0.5 * min(na, nb)))
-    ok = overlap >= need
-    score = np.where(ok, vals / np.maximum(overlap, 1), -np.inf)
+    ok = overlap >= _need(na, nb)
+    # weight by how much of the shorter clip the overlap covers: dividing by a short overlap
+    # inflates chance correlations at the edges of the search range
+    score = np.where(ok, vals / np.maximum(overlap, 1) * overlap / min(na, nb), -np.inf)
     return lags, score
 
 
@@ -171,25 +196,46 @@ def _peaks(lags, score, np) -> list[tuple[float, float]]:
     return out
 
 
-def _pearson_at(a, b, lag_s: float, min_std: float) -> float:
+def _pearson_at(a, b, lag_s: float, min_std: float) -> float | None:
     """Correlation over the overlap at a lag, weighted by how much of the shorter clip the overlap
-    covers (a short overlap correlates well by chance). 0 when either side is flat."""
+    covers (a short overlap correlates well by chance). None when either side is flat or the
+    overlap is too short to say anything."""
     k = int(round(lag_s / GRID))
     i0, i1 = max(0, -k), min(len(a), len(b) - k)
-    if i1 - i0 < int(MIN_OVERLAP_S / GRID):
-        return 0.0
+    if i1 - i0 < max(2, _need(len(a), len(b))):
+        return None
     x, y = a[i0:i1], b[i0 + k:i1 + k]
     sx, sy = float(x.std()), float(y.std())
     if sx < min_std or sy < min_std:
-        return 0.0
+        return None
     r = float(((x - x.mean()) * (y - y.mean())).mean() / (sx * sy))
     return r * (i1 - i0) / min(len(a), len(b))
 
 
+def _has_picture(rv, cv) -> bool:
+    return all(float(x.std()) >= VIS_MIN_CHANGE_STD for x in (rv[1], cv[1]))
+
+
+def _visual_alignment(rv, cv, np, notes: list[str]):
+    """``(offset_s, confidence)`` from cross-correlating the frame-change series, or None."""
+    if not _has_picture(rv, cv):
+        return None
+    lags, score = _xcorr(rv[1], cv[1], np)
+    peaks = _peaks(lags, score, np)
+    if not peaks or peaks[0][1] < VIS_MIN_SCORE:
+        return None
+    if len(peaks) > 1 and peaks[1][1] >= PEAK_ALIKE * peaks[0][1]:
+        notes.append("picture: several alignments score alike")
+        return None
+    return peaks[0][0], min(0.85, peaks[0][1])
+
+
 def _vis_score(rv, cv, lag_s: float) -> float:
-    """Picture agreement: mean of luma and frame-change correlation (``rv``/``cv`` = (luma, change))."""
-    return 0.5 * (_pearson_at(rv[0], cv[0], lag_s, VIS_MIN_LUMA_STD)
-                  + _pearson_at(rv[1], cv[1], lag_s, VIS_MIN_CHANGE_STD))
+    """Picture agreement: mean of luma and frame-change correlation over whichever of the two carries
+    information (``rv``/``cv`` = (luma, change)); 0 when neither does."""
+    got = [r for r in (_pearson_at(rv[0], cv[0], lag_s, VIS_MIN_LUMA_STD),
+                       _pearson_at(rv[1], cv[1], lag_s, VIS_MIN_CHANGE_STD)) if r is not None]
+    return sum(got) / len(got) if got else 0.0
 
 
 def _audio_alignment(ra, ca, rv, cv, np, notes: list[str]):
@@ -204,6 +250,10 @@ def _audio_alignment(ra, ca, rv, cv, np, notes: list[str]):
     alike = [p for p in peaks if p[1] >= PEAK_ALIKE * best]
     base_conf = min(0.95, best)
     if len(alike) == 1:
+        if rv is not None and _has_picture(rv, cv) and _vis_score(rv, cv, peaks[0][0]) < VIS_CHECK:
+            notes.append(f"audio: best match {peaks[0][0]:+.3f} s is contradicted by the picture; "
+                         "treating the audio as not shared")
+            return None
         return peaks[0][0], base_conf, []
     vis = sorted(((_vis_score(rv, cv, lag), lag) for lag, _ in alike), reverse=True) if rv is not None else []
     if vis and vis[0][0] >= 0.5 and vis[0][0] - vis[1][0] >= VIS_MARGIN:
@@ -228,20 +278,53 @@ def _onset(diff, fps: float, np):
 
 # ---- mapping ----------------------------------------------------------------
 
-def _match(ref: list[float], cand: list[float], off: float) -> list[tuple[int, int]]:
-    """One-to-one, order-preserving pairs within MATCH_TOL_S after alignment (closest first)."""
-    pairs = sorted(((abs(c - off - r), i, j) for i, r in enumerate(ref) for j, c in enumerate(cand)
-                    if abs(c - off - r) <= MATCH_TOL_S))
-    used_i, used_j, out = set(), set(), []
-    for _, i, j in pairs:
-        if i in used_i or j in used_j:
-            continue
-        if any((i - a) * (j - b) < 0 for a, b in out):  # would cross an accepted pair
-            continue
-        used_i.add(i)
-        used_j.add(j)
-        out.append((i, j))
-    return sorted(out)
+def _match(ref: list[float], cand: list[float], off: float):
+    """``(pairs, ambiguous_ref, ambiguous_cand)``: an order-preserving minimum-cost alignment of the
+    two event lists (pair cost = |delta| within MATCH_TOL_S, skipping an event costs MATCH_TOL_S).
+    A pair whose event has a neighbour almost as close on the other side is not trusted: both go to
+    the ambiguous sets instead of being paired."""
+    n, m, gap = len(ref), len(cand), MATCH_TOL_S
+    inf = float("inf")
+    cost = [[inf] * (m + 1) for _ in range(n + 1)]
+    move = [[None] * (m + 1) for _ in range(n + 1)]
+    cost[0][0] = 0.0
+    for i in range(n + 1):
+        for j in range(m + 1):
+            c0 = cost[i][j]
+            if c0 == inf:
+                continue
+            if i < n and c0 + gap < cost[i + 1][j]:
+                cost[i + 1][j], move[i + 1][j] = c0 + gap, "r"
+            if j < m and c0 + gap < cost[i][j + 1]:
+                cost[i][j + 1], move[i][j + 1] = c0 + gap, "c"
+            if i < n and j < m:
+                d = abs(cand[j] - off - ref[i])
+                if d <= MATCH_TOL_S and c0 + d < cost[i + 1][j + 1]:
+                    cost[i + 1][j + 1], move[i + 1][j + 1] = c0 + d, "m"
+    pairs, i, j = [], n, m
+    while i or j:
+        mv = move[i][j]
+        if mv == "m":
+            pairs.append((i - 1, j - 1))
+            i, j = i - 1, j - 1
+        elif mv == "r":
+            i -= 1
+        else:
+            j -= 1
+    pairs.reverse()
+    keep, amb_r, amb_c = [], set(), set()
+    for i, j in pairs:
+        d = abs(cand[j] - off - ref[i])
+        rival = any(0 <= k < m and k != j and abs(abs(cand[k] - off - ref[i]) - d) <= AMBIG_PARTNER_S
+                    and abs(cand[k] - off - ref[i]) <= MATCH_TOL_S for k in (j - 1, j + 1))
+        rival = rival or any(0 <= k < n and k != i and abs(abs(cand[j] - off - ref[k]) - d) <= AMBIG_PARTNER_S
+                             and abs(cand[j] - off - ref[k]) <= MATCH_TOL_S for k in (i - 1, i + 1))
+        if rival:
+            amb_r.add(i)
+            amb_c.add(j)
+        else:
+            keep.append((i, j))
+    return keep, amb_r, amb_c
 
 
 def _boundaries(path: str, info: dict) -> list[dict]:
@@ -372,11 +455,8 @@ def _compare(ref: dict, cand: dict, offset: float | None, slow: int, out_dir: Pa
         ry, rdiff = _gray(ref["path"], np)
         cy, cdiff = _gray(cand["path"], np)
         if ry is not None and cy is not None:
-            box = np.ones(5) / 5  # 50 ms: tolerate a frame of jitter in change events
-            rv = (_to_grid(ry, ri["fps"], ri["duration"], np),
-                  np.convolve(_to_grid(rdiff, ri["fps"], ri["duration"], np), box, mode="same"))
-            cv = (_to_grid(cy, ci["fps"], ci["duration"], np),
-                  np.convolve(_to_grid(cdiff, ci["fps"], ci["duration"], np), box, mode="same"))
+            rv = (_to_grid(ry, ri["fps"], ri["duration"], np), _impulses(rdiff, ri["fps"], ri["duration"], np))
+            cv = (_to_grid(cy, ci["fps"], ci["duration"], np), _impulses(cdiff, ci["fps"], ci["duration"], np))
 
     span_end = max(ri["duration"], ci["duration"])
     al = None
@@ -415,17 +495,36 @@ def _compare(ref: dict, cand: dict, offset: float | None, slow: int, out_dir: Pa
             al["alternatives_s"] = [round(x, 4) for x in alternatives]
     elif al is None and onset:
         off_s, conf, o_r, o_c = onset
-        al = {"method": "motion_onset", "offset_s": off_s, "confidence": conf,
-              "evidence": _ev(o_r["t"], o_r["t"], conf), "onsets": {"ref": o_r["t"], "cand": o_c["t"]}}
+        if rv is not None and _has_picture(rv, cv):
+            here = _vis_score(rv, cv, off_s)
+            near = max(_vis_score(rv, cv, off_s - 0.5), _vis_score(rv, cv, off_s + 0.5))
+            if here < VIS_CHECK or here <= near:
+                notes.append(f"first visible motion suggests {off_s:+.3f} s but the rest of the picture does "
+                             "not agree (the two first motions may be different events)")
+                conf = UNCONFIRMED_CONF
+        if conf > UNCONFIRMED_CONF:
+            al = {"method": "motion_onset", "offset_s": off_s, "confidence": min(conf, ONSET_MAX_CONF),
+                  "evidence": _ev(o_r["t"], o_r["t"], min(conf, ONSET_MAX_CONF)),
+                  "onsets": {"ref": o_r["t"], "cand": o_c["t"]}}
+            notes.append("motion-onset alignment: deltas are relative to the first detected motion, which "
+                         "absorbs that event's own timing difference")
     elif al is None and np is not None:
         notes.append("no motion onset found in both clips")
+    if al is None and np is not None and rv is not None:
+        got = _visual_alignment(rv, cv, np, notes)
+        if got is not None:
+            al = {"method": "visual", "offset_s": round(got[0], 4), "confidence": round(got[1], 3),
+                  "evidence": _ev(0.0, span_end, got[1])}
     if al is None:
-        al = {"method": NOT_DETERMINED, "offset_s": 0.0, "confidence": 0,
+        al = {"method": NOT_DETERMINED, "offset_s": NOT_DETERMINED, "confidence": 0,
               "evidence": _ev(0.0, span_end, 0.0)}
         notes.append("alignment not determined: pass --offset SECONDS (candidate time = reference time + offset); "
                      "the side-by-side is unaligned and no timing deltas are reported")
     res["alignment"] = al
-    off = al["offset_s"]
+    aligned = al["method"] != NOT_DETERMINED and float(al["confidence"]) > UNCONFIRMED_CONF
+    if al["method"] != NOT_DETERMINED and not aligned:
+        notes.append("alignment unconfirmed: no timing deltas reported; pass --offset")
+    off = float(al["offset_s"]) if al["method"] != NOT_DETERMINED else 0.0
 
     a = max(0.0, -off)
     b = min(ri["duration"], ci["duration"] - off)
@@ -433,11 +532,11 @@ def _compare(ref: dict, cand: dict, offset: float | None, slow: int, out_dir: Pa
         raise CompareError(f"no overlap between the clips at offset {off:+.3f} s")
     res["overlap"] = {"ref_start": round(a, 4), "ref_end": round(b, 4)}
 
-    if al["method"] != NOT_DETERMINED:
+    if aligned:
         conf = float(al["confidence"])
         rb = [x for x in _boundaries(ref["path"], ri) if _in(x["t"], a, b)]
         cb = [x for x in _boundaries(cand["path"], ci) if _in(x["t"] - off, a, b)]
-        pairs = _match([x["t"] for x in rb], [x["t"] for x in cb], off)
+        pairs, amb_r, amb_c = _match([x["t"] for x in rb], [x["t"] for x in cb], off)
         for i, j in pairs:
             r, c = rb[i], cb[j]
             res["shots"].append({"ref": r["t"], "cand": c["t"], "kind_ref": r["kind"], "kind_cand": c["kind"],
@@ -449,15 +548,18 @@ def _compare(ref: dict, cand: dict, offset: float | None, slow: int, out_dir: Pa
                                           "delta_ms": round((cd - rd) * 1000, 1),
                                           "evidence": _ev(rb[i0]["t"], rb[i1]["t"], conf)})
         mi, mj = {i for i, _ in pairs}, {j for _, j in pairs}
-        res["unmatched"] += [{"side": "ref", "kind": x["kind"], "t": x["t"], "reason": "no candidate cut within "
-                              f"{MATCH_TOL_S} s"} for k, x in enumerate(rb) if k not in mi]
-        res["unmatched"] += [{"side": "cand", "kind": x["kind"], "t": x["t"], "reason": "no reference cut within "
-                              f"{MATCH_TOL_S} s"} for k, x in enumerate(cb) if k not in mj]
+        amb = "ambiguous: two partners almost equally close, not paired"
+        res["unmatched"] += [{"side": "ref", "kind": x["kind"], "t": x["t"],
+                              "reason": amb if k in amb_r else f"no candidate cut within {MATCH_TOL_S} s",
+                              "evidence": _ev(x["t"], x["t"], conf)} for k, x in enumerate(rb) if k not in mi]
+        res["unmatched"] += [{"side": "cand", "kind": x["kind"], "t": x["t"],
+                              "reason": amb if k in amb_c else f"no reference cut within {MATCH_TOL_S} s",
+                              "evidence": _ev(x["t"], x["t"], conf)} for k, x in enumerate(cb) if k not in mj]
 
         if np is not None:
             rs = [s for s in _spans(rdiff, ri["fps"], np) if _in(s[0], a, b)]
             cs = [s for s in _spans(cdiff, ci["fps"], np) if _in(s[0] - off, a, b)]
-            sp = _match([s[0] for s in rs], [s[0] for s in cs], off)
+            sp, _, _ = _match([s[0] for s in rs], [s[0] for s in cs], off)
             for i, j in sp:
                 (r0, r1), (c0, c1) = rs[i], cs[j]
                 res["phases"].append({
@@ -468,10 +570,12 @@ def _compare(ref: dict, cand: dict, offset: float | None, slow: int, out_dir: Pa
                     "evidence": _ev(r0, r1, conf)})
             mi, mj = {i for i, _ in sp}, {j for _, j in sp}
             res["unmatched"] += [{"side": "ref", "kind": "motion_span", "t": round(s[0], 4),
-                                  "reason": "no candidate motion span starts nearby"}
+                                  "reason": "no candidate motion span starts nearby",
+                                  "evidence": _ev(s[0], s[1], conf)}
                                  for k, s in enumerate(rs) if k not in mi]
             res["unmatched"] += [{"side": "cand", "kind": "motion_span", "t": round(s[0], 4),
-                                  "reason": "no reference motion span starts nearby"}
+                                  "reason": "no reference motion span starts nearby",
+                                  "evidence": _ev(s[0], s[1], conf)}
                                  for k, s in enumerate(cs) if k not in mj]
         if conf <= 0.5:
             notes.append(f"alignment confidence {conf:.2f}: treat every delta as approximate")
@@ -486,9 +590,12 @@ def _compare(ref: dict, cand: dict, offset: float | None, slow: int, out_dir: Pa
 
 def summary_md(res: dict) -> str:
     al = res["alignment"]
-    lines = [f"# Comparison: {res['reference']['source']} vs {res['candidate']['source']}", "",
-             f"- alignment: {al['method']}, candidate = reference {al['offset_s']:+.3f} s "
-             f"(confidence {al['confidence']})"]
+    lines = [f"# Comparison: {res['reference']['source']} vs {res['candidate']['source']}", ""]
+    if al["offset_s"] == NOT_DETERMINED:
+        lines.append("- alignment: _not determined_ (pass --offset)")
+    else:
+        lines.append(f"- alignment: {al['method']}, candidate = reference {al['offset_s']:+.3f} s "
+                     f"(confidence {al['confidence']})")
     if res["shots"]:
         lines += ["", "| ref cut (s) | your cut (s) | delta (ms) |", "|---|---|---|"]
         lines += [f"| {s['ref']:.3f} | {s['cand']:.3f} | {s['delta_ms']:+.0f} |" for s in res["shots"]]

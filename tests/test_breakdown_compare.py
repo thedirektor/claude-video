@@ -144,3 +144,109 @@ def test_missing_candidate(ref, tmp_path):
     p, _ = ref
     with pytest.raises(compare.CompareError):
         compare.run(str(p), str(tmp_path / "nope.mp4"), out_dir=tmp_path / "o")
+
+
+# ---- realistic cases (reviewer probes): different music, black lead, uniform retime ----
+
+SRCS = ["testsrc2", "mandelbrot", "smptebars", "rgbtestsrc", "testsrc"]
+REF_CUTS = [1.5, 3.2, 4.0, 6.1]
+DUR = 8.0
+
+
+def _wav(path, times, freq, dur, seed):
+    np = pytest.importorskip("numpy")
+    import wave
+
+    sr = 44100
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(dur * sr)) / sr
+    x = 0.02 * rng.standard_normal(len(t))
+    for i, c in enumerate(times):
+        m = (t >= c) & (t < c + 0.06)
+        x[m] += 0.7 * np.sin(2 * np.pi * (freq + 37 * (i % 5)) * (t[m] - c)) * np.exp(-(t[m] - c) * 40)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes((np.clip(x, -1, 1) * 32000).astype("<i2").tobytes())
+
+
+def _edit(path, cuts, fps, size, audio=None, lead=0.0):
+    """Concatenated lavfi shots cut at ``cuts``; ``lead`` seconds of black first (shifts every cut)."""
+    srcs = (["color=c=black"] if lead else []) + SRCS
+    cuts = ([lead] if lead else []) + [c + lead for c in cuts]
+    bounds = [0.0, *cuts, DUR + lead]
+    chains = []
+    for k, (t0, t1) in enumerate(zip(bounds, bounds[1:])):
+        src = srcs[k % len(srcs)]
+        sep = ":" if "=" in src else "="
+        chains.append(f"{src}{sep}s={size}:r={fps},trim=duration={t1 - t0:.4f},setpts=PTS-STARTPTS,"
+                      f"format=yuv420p,setsar=1[s{k}]")
+    g = ";".join(chains) + ";" + "".join(f"[s{k}]" for k in range(len(chains))) + f"concat=n={len(chains)}:v=1:a=0"
+    args = ["-i", str(audio)] if audio else []
+    args += ["-filter_complex", g + "[v]", "-map", "[v]"]
+    args += ["-map", "0:a", "-c:a", "aac"] if audio else ["-an"]
+    _ffmpeg([*args, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", str(fps),
+             "-t", str(DUR + lead), str(path)])
+
+
+A_T = [0.3, 0.9, 1.25, 2.1, 2.4, 3.3, 3.95, 4.6, 5.2, 5.35, 6.0, 6.8, 7.4]
+B_T = [0.15, 0.7, 1.6, 1.9, 2.75, 3.1, 4.2, 4.45, 5.6, 6.3, 6.55, 7.1, 7.7]
+
+
+@pytest.fixture(scope="module")
+def edit_ref(tmp_path_factory):
+    d = tmp_path_factory.mktemp("edit")
+    _wav(d / "a.wav", A_T, 800, DUR, 1)
+    _wav(d / "b.wav", B_T, 1300, DUR, 2)
+    _edit(d / "ref.mp4", REF_CUTS, 25, "640x360", d / "a.wav")
+    return d
+
+
+def _never_confidently_wrong(res, true_offset, tol=0.1):
+    al = res["alignment"]
+    if al["method"] == "not determined":
+        return
+    assert al["confidence"] <= 0.5 or abs(al["offset_s"] - true_offset) <= tol, al
+
+
+def test_different_music_is_not_audio_aligned(edit_ref, tmp_path):
+    cand = tmp_path / "c.mp4"
+    _edit(cand, REF_CUTS, 60, "360x640", edit_ref / "b.wav")  # own music, same cuts, 9:16 60 fps
+    res = compare.run(str(edit_ref / "ref.mp4"), str(cand), out_dir=tmp_path / "o")
+    assert res["alignment"]["method"] != "audio"
+    _never_confidently_wrong(res, 0.0)
+    for s in res["shots"]:
+        assert abs(s["delta_ms"]) <= 60, s
+
+
+def test_black_lead_not_confidently_wrong(edit_ref, tmp_path):
+    cand = tmp_path / "c.mp4"
+    _edit(cand, REF_CUTS, 60, "1280x720", lead=0.5)  # silent, 0.5 s of black first
+    res = compare.run(str(edit_ref / "ref.mp4"), str(cand), out_dir=tmp_path / "o")
+    _never_confidently_wrong(res, 0.48)  # the reference's cuts land on 25 fps frames (1.52 s)
+    if res["alignment"]["method"] != "not determined" and res["alignment"]["confidence"] > 0.5:
+        for s in res["shots"]:
+            assert abs(s["delta_ms"]) <= 60, s
+
+
+def test_uniform_shift_half_cut_spacing_not_forced(edit_ref, tmp_path):
+    """Video sits ~0.4 s from the aligned audio: cuts between two partners are left unpaired."""
+    _wav(tmp_path / "a37.wav", [t + 0.37 for t in A_T], 800, DUR + 0.37, 1)
+    cand = tmp_path / "c.mp4"
+    _edit(cand, REF_CUTS, 60, "360x640", tmp_path / "a37.wav")
+    res = compare.run(str(edit_ref / "ref.mp4"), str(cand), out_dir=tmp_path / "o")
+    assert res["alignment"]["method"] == "audio"
+    for s in res["shots"]:  # every reported pairing is the true one (video ~0.39 s early)
+        assert -0.47 <= s["delta_ms"] / 1000 <= -0.33, s
+    assert any("ambiguous" in u["reason"] for u in res["unmatched"])
+
+
+def test_not_determined_offset_is_a_string(tmp_path):
+    a, b = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    for path in (a, b):
+        _ffmpeg(["-f", "lavfi", "-i", "color=c=gray:s=320x180:r=25:d=3", "-c:v", "libx264",
+                 "-preset", "veryfast", "-t", "3", str(path)])
+    res = compare.run(str(a), str(b), out_dir=tmp_path / "o")
+    assert res["alignment"]["offset_s"] == "not determined"
+    assert "_not determined_" in compare.summary_md(res)
