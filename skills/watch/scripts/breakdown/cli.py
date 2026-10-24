@@ -55,6 +55,7 @@ def _cmd_breakdown(argv: list[str]) -> int:
     ap.add_argument("--json", action="store_true", help="print breakdown.json instead of the brief")
     ap.add_argument("--formats", default="", help="timeline files to write: otio,fcpxml,edl")
     ap.add_argument("--allow-cost", action="store_true", help="ignore WATCH_COST_CEILING_USD for --interpret")
+    ap.add_argument("--spend-out", default=None, help="write spend.json (the --interpret call's cost) to this folder")
     ap.add_argument("--stored", action="store_true",
                     help="return the stored breakdown.json / .md as they are, without re-measuring")
     a = ap.parse_args(argv)
@@ -89,6 +90,10 @@ def _cmd_breakdown(argv: list[str]) -> int:
             return 0
         try:
             bd = assemble.build(conn, key, interpret=a.interpret, allow_cost=a.allow_cost)
+            if a.spend_out:
+                import spend
+
+                spend.flush(Path(a.spend_out))
         except cost.CostCeilingExceeded as exc:
             print(f"[watch] {exc}", file=sys.stderr)
             return 2
