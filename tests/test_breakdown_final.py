@@ -401,3 +401,16 @@ def test_fragment_track_dropped_when_inside_longer_overlapping_track():
 def test_notes_mention_merged_jump_cuts_and_dropped_same_picture_cuts(conn, one_shot):
     bd = assemble.build(conn, KEY, store_dir=one_shot)
     assert any("jump cuts within one framing may be merged" in n for n in bd["notes"])
+
+
+def test_notes_count_cuts_dropped_inside_a_pan(conn, one_shot, monkeypatch):
+    real = assemble.shots_mod.detect_shots
+
+    def counted(series, duration):
+        out = real(series, duration)
+        series["pan_dropped"] = 2
+        return out
+
+    monkeypatch.setattr(assemble.shots_mod, "detect_shots", counted)
+    bd = assemble.build(conn, KEY, store_dir=one_shot)
+    assert any("2 cut candidate(s) dropped inside one continuous pan" in n for n in bd["notes"])

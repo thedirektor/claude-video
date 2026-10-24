@@ -350,6 +350,87 @@ def test_one_continuous_pan_is_one_shot(strips, v):
     assert len(S.detect_shots(S.frame_series(str(p), 25), 2.0)) == 1
 
 
+# ------------------------------------------------------------------ fix round 5
+
+WIDE = 6400  # 6 s at 40 px/frame crosses 6000 px of one picture
+
+
+@pytest.fixture(scope="module")
+def wide(tmp_path_factory):
+    d = tmp_path_factory.mktemp("wide")
+    _ff("-f", "lavfi", "-i", f"testsrc2=s={WIDE}x180:d=1", "-frames:v", "1", str(d / "b.png"))
+    _ff("-f", "lavfi", "-i", f"mandelbrot=s={WIDE}x180:start_scale=0.3:start_x=-0.5:start_y=0.0", "-frames:v", "1",
+        str(d / "c.png"))
+    return d
+
+
+@pytest.mark.parametrize("sign", [1, -1])
+@pytest.mark.parametrize("img", ["b", "c"])
+@pytest.mark.parametrize("secs", [2, 4, 6])
+@pytest.mark.parametrize("v", [10, 20, 40])
+def test_continuous_pan_has_no_boundary_of_any_kind(wide, v, secs, img, sign):
+    """One unbroken single-direction pan is one shot: no cut, no gradual, no motion boundary. A 4 s pan at
+    20 px/frame used to leave two cuts at 1.0 (3.56 s, 3.92 s) that no pan check ever looked at."""
+    frames = secs * 25
+    p = _pan(wide, img, frames, v, 0 if sign > 0 else WIDE - 320, sign, f"p{img}{v}{secs}{sign}.mp4")
+    found = S.detect_shots(S.frame_series(str(p), 25), float(secs))
+    assert [(round(s["start"], 2), s["boundary"]["kind"], s["boundary"]["evidence"]["confidence"])
+            for s in found if s["boundary"]] == []
+
+
+@pytest.mark.parametrize("v", [10, 20, 40])
+def test_reviewer_four_second_pan_has_no_cut(strips, v):
+    p = _pan(strips, "b", 100, v, 0, 1, f"rv{v}.mp4")  # the reviewer's clip: cuts at 3.56 / 3.92 s (20 px)
+    found = S.detect_shots(S.frame_series(str(p), 25), 4.0)
+    assert [(s["start"], s["boundary"]["kind"]) for s in found if s["boundary"]] == []
+
+
+@pytest.mark.parametrize("v,secs,sign", [(10, 2, 1), (10, 2, -1), (40, 6, 1)])
+def test_pan_over_featureless_detail_never_gets_a_confident_boundary(wide, v, secs, sign):
+    """Smooth mandelbrot edges: phase correlation cannot confirm the slide, so a boundary may remain, but
+    it is capped and says why (these were gradual boundaries at 0.65-0.76)."""
+    if not (wide / "a.png").exists():
+        _ff("-f", "lavfi", "-i", f"mandelbrot=s={WIDE}x180:start_scale=0.05:start_x=-0.74:start_y=0.1", "-frames:v",
+            "1", str(wide / "a.png"))
+    p = _pan(wide, "a", secs * 25, v, 0 if sign > 0 else WIDE - 320, sign, f"fa{v}{secs}{sign}.mp4")
+    bounds = [s["boundary"] for s in S.detect_shots(S.frame_series(str(p), 25), float(secs)) if s["boundary"]]
+    assert all(b["evidence"]["confidence"] <= 0.4 and b.get("note") for b in bounds), bounds
+
+
+def test_without_opencv_a_cut_inside_a_pan_is_capped_and_says_so(strips, monkeypatch):
+    series = S.frame_series(str(_pan(strips, "b", 100, 20, 0, 1, "nocv_cut.mp4")), 25)
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    bounds = [s["boundary"] for s in S.detect_shots(series, 4.0) if s["boundary"]]
+    assert any(b["kind"] == "cut" for b in bounds), "the raw detector leaves cuts in this pan"
+    assert all(b["evidence"]["confidence"] <= 0.4 and "opencv missing" in b["note"] for b in bounds)
+
+
+def test_pan_check_without_media_path_does_not_blame_opencv(strips):
+    series = dict(S.frame_series(str(_pan(strips, "b", 100, 20, 0, 1, "nopath.mp4")), 25))
+    series.pop("path")
+    bounds = [s["boundary"] for s in S.detect_shots(series, 4.0) if s["boundary"]]
+    assert bounds and all(b["evidence"]["confidence"] <= 0.4 for b in bounds)
+    assert all("opencv missing" not in b["note"] and "continuous-pan check skipped" in b["note"] for b in bounds)
+
+
+def test_dropped_pan_cuts_are_counted(strips):
+    series = S.frame_series(str(_pan(strips, "b", 100, 20, 0, 1, "count.mp4")), 25)
+    assert len(S.detect_shots(series, 4.0)) == 1
+    assert series.get("pan_dropped", 0) >= 1
+
+
+@pytest.mark.parametrize("v", [10, 20, 40])
+def test_hard_cut_between_two_same_direction_pans_is_a_cut(wide, v):
+    """The pan check must not swallow a real cut when both shots slide the same way."""
+    a = _pan(wide, "b", 50, v, 0, 1, f"sa{v}.mp4")
+    b = _pan(wide, "c", 50, v, 0, 1, f"sb{v}.mp4")
+    p = wide / f"same{v}.mp4"
+    _ff("-i", str(a), "-i", str(b), "-filter_complex", "concat=n=2:v=1", *_ENC, str(p))
+    found = S.detect_shots(S.frame_series(str(p), 25), 4.0)
+    kinds = [(s["boundary"]["kind"], round(s["boundary"]["t"], 2)) for s in found if s["boundary"]]
+    assert [k for k, _ in kinds] == ["cut"] and abs(kinds[0][1] - 2.0) <= 0.04, kinds
+
+
 def test_same_picture_frames_are_dropped_not_demoted():
     import random
     rnd = random.Random(8)
