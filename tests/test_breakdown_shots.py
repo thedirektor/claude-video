@@ -662,7 +662,7 @@ def test_moving_dissolve_scan_is_bounded_and_says_so(strips, monkeypatch):
     p = strips / "bd.mp4"
     _ff("-i", str(a), "-i", str(b), "-filter_complex", "[0][1]xfade=transition=fade:duration=1:offset=1.5", *_ENC, str(p))
     series = S.frame_series(str(p), 25)
-    monkeypatch.setattr(S, "DISSOLVE_SCAN_MIN_S", 1.0)  # budget below the 5 s moving stretch
+    monkeypatch.setattr(S, "DISSOLVE_SCAN_BUDGET_S", -1.0)  # forced: no scan time at all
     found = S.detect_shots(series, 5.0)
     assert series.get("dissolve_scan_capped") is True
     assert [s for s in found if s["boundary"]] == []  # not scanned: nothing invented, the note says why
@@ -682,3 +682,13 @@ def test_recurring_states_are_capped_with_a_note():
     assert all(b["confidence"] <= 0.4 and b["note"] == S.RECURRING_NOTE for b in out), out
     single = S._uncertain_colour_cuts(series, [_cut(series, 4)])  # one change, no return: untouched
     assert single[0]["confidence"] == 1.0 and "note" not in single[0]
+
+
+def test_four_minutes_of_ordinary_motion_scan_within_budget(tmp_path):
+    """The budget is wall-clock: a few minutes of ordinary moving footage scans in full, and says
+    nothing about a cap (the 213 s music video scanned unbounded in +0.6 s)."""
+    p = tmp_path / "long.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=240", "-vf", "crop=240:180:'40+40*sin(t)':0", *_ENC, str(p))
+    series = S.frame_series(str(p), 25)
+    S.detect_shots(series, 240.0)
+    assert not series.get("dissolve_scan_capped")

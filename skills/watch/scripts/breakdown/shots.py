@@ -12,6 +12,7 @@ import math
 import re
 import statistics
 import subprocess
+import time
 
 NOT_DETERMINED = "not determined"
 CUT_FLOOR = 0.15  # brief says 0.3; ffmpeg's scene score for a real red->green cut is only 0.23
@@ -549,8 +550,7 @@ def slide_explains_window(series: dict, r0: int, r1: int):
 DISSOLVE_MIN_RUN_S = 1.5  # a moving stretch this long (no cut, picture changing every frame) is scanned
 DISSOLVE_GAP_S = 2.5  # quiet stretch (no thumbnail change) bridged between two moving runs
 DISSOLVE_MOVING_SHARE = 0.35  # share of moving frames a stretch needs to be scanned
-DISSOLVE_SCAN_S_PER_H = 600.0  # moving-dissolve scan budget: seconds of media per hour of media ...
-DISSOLVE_SCAN_MIN_S = 60.0  # ... and at least this much on short media
+DISSOLVE_SCAN_BUDGET_S = 30.0  # wall-clock seconds the moving-dissolve scan may spend per media file
 DISSOLVE_SCAN_CAPPED_NOTE = ("moving-dissolve scan budget reached: some moving stretches were not scanned, "
                              "dissolves between moving shots there can go undetected")
 DISSOLVE_SCAN_MAX = 750  # frames decoded per scan chunk
@@ -589,23 +589,17 @@ def _moving_dissolves(series: dict, cut_idx: set[int], taken: list[tuple[int, in
             runs.append([s0, e])
     # only stretches where a real share of frames moves (a dissolve over featureless detail leaves
     # 40-50% of the stretch nearly still in the thumbnails, so a median test would skip exactly those),
-    # within a scan budget per media hour: the scan decodes every frame of a stretch
+    # within a wall-clock budget, checked between scan chunks: the scan decodes every frame of a stretch
     runs = [(s0 - 1, e) for s0, e in runs if t[e] - t[s0 - 1] >= DISSOLVE_MIN_RUN_S
             and sum(x >= BURST_ACTIVE for x in d[s0:e + 1]) >= DISSOLVE_MOVING_SHARE * (e - s0 + 1)]
-    budget = max(DISSOLVE_SCAN_MIN_S, DISSOLVE_SCAN_S_PER_H * (t[-1] - t[0]) / 3600.0)
-    kept, used = [], 0.0
-    for f_lo, f_hi in sorted(runs, key=lambda r: t[r[1]] - t[r[0]]):  # shortest first: most stretches
-        span = t[f_hi] - t[f_lo]
-        if used + span > budget:
-            series["dissolve_scan_capped"] = True
-            continue
-        used += span
-        kept.append((f_lo, f_hi))
-    runs = sorted(kept)
+    started = time.monotonic()
     out: list[dict] = []
-    for f_lo, f_hi in runs:
+    for f_lo, f_hi in sorted(runs, key=lambda r: t[r[1]] - t[r[0]]):  # shortest first: most stretches
         for c0 in range(f_lo, f_hi, DISSOLVE_SCAN_MAX // 2):
             c1 = min(f_hi, c0 + DISSOLVE_SCAN_MAX)
+            if time.monotonic() - started > DISSOLVE_SCAN_BUDGET_S:
+                series["dissolve_scan_capped"] = True  # only when stretches were really left unscanned
+                break
 
             def run(cv2, np, cap, c0=c0, c1=c1):
                 grays = _pan_frames(cv2, np, cap, t, c0, c1, series.get("crop"))
@@ -1019,7 +1013,7 @@ SINGLE_SHOT_CONF = 0.6  # no neighbouring boundary: a dissolve between two movin
 
 
 COLOUR_ONLY_NOTE = "colour change on the same picture: a cut or a lighting change, not determined"
-RECURRING_NOTE = "recurring light/colour states: strobe or light cycle, cuts not determined"
+RECURRING_NOTE = "recurring picture states (strobe, light cycle or rapid intercut): cuts not determined"
 RECUR_FRAMES = 12  # a later cut this close that returns the picture to an earlier state
 RECUR_RETURN = 0.3  # ... within this share of the first jump
 
