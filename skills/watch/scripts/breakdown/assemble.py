@@ -393,6 +393,8 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
             if series.get("merged_same_picture"):
                 _add_note(notes, f"{series['merged_same_picture']} cut candidate(s) merged as same-picture "
                                  "(a step inside one framing, not an edit)")
+            if series.get("dissolve_scan_capped"):
+                _add_note(notes, shots_mod.DISSOLVE_SCAN_CAPPED_NOTE)
             if series.get("pan_dropped"):
                 _add_note(notes, f"{series['pan_dropped']} cut candidate(s) dropped inside one continuous pan "
                                  "(the picture slides the same way through them)")

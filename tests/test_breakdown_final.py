@@ -414,3 +414,16 @@ def test_notes_count_cuts_dropped_inside_a_pan(conn, one_shot, monkeypatch):
     monkeypatch.setattr(assemble.shots_mod, "detect_shots", counted)
     bd = assemble.build(conn, KEY, store_dir=one_shot)
     assert any("2 cut candidate(s) dropped inside one continuous pan" in n for n in bd["notes"])
+
+
+def test_notes_say_when_the_moving_dissolve_scan_was_capped(conn, one_shot, monkeypatch):
+    real = assemble.shots_mod.detect_shots
+
+    def capped(series, duration):
+        out = real(series, duration)
+        series["dissolve_scan_capped"] = True
+        return out
+
+    monkeypatch.setattr(assemble.shots_mod, "detect_shots", capped)
+    bd = assemble.build(conn, KEY, store_dir=one_shot)
+    assert assemble.shots_mod.DISSOLVE_SCAN_CAPPED_NOTE in bd["notes"]

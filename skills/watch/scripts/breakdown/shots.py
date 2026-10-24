@@ -457,7 +457,7 @@ def _residual(cv2, np, a, b, dx: float, dy: float) -> float | None:
     return float(np.mean(np.abs(moved[y0:y1, x0:x1] - b[y0:y1, x0:x1]))) / 255.0
 
 
-def continuous_pan(series: dict, i_before: int, i_after: int):
+def continuous_pan(series: dict, i_before: int, i_after: int, colour: bool = True):
     """True when every frame step from ``i_before`` to ``i_after`` (clamped to the clip) is one picture
     sliding the same way at about the same speed: one continuous camera move, not an edit. A whip
     between held framings starts and ends at rest (False). A step whose measured shift is off the
@@ -487,7 +487,8 @@ def continuous_pan(series: dict, i_before: int, i_after: int):
         off = [max(abs(s[axis] - speed), abs(s[1 - axis] - drift)) for s in steps]
         dx, dy = (speed, drift) if axis == 0 else (drift, speed)
         # in colour: a cut to a regraded / hue-rotated copy keeps the grey picture and the shift
-        res = [_residual(cv2, np, cols[j], cols[j + 1], dx, dy) for j in range(len(steps))]
+        frames = cols if colour else grays  # grey: does the picture's structure carry on (colour aside)?
+        res = [_residual(cv2, np, frames[j], frames[j + 1], dx, dy) for j in range(len(steps))]
         known = [r for r in res if r is not None]
         if known and any(r is not None and r > PAN_BREAK_RATIO * statistics.median(known) + PAN_BREAK_FLOOR
                          for r in res):
@@ -547,6 +548,11 @@ def slide_explains_window(series: dict, r0: int, r1: int):
 
 DISSOLVE_MIN_RUN_S = 1.5  # a moving stretch this long (no cut, picture changing every frame) is scanned
 DISSOLVE_GAP_S = 2.5  # quiet stretch (no thumbnail change) bridged between two moving runs
+DISSOLVE_MOVING_SHARE = 0.35  # share of moving frames a stretch needs to be scanned
+DISSOLVE_SCAN_S_PER_H = 600.0  # moving-dissolve scan budget: seconds of media per hour of media ...
+DISSOLVE_SCAN_MIN_S = 60.0  # ... and at least this much on short media
+DISSOLVE_SCAN_CAPPED_NOTE = ("moving-dissolve scan budget reached: some moving stretches were not scanned, "
+                             "dissolves between moving shots there can go undetected")
 DISSOLVE_SCAN_MAX = 750  # frames decoded per scan chunk
 DISSOLVE_K = 6.0  # spans whose slide residual exceeds this many x the stretch's median ...
 DISSOLVE_MIN = 0.012  # ... and this level (0..1 grey) carry a picture change the slide does not explain
@@ -581,7 +587,21 @@ def _moving_dissolves(series: dict, cut_idx: set[int], taken: list[tuple[int, in
             runs[-1][1] = e
         else:
             runs.append([s0, e])
-    runs = [(s0 - 1, e) for s0, e in runs if t[e] - t[s0 - 1] >= DISSOLVE_MIN_RUN_S]
+    # only stretches where a real share of frames moves (a dissolve over featureless detail leaves
+    # 40-50% of the stretch nearly still in the thumbnails, so a median test would skip exactly those),
+    # within a scan budget per media hour: the scan decodes every frame of a stretch
+    runs = [(s0 - 1, e) for s0, e in runs if t[e] - t[s0 - 1] >= DISSOLVE_MIN_RUN_S
+            and sum(x >= BURST_ACTIVE for x in d[s0:e + 1]) >= DISSOLVE_MOVING_SHARE * (e - s0 + 1)]
+    budget = max(DISSOLVE_SCAN_MIN_S, DISSOLVE_SCAN_S_PER_H * (t[-1] - t[0]) / 3600.0)
+    kept, used = [], 0.0
+    for f_lo, f_hi in sorted(runs, key=lambda r: t[r[1]] - t[r[0]]):  # shortest first: most stretches
+        span = t[f_hi] - t[f_lo]
+        if used + span > budget:
+            series["dissolve_scan_capped"] = True
+            continue
+        used += span
+        kept.append((f_lo, f_hi))
+    runs = sorted(kept)
     out: list[dict] = []
     for f_lo, f_hi in runs:
         for c0 in range(f_lo, f_hi, DISSOLVE_SCAN_MAX // 2):
@@ -998,6 +1018,147 @@ def _drop_pan_cuts(series: dict, bounds: list[dict]) -> list[dict]:
 SINGLE_SHOT_CONF = 0.6  # no neighbouring boundary: a dissolve between two moving shots can go undetected
 
 
+COLOUR_ONLY_NOTE = "colour change on the same picture: a cut or a lighting change, not determined"
+RECURRING_NOTE = "recurring light/colour states: strobe or light cycle, cuts not determined"
+RECUR_FRAMES = 12  # a later cut this close that returns the picture to an earlier state
+RECUR_RETURN = 0.3  # ... within this share of the first jump
+
+
+def _grey_corr(a, b) -> float | None:
+    """Pearson correlation of two thumbnails' grey levels; None when either is flat."""
+    ga = [(a[k] + a[k + 1] + a[k + 2]) / 3.0 for k in range(0, len(a), 3)]
+    gb = [(b[k] + b[k + 1] + b[k + 2]) / 3.0 for k in range(0, len(b), 3)]
+    n = len(ga)
+    ma, mb = sum(ga) / n, sum(gb) / n
+    va = sum((v - ma) ** 2 for v in ga)
+    vb = sum((v - mb) ** 2 for v in gb)
+    if va < 36.0 * n or vb < 36.0 * n:
+        return None
+    return sum((x - ma) * (y - mb) for x, y in zip(ga, gb)) / (va * vb) ** 0.5
+
+
+LUMA_SAME_MAX = 0.05  # largest slide-compensated luma residual (0..1) of a step on one picture
+STRUCTURE_SAME = 0.75  # edge-map correlation (after the shift) above which two frames are one picture
+
+
+def _grad(cv2, np, img):
+    """Edge strength over luma and both chroma planes: a hue rotation turns the chroma plane, which
+    keeps Cr/Cb edge strength, so a recoloured copy keeps its edges where a grey edge map would not
+    (low-contrast colourful pictures have almost no grey edges)."""
+    ycc = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    tot = None
+    for c in range(3):
+        gx = cv2.Sobel(ycc[:, :, c], cv2.CV_32F, 1, 0)
+        gy = cv2.Sobel(ycc[:, :, c], cv2.CV_32F, 0, 1)
+        tot = gx * gx + gy * gy if tot is None else tot + gx * gx + gy * gy
+    return np.sqrt(tot)
+
+
+def _same_structure(series: dict, i: int) -> bool | None:
+    """True when the luma picture carries on through frame ``i``: every frame step around it, moved by
+    the slide (median measured shift), leaves a residual within the pan break rule. A colour edit that
+    keeps the luma (a hue / saturation change of the light or the grade) is then the same picture
+    whatever its colour did; a real cut changes the luma picture. Every step is tested, so a seek
+    landing a frame off changes nothing. None when it cannot run (no OpenCV / media)."""
+    t = series["t"]
+    lo, hi = max(1, i - PAN_CONTEXT), min(len(t) - 1, i + PAN_CONTEXT)
+
+    def run(cv2, np, cap):
+        grays = _pan_frames(cv2, np, cap, t, lo - 1, hi, series.get("crop"))
+        steps = _shifts_of(cv2, grays)
+        if len(steps) < 2:
+            return None
+        dx = statistics.median(s[0] for s in steps)
+        dy = statistics.median(s[1] for s in steps)
+        res = [_residual(cv2, np, grays[j], grays[j + 1], dx, dy) for j in range(len(steps))]
+        known = [r for r in res if r is not None]
+        if len(known) < 2:
+            return None
+        # relative (the break rule) and absolute: in a fast-moving shot the median is large, and a real
+        # cut's residual (0.11-0.29 on the music video) would hide under 3x of it
+        return max(known) <= min(LUMA_SAME_MAX, PAN_BREAK_RATIO * statistics.median(known) + PAN_BREAK_FLOOR)
+
+    return _with_capture(series, run)
+
+
+def _same_edges(series: dict, i: int) -> bool | None:
+    """True when every frame step around frame ``i`` keeps its edges (luma + chroma edge strength,
+    correlation after the measured shift >= STRUCTURE_SAME): a light that also changes the saturation
+    alters the luma, but not where the edges are. The weakest step counts (seek-proof)."""
+    t = series["t"]
+    lo, hi = max(1, i - PAN_CONTEXT), min(len(t) - 1, i + PAN_CONTEXT)
+
+    def run(cv2, np, cap):
+        pairs = _pan_frames(cv2, np, cap, t, lo - 1, hi, series.get("crop"), colour=True)
+        if len(pairs) < 2:
+            return None
+        edges = [_grad(cv2, np, c) for _, c in pairs]
+        win = cv2.createHanningWindow(edges[0].shape[::-1], cv2.CV_32F)
+        for a, b in zip(edges, edges[1:]):
+            (dx, dy), _r = cv2.phaseCorrelate(a.copy(), b.copy(), win)
+            h, w = a.shape
+            moved = cv2.warpAffine(a, np.float32([[1, 0, dx], [0, 1, dy]]), (w, h))
+            x0, x1 = int(max(0.0, dx)) + 2, int(min(w, w + dx)) - 2
+            y0, y1 = int(max(0.0, dy)) + 2, int(min(h, h + dy)) - 2
+            if x1 - x0 < 0.3 * w or y1 - y0 < 0.3 * h:
+                return False
+            u, v = moved[y0:y1, x0:x1].ravel(), b[y0:y1, x0:x1].ravel()
+            if float(u.std()) < 1e-3 or float(v.std()) < 1e-3 or float(np.corrcoef(u, v)[0, 1]) < STRUCTURE_SAME:
+                return False
+        return True
+
+    return _with_capture(series, run)
+
+
+def _cap(b: dict, note: str) -> dict:
+    return {**b, "confidence": min(b["confidence"], UNCHECKED_CONF), "note": b.get("note") or note}
+
+
+def _uncertain_colour_cuts(series: dict, bounds: list[dict]) -> list[dict]:
+    """Cuts kept, but capped, when the colour is all that changed or the light keeps coming back.
+
+    - Colour only: the colour balance jumps while the luma picture carries on (``_same_structure``;
+      thumbnails' grey correlation without OpenCV). A cut to a regraded copy and a lighting
+      change on the same picture measure exactly the same, so neither is claimed: capped at 0.4.
+    - Recurring states: a later cut within RECUR_FRAMES returns the picture to where it was before an
+      earlier one (a strobe, a light cycle). Flash frames (one return) are already dropped; a run of
+      returns is capped at 0.4. Needs thumbnails."""
+    t, th = series["t"], series.get("thumb") or []
+    if len(th) != len(t):
+        return bounds
+    pos = {round(x, 6): i for i, x in enumerate(t)}
+    cs = _chroma_steps(series)
+    cut_at = {pos[round(b["t"], 6)]: b for b in bounds if b["kind"] == "cut" and round(b["t"], 6) in pos}
+    note: dict[int, str] = {}
+    for i in cut_at:
+        if i < 1 or not _colour_edit(cs, i):
+            continue
+        same = _same_structure(series, i)
+        if same is False:
+            same = _same_edges(series, i)
+        if same is None:  # no media check: fall back to the thumbnails' grey structure
+            gc = _grey_corr(th[i - 1], th[i])
+            same = gc is not None and gc >= SAME_PICTURE
+        if same:
+            note[i] = COLOUR_ONLY_NOTE
+    idx = sorted(cut_at)
+    for a, i in enumerate(idx):
+        if i < 1:
+            continue
+        jump = _dist(th[i - 1], th[i])
+        for j in idx[a + 1:]:
+            if j - i > RECUR_FRAMES:
+                break
+            if jump > 0 and _dist(th[i - 1], th[j]) < RECUR_RETURN * jump:
+                for k in idx[a:idx.index(j) + 1]:
+                    note.setdefault(k, RECURRING_NOTE)
+                break
+    if not note:
+        return bounds
+    capped = {id(cut_at[i]): n for i, n in note.items()}
+    return [_cap(b, capped[id(b)]) if id(b) in capped else b for b in bounds]
+
+
 def detect_shots(series: dict, duration: float) -> list[dict]:
     """Shots from a frame series. Empty list when nothing can be measured."""
     if not series or len(series.get("t", [])) < 2 or not duration or duration <= 0:
@@ -1006,6 +1167,7 @@ def detect_shots(series: dict, duration: float) -> list[dict]:
     reader = series["_pan_reader"] = _PanReader(series["path"]) if series.get("path") else None
     try:
         bounds = _drop_pan_cuts(series, _vet_cuts(series, _collapse_bursts(series, _boundaries(series))))
+        bounds = _uncertain_colour_cuts(series, bounds)
     finally:
         series.pop("_pan_reader", None)
         if reader is not None:

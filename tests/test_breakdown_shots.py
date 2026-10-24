@@ -594,17 +594,91 @@ def test_cut_between_two_slowly_drifting_shots_is_kept(mont, v):
 
 
 @pytest.mark.parametrize("v,hue", [(2, 120), (4, 180), (3, 120), (3, 180)])
-def test_cut_to_a_hue_rotated_copy_is_an_edit(mont, v, hue):
+def test_cut_to_a_hue_rotated_copy_is_capped_not_claimed(mont, v, hue):
     """A hard cut from a drifting picture to a hue-rotated copy of it (a grade / colour flash cut) keeps
     nearly the same luma, so neither the grey-level pan check nor the cut score saw it: no boundary at
-    2/120, dropped as part of the slide at 4/180. A colour change that large is an edit."""
+    2/120, dropped as part of the slide at 4/180. It is a boundary in the colour, kept as a cut, but
+    a lighting change on the same picture measures the same, so it is capped (round 7)."""
     a = _pan(mont, "c", 50, v, 0, 1, f"hu_a{v}.mp4")
-    q = mont / f"hu_b{v}_{hue}.mp4"
+    q = mont / f"hu_b{v}_{hue}.mp4"  # the same drift carrying on, recoloured from 2.0 s
     _ff("-loop", "1", "-framerate", "25", "-i", str(mont / "c.png"), "-frames:v", "50",
-        "-vf", f"crop=320:180:150+n*{v}:0,hue=h={hue}" + (":s=1.5" if hue == 180 else ""), *_ENC, str(q))
+        "-vf", f"crop=320:180:{50 * v}+n*{v}:0,hue=h={hue}" + (":s=1.5" if hue == 180 else ""), *_ENC, str(q))
     p = mont / f"hue{v}_{hue}.mp4"
     _ff("-i", str(a), "-i", str(q), "-filter_complex", "concat=n=2:v=1", *_ENC, str(p))
     found = S.detect_shots(S.frame_series(str(p), 25), 4.0)
-    bounds = [(s["boundary"]["kind"], round(s["boundary"]["t"], 2), s["boundary"]["evidence"]["confidence"])
-              for s in found if s["boundary"]]
-    assert bounds == [("cut", 2.0, 1.0)], bounds
+    bounds = [s["boundary"] for s in found if s["boundary"]]
+    # a cut to a recoloured copy and a lighting change on the same picture measure the same: the cut
+    # is kept (it is a boundary in the colour) but never claimed above 0.4, and says why
+    assert [(b["kind"], round(b["t"], 2)) for b in bounds] == [("cut", 2.0)], bounds
+    assert bounds[0]["evidence"]["confidence"] <= 0.4 and bounds[0]["note"] == S.COLOUR_ONLY_NOTE
+
+
+@pytest.fixture(scope="module")
+def still(tmp_path_factory):
+    d = tmp_path_factory.mktemp("strobe")
+    _ff("-f", "lavfi", "-i", "mandelbrot=s=640x360:start_scale=0.5,trim=end_frame=1", "-frames:v", "1", str(d / "s.png"))
+    return d
+
+
+_LIGHT = {
+    "hue_step": "hue=h='if(gte(t,2),90,0)'",                 # lighting turns colour at 2.0 s and stays
+    "strobe3": "hue=h='if(mod(floor(n/3),2),120,0)'",        # colour strobes
+    "strobe6": "hue=h='if(mod(floor(n/6),2),120,0)'",
+    "strobe12": "hue=h='if(mod(floor(n/12),2),180,0)'",
+    "rgbcycle8": "hue=h='120*mod(floor(n/8),3)':s=2",        # club light red / green / blue
+}
+
+
+@pytest.mark.parametrize("case", sorted(_LIGHT))
+def test_lighting_changes_on_one_drifting_picture_are_never_confident_cuts(still, case):
+    """One drifting shot under changing coloured light: whatever boundaries remain are capped at 0.4 and
+    say why (colour change on the same picture / recurring light states)."""
+    p = still / f"{case}.mp4"
+    _ff("-loop", "1", "-framerate", "25", "-t", "4", "-i", str(still / "s.png"),
+        "-vf", f"crop=480:270:'20+t*15':40,{_LIGHT[case]}", *_ENC, str(p))
+    bounds = [s["boundary"] for s in S.detect_shots(S.frame_series(str(p), 25), 4.0) if s["boundary"]]
+    assert all(b["evidence"]["confidence"] <= 0.4 for b in bounds), [(b["t"], b["evidence"]["confidence"]) for b in bounds]
+    assert all(b.get("note") in (S.COLOUR_ONLY_NOTE, S.RECURRING_NOTE) for b in bounds), [b.get("note") for b in bounds]
+
+
+@pytest.mark.parametrize("hue", [120, 180])
+def test_cut_to_another_part_recoloured_stays_a_full_cut(wide, hue):
+    """Guard: a cut to a different picture that also changes colour is a plain edit (edges do not carry
+    on), so the colour-only cap must not touch it."""
+    a = _pan(wide, "b", 50, 3, 0, 1, f"rc_a{hue}.mp4")
+    q = wide / f"rc_b{hue}.mp4"
+    _ff("-loop", "1", "-framerate", "25", "-i", str(wide / "c.png"), "-frames:v", "50",
+        "-vf", f"crop=320:180:2000+n*3:0,hue=h={hue}", *_ENC, str(q))
+    p = wide / f"rc{hue}.mp4"
+    _ff("-i", str(a), "-i", str(q), "-filter_complex", "concat=n=2:v=1", *_ENC, str(p))
+    bounds = [s["boundary"] for s in S.detect_shots(S.frame_series(str(p), 25), 4.0) if s["boundary"]]
+    assert [(b["kind"], round(b["t"], 2), b["evidence"]["confidence"], b.get("note")) for b in bounds] == \
+        [("cut", 2.0, 1.0, None)]
+
+
+def test_moving_dissolve_scan_is_bounded_and_says_so(strips, monkeypatch):
+    a = _pan(strips, "a", 75, 10, 0, 1, "bda.mp4")
+    b = _pan(strips, "b", 75, 10, 0, 1, "bdb.mp4")
+    p = strips / "bd.mp4"
+    _ff("-i", str(a), "-i", str(b), "-filter_complex", "[0][1]xfade=transition=fade:duration=1:offset=1.5", *_ENC, str(p))
+    series = S.frame_series(str(p), 25)
+    monkeypatch.setattr(S, "DISSOLVE_SCAN_MIN_S", 1.0)  # budget below the 5 s moving stretch
+    found = S.detect_shots(series, 5.0)
+    assert series.get("dissolve_scan_capped") is True
+    assert [s for s in found if s["boundary"]] == []  # not scanned: nothing invented, the note says why
+
+
+def test_recurring_states_are_capped_with_a_note():
+    """Alternating between two pictures every 4 frames (a strobe that is not a colour change, so the
+    colour-only rule does not apply): each later cut returns to an earlier state, so the run is capped."""
+    import random
+    rnd = random.Random(3)
+    pa = bytes(rnd.randrange(30, 120) for _ in range(432))
+    pb = bytes(rnd.randrange(130, 220) for _ in range(432))
+    thumbs = [pa if (k // 4) % 2 == 0 else pb for k in range(24)]
+    series = {"t": [k / 25 for k in range(24)], "scene": [0.0] * 24, "yavg": [0.0] * 24, "thumb": thumbs}
+    cuts = [_cut(series, k) for k in (4, 8, 12, 16, 20)]
+    out = S._uncertain_colour_cuts(series, cuts)
+    assert all(b["confidence"] <= 0.4 and b["note"] == S.RECURRING_NOTE for b in out), out
+    single = S._uncertain_colour_cuts(series, [_cut(series, 4)])  # one change, no return: untouched
+    assert single[0]["confidence"] == 1.0 and "note" not in single[0]
