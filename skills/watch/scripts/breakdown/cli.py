@@ -173,6 +173,8 @@ def _cmd_compare(argv: list[str]) -> int:
         print(f"[watch] {exc}", file=sys.stderr)
         return 2
     print(json.dumps(res, ensure_ascii=False, indent=1) if a.json else compare.summary_md(res))
+    if res.get("out_dir"):
+        print(f"[watch] compare stored in {res['out_dir']}", file=sys.stderr)
     return 0
 
 

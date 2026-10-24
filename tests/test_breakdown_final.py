@@ -338,3 +338,11 @@ def test_compare_summary_has_absolute_video_path(tmp_path):
     out = tmp_path / "rel" / "out"
     res = compare.run(str(clip), str(cand), slow=2, out_dir=out)
     assert f"{out.resolve() / 'compare.mp4'}" in compare.summary_md(res)
+
+
+def test_cli_compare_reports_output_folder(monkeypatch, capsys, tmp_path):
+    from breakdown import compare
+    monkeypatch.setattr(compare, "run", lambda *a, **k: {"video": "compare.mp4", "out_dir": str(tmp_path)})
+    monkeypatch.setattr(compare, "summary_md", lambda res: "summary")
+    assert cli.main(["compare", "ref", "cand"]) == 0
+    assert f"[watch] compare stored in {tmp_path}" in capsys.readouterr().err
