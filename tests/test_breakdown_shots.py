@@ -358,3 +358,57 @@ def test_same_picture_frames_are_dropped_not_demoted():
     thumbs = [bytes(base)] * 8 + [bytes(jump)] * 8
     series = {"t": [i / 25 for i in range(16)], "scene": [0.0] * 16, "yavg": [0.0] * 16, "thumb": thumbs}
     assert S._vet_cuts(series, [_cut(series, 8)]) == []
+
+
+# ------------------------------------------------------------------ fix round 4
+
+@pytest.fixture(scope="module")
+def mont(tmp_path_factory):
+    d = tmp_path_factory.mktemp("mont")
+    specs = {"a": "mandelbrot=s=4000x180:start_scale=0.05:start_x=-0.74:start_y=0.1", "b": "testsrc2=s=4000x180:d=1",
+             "c": "mandelbrot=s=4000x180:start_scale=0.3:start_x=-0.5:start_y=0.0",
+             "e": "mandelbrot=s=4000x180:start_scale=0.01:start_x=-1.25:start_y=0.02"}
+    for k, v in specs.items():
+        _ff("-f", "lavfi", "-i", v, "-frames:v", "1", str(d / f"{k}.png"))
+    return d
+
+
+def _moving_montage(d, v):
+    parts = [_pan(d, "a", 25, v, 0, 1, f"m0{v}.mp4")]
+    for j, (img, sg) in enumerate((("b", -1), ("c", 1), ("e", 1), ("b", 1), ("c", -1))):
+        parts.append(_pan(d, img, 4, v, 1500 if sg < 0 else 200 * j, sg, f"m{j + 1}{v}.mp4"))
+    parts.append(_pan(d, "e", 25, v, 2000, -1, f"m9{v}.mp4"))
+    p = d / f"montage{v}.mp4"
+    _ff(*[a for q in parts for a in ("-i", str(q))], "-filter_complex", f"concat=n={len(parts)}:v=1", *_ENC, str(p))
+    return p
+
+
+@pytest.mark.parametrize("v", [8, 20])
+def test_moving_montage_keeps_every_cut(mont, v):
+    """Two different strips cut at 1.32 s: thumbnail step 0.475 but scene score 0.058, correlation 0.805."""
+    found = S.detect_shots(S.frame_series(str(_moving_montage(mont, v)), 25), 70 / 25)
+    assert len(found) == 7, [(s["start"], s["boundary"] and s["boundary"]["kind"]) for s in found]
+    assert any(abs(s["start"] - 1.32) < 0.05 and s["boundary"]["kind"] == "cut" for s in found)
+
+
+def test_large_step_with_correlated_frames_is_still_a_cut():
+    import random
+    rnd = random.Random(2)
+    base = [rnd.randrange(40, 200) for _ in range(432)]
+    other = [min(255, max(0, int(0.5 * v + 90 + rnd.randint(-30, 30)))) for v in base]  # correlated, far apart
+    series = {"t": [i / 25 for i in range(16)], "scene": [0.0] * 16, "yavg": [0.0] * 16,
+              "thumb": [bytes(base)] * 8 + [bytes(other)] * 8}
+    assert S.correlation(bytes(base), bytes(other)) >= S.SAME_PICTURE and S._steps(series)[8] > S.SAME_PICTURE_MAX_STEP
+    assert len(S._vet_cuts(series, [_cut(series, 8)])) == 1
+
+
+def test_without_opencv_a_pan_boundary_is_capped_and_says_so(strips, monkeypatch):
+    p = _pan(strips, "b", 100, 20, 0, 1, "nocv.mp4")  # a pan the cv2 check would remove
+    series = S.frame_series(str(p), 25)
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    found = S.detect_shots(series, 4.0)
+    bounds = [s["boundary"] for s in found if s["boundary"] and s["boundary"]["kind"] != "cut"]
+    assert bounds, "without the frame-level check the pan stays a boundary"
+    assert all(b["evidence"]["confidence"] <= 0.4 and "opencv missing" in b["note"] for b in bounds)
+    monkeypatch.undo()
+    assert [s for s in S.detect_shots(series, 4.0) if s["boundary"] and s["boundary"]["kind"] != "cut"] == []

@@ -34,7 +34,8 @@ MAX_TILES = 48
 EPS = 1e-6
 BRIEF_MIN_TEXT_CONF = 0.5  # OCR tracks below this are listed in breakdown.json only
 SAMPLING_NOTE = f"sampled every {typography.STEP_S:g} s; shorter or stylised text may be missed"
-BLIND_SPOT_NOTE = "dissolves between two moving shots can go undetected: cuts and shots are what was measured"
+BLIND_SPOT_NOTE = ("dissolves between two moving shots can go undetected and jump cuts within one framing "
+                   "may be merged: cuts and shots are what was measured")
 HOLD_MIN_S = 0.5  # a black / white hold this long between two fades is its own shot (0.7.0 ruling)
 FOLD_MAX_S = 1.0  # a fade between two cuts this close is one dip, not a shot
 
@@ -389,6 +390,9 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
         if raw:
             entries = transitions.classify(series, raw)
             _add_note(notes, BLIND_SPOT_NOTE)
+            if series.get("merged_same_picture"):
+                _add_note(notes, f"{series['merged_same_picture']} cut candidate(s) merged as same-picture "
+                                 "(a step inside one framing, not an edit)")
         else:
             _add_note(notes, "shot detection produced no shots; cuts not determined")
     else:
@@ -396,6 +400,7 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
     shot_list, loose_fades = reconcile(raw, entries) if raw else ([], [])
 
     for sh in shot_list:
+        _add_note(notes, (sh.get("boundary") or {}).get("note", ""))
         sh["camera"] = camera.camera_motion(m["path"], sh, crop=series.get("crop"))
         sh["look"] = look.shot_look(m["path"], sh)
         for n in (sh["camera"].get("notes") or []) + (sh["look"].get("notes") or []):

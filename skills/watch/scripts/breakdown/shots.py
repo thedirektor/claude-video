@@ -15,6 +15,7 @@ import subprocess
 
 NOT_DETERMINED = "not determined"
 CUT_FLOOR = 0.15  # brief says 0.3; ffmpeg's scene score for a real red->green cut is only 0.23
+THUMB_SCALE = 2.5  # a thumbnail step of this many x the cut threshold counts as a full-strength cut
 LUMA_SCALE = 60.0  # a luma jump of this many levels counts as a full-strength cut
 CUT_K = 6.0
 GRADUAL_MIN_FRAMES = 3
@@ -346,23 +347,26 @@ def _shift_at(cv2, np, cap, t: float, crop):
     return (dx, dy) if resp >= PAN_MIN_RESPONSE else None
 
 
-def continuous_pan(series: dict, i_before: int, i_after: int) -> bool:
+def continuous_pan(series: dict, i_before: int, i_after: int) -> bool | None:
     """True when the picture is already sliding the same way before frame ``i_before`` and still
-    sliding after ``i_after``: the span between is one continuous camera move, not an edit. A whip
+    sliding after ``i_after``: the span between is one continuous camera move, not an edit. None when the
+    check could not run (no OpenCV / media path). A whip
     between held framings starts and ends at rest, so it is not. Needs OpenCV and the media path."""
     path = series.get("path")
     t = series["t"]
-    if not path or i_before < 1 or i_after + 2 >= len(t):
-        return False
+    if i_before < 1 or i_after + 2 >= len(t):
+        return False  # at a clip edge there is no "after": nothing to compare
+    if not path:
+        return None
     try:
         import cv2  # noqa: PLC0415
         import numpy as np  # noqa: PLC0415
     except Exception:
-        return False
+        return None  # check could not run: callers cap their confidence and say so
     cap = cv2.VideoCapture(str(path))
     try:
         if not cap.isOpened():
-            return False
+            return None
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         out = [_shift_at(cv2, np, cap, max(0.0, t[i] - 0.5 / fps), series.get("crop")) for i in (i_before - 1, i_after + 1)]
     finally:
@@ -373,6 +377,10 @@ def continuous_pan(series: dict, i_before: int, i_after: int) -> bool:
     axis = 0 if abs(bx) + abs(ax) >= abs(by) + abs(ay) else 1
     b, a = out[0][axis], out[1][axis]
     return abs(b) >= PAN_MIN_PX and abs(a) >= PAN_MIN_PX and b * a > 0
+
+
+UNCHECKED_CONF = 0.4
+PAN_SKIPPED_NOTE = "opencv missing: continuous-pan check skipped"
 
 
 def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
@@ -425,11 +433,17 @@ def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
             out.append({"kind": "cut", "t": t[k], "frames": 1, "t_start": t[k - 1], "t_end": t[k],
                         "confidence": HARD_STEP_CONF})
             continue
-        if continuous_pan(series, r0 - 3, r1 + 3):
+        pan = continuous_pan(series, r0 - 3, r1 + 3)
+        if pan:
             continue  # one camera move through the window, still moving the same way after it
-        out.append({"kind": "gradual", "t": round((t[r0] + t[r1]) / 2, 6), "frames": r1 - r0,
-                    "t_start": t[r0], "t_end": t[r1],
-                    "confidence": round(_clamp(0.4 + 0.08 * score), 3)})
+        unchecked = pan is None
+        conf = _clamp(0.4 + 0.08 * score)
+        bound = {"kind": "gradual", "t": round((t[r0] + t[r1]) / 2, 6), "frames": r1 - r0,
+                 "t_start": t[r0], "t_end": t[r1], "confidence": round(conf, 3)}
+        if unchecked:  # a continuous pan would look exactly like this: say so, claim less
+            bound["confidence"] = min(bound["confidence"], UNCHECKED_CONF)
+            bound["note"] = PAN_SKIPPED_NOTE
+        out.append(bound)
     return out
 
 
@@ -438,7 +452,9 @@ def _boundaries(series: dict) -> list[dict]:
     n = len(t)
     dy = [0.0] + [abs(yavg[i] - yavg[i - 1]) for i in range(1, n)]
     # cut strength: ffmpeg's scene score, or the luma jump when the score under-reads
-    strength = [max(scene[i], dy[i] / LUMA_SCALE) for i in range(n)]
+    th = series.get("thumb") or []
+    dt = _steps(series) if len(th) == n else [0.0] * n  # a big picture change the score under-reads
+    strength = [max(scene[i], dy[i] / LUMA_SCALE, dt[i] / THUMB_SCALE) for i in range(n)]
     thr = _cut_threshold(strength)
     cands = [i for i in range(1, n) if strength[i] >= thr]
     flash = _flash_cuts(cands, strength, series)
@@ -551,7 +567,8 @@ def _collapse_bursts(series: dict, bounds: list[dict]) -> list[dict]:
                 lo = g[0][0]
             if keep and keep[-1] is last[1]:
                 hi = g[-1][0]
-        if not held or continuous_pan(series, lo - 3, hi + 3):
+        pan = continuous_pan(series, lo - 3, hi + 3)
+        if not held or pan:
             # no held picture either side, or the move carries on in the same direction after it:
             # continuous motion, not an edit
             drop.update(id(b) for _, b in g)
@@ -559,7 +576,8 @@ def _collapse_bursts(series: dict, bounds: list[dict]) -> list[dict]:
         drop.update(id(b) for _, b in g)
         merged.append({"kind": "motion", "t": round((t[lo - 1] + t[hi]) / 2, 6), "frames": hi - lo + 1,
                        "t_start": t[lo - 1], "t_end": t[hi],
-                       "confidence": min(BURST_CONF, min(b["confidence"] for _, b in g))})
+                       "confidence": min(BURST_CONF, min(b["confidence"] for _, b in g)),
+                       **({"note": PAN_SKIPPED_NOTE} if pan is None else {})})
     if not merged and not drop:
         return bounds
     out = [b for b in bounds if id(b) not in drop] + merged
@@ -584,6 +602,7 @@ def correlation(a, b) -> float | None:
     return sum(cs) / len(cs) if cs else None
 
 
+SAME_PICTURE_MAX_STEP = 0.1  # false steps on real footage were 0.055-0.067, real cuts >= 0.11; a big step is an edit however alike the frames
 SAME_PICTURE = 0.8  # frames either side of a "cut" correlating this well are one picture
 CUT_STAND_OUT = 2.5  # a cut's step must exceed the change around it by this factor
 
@@ -601,6 +620,7 @@ def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
     d = _steps(series)
     pos = {round(x, 6): i for i, x in enumerate(t)}
     out = []
+    merged_out = 0
     for b in bounds:
         i = pos.get(round(b["t"], 6)) if b["kind"] == "cut" else None
         if i is None or i < 1:
@@ -615,11 +635,14 @@ def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
         near = sorted(d[k] for k in range(max(1, i - 5), min(len(d), i + 6)) if k != i)
         med = near[len(near) // 2] if near else 0.0
         if med > 0 and d[i] < CUT_STAND_OUT * med:
+            merged_out += 1
             continue
         corr = correlation(th[i - 1], th[i])
-        if corr is not None and corr >= SAME_PICTURE:
-            continue  # the same picture either side: a step inside one shot, not an edit
+        if corr is not None and corr >= SAME_PICTURE and d[i] < SAME_PICTURE_MAX_STEP:
+            merged_out += 1
+            continue  # the same picture either side: a small step inside one shot, not an edit
         out.append(b)
+    series["merged_same_picture"] = merged_out
     return out
 
 
@@ -654,6 +677,8 @@ def build_shots(bounds: list[dict], duration: float) -> list[dict]:
             shot["boundary"] = {"kind": b["kind"], "t": round(b["t"], 6), "frames": b["frames"],
                                 "evidence": {"t_start": b["t_start"], "t_end": b["t_end"],
                                              "method": "measured", "confidence": round(b["confidence"], 3)}}
+            if b.get("note"):
+                shot["boundary"]["note"] = b["note"]
         shots.append(shot)
     return shots
 

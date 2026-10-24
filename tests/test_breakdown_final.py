@@ -396,3 +396,8 @@ def test_fragment_track_dropped_when_inside_longer_overlapping_track():
     other = {"text": "ORLD", "t_in": 4.0, "t_out": 5.0, "box": [0.25, 0.1, 0.15, 0.1], "evidence": {"confidence": 0.87}}
     out = TY._drop_fragments([full, frag, other])
     assert [t["text"] for t in out] == ["HELLO WORLD", "ORLD"] and out[1]["t_in"] == 4.0
+
+
+def test_notes_mention_merged_jump_cuts_and_dropped_same_picture_cuts(conn, one_shot):
+    bd = assemble.build(conn, KEY, store_dir=one_shot)
+    assert any("jump cuts within one framing may be merged" in n for n in bd["notes"])
