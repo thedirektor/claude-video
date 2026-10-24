@@ -53,16 +53,19 @@ TOOLS = [
     {"name": "plan", "description": "Cost plan for watching a video (no side effects).",
      "inputSchema": _schema({"source": S, "detail": S, "backend": S, "start": S, "end": S}, ["source"])},
     {"name": "breakdown", "description": "Measure a watched video into a rebuild brief (shots, cuts, camera, "
-     "typography, motion, music, timelines) with evidence per element; anything unmeasured is 'not determined'. "
-     "Stored and pinned. Free unless interpret=true. formats: otio,fcpxml,edl timeline files.",
-     "inputSchema": _schema({"video": S, "interpret": B, "formats": S}, ["video"])},
+     "typography, music, transitions, timelines) with evidence per element; anything unmeasured is 'not determined'. "
+     "Stored and pinned. Free unless interpret=true (allow_cost=true lifts the cost ceiling). formats: "
+     "otio,fcpxml,edl timeline files. refresh=false returns the stored breakdown without re-measuring.",
+     "inputSchema": _schema({"video": S, "interpret": B, "formats": S, "allow_cost": B, "refresh": B},
+                            ["video"])},
     {"name": "motion", "description": "Track a region over a segment (seconds) of a watched video: phases, easing "
      "fit, Godot/Unity/CSS snippets. region is 'x,y,w,h' (0-1) or a short text found by OCR.",
      "inputSchema": _schema({"video": S, "start": N, "end": N, "region": S, "px_per_unit": N},
                             ["video", "start", "end"])},
     {"name": "compare", "description": "Compare a reference video with your version (local file or URL): alignment, "
-     "timing deltas, side-by-side video. offset = candidate time minus reference time, in seconds.",
-     "inputSchema": _schema({"reference": S, "candidate": S, "offset": N}, ["reference", "candidate"])},
+     "timing deltas, side-by-side video (slow = slow-motion factor, default 4). offset = candidate time minus "
+     "reference time, in seconds.",
+     "inputSchema": _schema({"reference": S, "candidate": S, "offset": N, "slow": I}, ["reference", "candidate"])},
     {"name": "doctor", "description": "Check this machine's /watch dependencies (ffmpeg, yt-dlp, tesseract, "
      "model, keys present).", "inputSchema": _schema({"offline": B}, [])},
 ]
@@ -121,13 +124,15 @@ def call_tool(name: str, args: dict) -> dict:
         if name in ("breakdown", "motion", "compare"):
             if name == "breakdown":
                 argv = ["breakdown", args["video"], "--json",
-                        *_flags(args, {"interpret": "--interpret", "formats": "--formats"})]
+                        *_flags(args, {"interpret": "--interpret", "formats": "--formats",
+                                       "allow_cost": "--allow-cost"}),
+                        *(["--stored"] if args.get("refresh") is False else [])]
             elif name == "motion":
                 argv = ["motion", args["video"], "--start", str(args["start"]), "--end", str(args["end"]), "--json",
                         *_flags(args, {"region": "--region", "px_per_unit": "--px-per-unit"})]
             else:
                 argv = ["compare", args["reference"], args["candidate"], "--json",
-                        *_flags(args, {"offset": "--offset"})]
+                        *_flags(args, {"offset": "--offset", "slow": "--slow"})]
             r = _run_watch(argv)
             if r.returncode != 0:
                 return _text(f"{name} failed (exit {r.returncode}):\n{(r.stderr or '')[-1500:]}", True)

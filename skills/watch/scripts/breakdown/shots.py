@@ -203,6 +203,9 @@ def _boundaries(series: dict) -> list[dict]:
     return out
 
 
+SINGLE_SHOT_CONF = 0.6  # no neighbouring boundary: a dissolve between two moving shots can go undetected
+
+
 def detect_shots(series: dict, duration: float) -> list[dict]:
     """Shots from a frame series. Empty list when nothing can be measured."""
     if not series or len(series.get("t", [])) < 2 or not duration or duration <= 0:
@@ -213,7 +216,7 @@ def detect_shots(series: dict, duration: float) -> list[dict]:
     for k in range(len(edges) - 1):
         start, end = edges[k], edges[k + 1]
         adj = [bounds[x] for x in (k - 1, k) if 0 <= x < len(bounds)]
-        conf = min((b["confidence"] for b in adj), default=0.9)
+        conf = min((b["confidence"] for b in adj), default=SINGLE_SHOT_CONF)
         shot = {
             "index": k, "start": round(start, 6), "end": round(end, 6),
             "duration": round(end - start, 6),

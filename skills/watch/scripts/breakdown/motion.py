@@ -43,7 +43,8 @@ def _import_cv():
 
 
 def _skeleton(start: float, end: float, fps: float, video_key: str | None, ppu) -> dict:
-    return {"schema": SCHEMA, "video_key": video_key,
+    from .assemble import CONTRACT  # noqa: PLC0415 - deferred: assemble is heavier than motion
+    return {"schema": SCHEMA, "contract": CONTRACT, "video_key": video_key,
             "segment": {"start": round(float(start), 4), "end": round(float(end), 4), "fps": round(float(fps), 4)},
             "region": {"box": [0.0, 0.0, 1.0, 1.0], "method": "whole_frame"},
             "px_per_unit": ppu, "track": [], "phases": [], "notes": []}
@@ -475,6 +476,8 @@ def _analyze(conn, video_key, start, end, region, ppu, store_dir, fetch, out):
         return
     root = Path(store_dir) if store_dir is not None else Path(memory_paths()["store_dir"])
     m = media.ensure_media(conn, video_key, root, fetch=fetch if fetch is not None else (lambda *_: None))
+    if m.get("path"):
+        media.pin(root, video_key)  # secured: keep it even if the analysis below fails
     if not m.get("path"):
         notes.append("only stored frames are available (no full-fps media); motion not determined")
         return

@@ -160,6 +160,39 @@ def _tree_bytes(root: Path) -> int:
     return sum(_size(p) for p in root.rglob("*") if p.is_file()) if root.is_dir() else 0
 
 
+COMPARE_KEEP = 20
+COMPARE_MAX_AGE_S = 14 * 86400
+
+
+def _compare_dirs(root: Path) -> list[Path]:
+    """Output folders of ``watch compare``: ``<video>/breakdown/compare-*`` and ``<store>/compare/*``."""
+    if not root.is_dir():
+        return []
+    dirs = [d for d in root.glob("*/breakdown/compare-*") if d.is_dir()]
+    dirs += [d for d in (root / "compare").glob("*") if d.is_dir()] if (root / "compare").is_dir() else []
+    return dirs
+
+
+def prune_compare(root: Path, keep: int = COMPARE_KEEP, max_age_s: float = COMPARE_MAX_AGE_S) -> int:
+    """Delete compare outputs older than ``max_age_s`` or beyond the newest ``keep``. Returns bytes freed."""
+    import shutil  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    def mtime(d: Path) -> float:
+        try:
+            return d.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    dirs = sorted(_compare_dirs(Path(root)), key=mtime, reverse=True)
+    now, freed = time.time(), 0
+    for i, d in enumerate(dirs):
+        if i >= keep or now - mtime(d) > max_age_s:
+            freed += _tree_bytes(d)
+            shutil.rmtree(d, ignore_errors=True)
+    return freed
+
+
 PINNED_MARKER = ".pinned"
 
 
@@ -184,6 +217,7 @@ def enforce_retention(conn, store_dir: Path, max_bytes: int | None = None,
         max_bytes = int(gb * _GB)
     out = {"freed": 0, "media_removed": 0, "frames_removed": 0}
     cap = _breakdown_media_cap_bytes()
+    prune_compare(root)  # side-by-side outputs are transient: bounded by count and age, not by the media budget
 
     def _exempt(key: str) -> list[Path]:
         vdir = video_dir(root, key)
@@ -193,7 +227,8 @@ def enforce_retention(conn, store_dir: Path, max_bytes: int | None = None,
 
     # Pinned media within its own per-video cap is outside the store budget.
     all_keys = [r[0] for r in conn.execute("SELECT video_key FROM videos")]
-    total = _tree_bytes(root) - sum(_size(m) for k in all_keys for m in _exempt(k))
+    total = (_tree_bytes(root) - sum(_size(m) for k in all_keys for m in _exempt(k))
+             - sum(_tree_bytes(d) for d in _compare_dirs(root)))
     if total <= max_bytes:
         return out
 

@@ -34,6 +34,19 @@ def _parse_formats(value: str | None) -> list[str]:
     return out
 
 
+def _push(key: str) -> None:
+    """Send the video's bundle (now carrying breakdown/ and motion-*/) to the central service, like a run does."""
+    try:
+        import push  # noqa: PLC0415
+
+        if push.enabled():
+            push.flush_outbox()
+            r = push.push_video(key)
+            print(f"[watch] central memory: {'pushed' if r.get('ok') else 'queued in outbox'}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - a push never fails a measurement
+        print(f"[watch] push skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+
+
 def _cmd_breakdown(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="watch breakdown",
                                  description="Measure a stored video into breakdown.json / breakdown.md.")
@@ -42,6 +55,8 @@ def _cmd_breakdown(argv: list[str]) -> int:
     ap.add_argument("--json", action="store_true", help="print breakdown.json instead of the brief")
     ap.add_argument("--formats", default="", help="timeline files to write: otio,fcpxml,edl")
     ap.add_argument("--allow-cost", action="store_true", help="ignore WATCH_COST_CEILING_USD for --interpret")
+    ap.add_argument("--stored", action="store_true",
+                    help="return the stored breakdown.json / .md as they are, without re-measuring")
     a = ap.parse_args(argv)
     try:
         formats = _parse_formats(a.formats)
@@ -58,6 +73,19 @@ def _cmd_breakdown(argv: list[str]) -> int:
         except retrieval.AmbiguousVideo as exc:
             print(f"[watch] {exc}", file=sys.stderr)
             return EXIT_AMBIGUOUS
+        if a.stored:
+            bd = assemble.read_stored(conn, key)
+            out_dir = assemble.stored_path(conn, key, None).parent
+            if bd is None:
+                print("[watch] no stored breakdown for this video; run `breakdown` without --stored first",
+                      file=sys.stderr)
+                return 2
+            if not a.json:
+                md = out_dir / "breakdown.md"
+                print(md.read_text(encoding="utf-8") if md.is_file() else assemble.brief_md(bd))
+            else:
+                print(json.dumps(bd, ensure_ascii=False, indent=1))
+            return 0
         try:
             bd = assemble.build(conn, key, interpret=a.interpret, allow_cost=a.allow_cost)
         except cost.CostCeilingExceeded as exc:
@@ -68,6 +96,7 @@ def _cmd_breakdown(argv: list[str]) -> int:
             written = assemble.write_timelines(bd, out_dir, formats)
             if not written:
                 print(f"[watch] no timeline files written: {interchange.skip_reason(bd)}", file=sys.stderr)
+        _push(key)
     finally:
         conn.close()
     if a.json:
@@ -115,6 +144,7 @@ def _cmd_motion(argv: list[str]) -> int:
         for name, text in sn.items():
             (out_dir / name).write_text(text, encoding="utf-8")
         media.pin(root, key)
+        _push(key)
     finally:
         conn.close()
     print(json.dumps(m, ensure_ascii=False, indent=1) if a.json else sn["table.md"])

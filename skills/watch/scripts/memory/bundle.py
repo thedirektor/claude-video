@@ -35,6 +35,18 @@ def _max_bytes() -> int:
         return MAX_BUNDLE_BYTES
 
 
+def _breakdown_files(bdir: Path) -> list[Path]:
+    """Files of a breakdown folder that travel: its top-level files and ``motion-*/`` one level down.
+    ``compare-*`` outputs (a transient comparison against a candidate, with a video) stay local."""
+    if not bdir.is_dir():
+        return []
+    out = [f for f in sorted(bdir.iterdir()) if f.is_file()]
+    for d in sorted(bdir.glob("motion-*")):
+        if d.is_dir() and not d.is_symlink():
+            out += [f for f in sorted(d.iterdir()) if f.is_file() and not f.is_symlink()]
+    return out
+
+
 def make_bundle(conn, key: str, out_path: Path, *, store_dir=None, host: str | None = None,
                 library_saved: bool = False) -> Path:
     v = conn.execute("SELECT title, url, source, duration, channel, upload_date, transcript_source, store_path, "
@@ -78,10 +90,8 @@ def make_bundle(conn, key: str, out_path: Path, *, store_dir=None, host: str | N
         if report and report.is_file():
             z.write(report, "report.md")
         bdir = root / v[7] / "breakdown" if v[7] else store.video_dir(root, key) / "breakdown"
-        if bdir.is_dir():
-            for f in sorted(bdir.iterdir()):
-                if f.is_file():
-                    z.write(f, f"breakdown/{f.name}")
+        for f in _breakdown_files(bdir):
+            z.write(f, f"breakdown/{f.relative_to(bdir).as_posix()}")
     return out_path
 
 
@@ -138,12 +148,13 @@ def import_bundle(zip_path, *, embedder: object = "auto") -> dict:
         result = writer.remember(record, archive=True, embedder=embedder)
         if result is None:
             raise BundleError("merge failed (see service log)")
-        shipped = sorted((root / "breakdown").glob("*")) if (root / "breakdown").is_dir() else []
+        shipped = _breakdown_files(root / "breakdown")
         if shipped:
             dest = store.video_dir(Path(memory_paths()["store_dir"]), run["video_key"]) / "breakdown"
             dest.mkdir(parents=True, exist_ok=True)
             for f in shipped:
-                if f.is_file():
-                    shutil.copyfile(f, dest / f.name)
+                rel = f.relative_to(root / "breakdown")
+                (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(f, dest / rel)
         return {**result, "skipped": result.get("run_id") is None, "title": run.get("title"),
                 "library_saved": bool(run.get("library_saved"))}

@@ -430,6 +430,7 @@ def run(reference: str, candidate: str, *, offset: float | None = None, slow: in
         out_dir = Path(out_dir) if out_dir else _default_out(ref)
         out_dir.mkdir(parents=True, exist_ok=True)
         res = _compare(ref, cand, offset, slow, out_dir)
+        res["out_dir"] = str(out_dir.resolve())
         (out_dir / "compare.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
         return res
     finally:
@@ -610,5 +611,6 @@ def summary_md(res: dict) -> str:
     if res["notes"]:
         lines += ["", "Notes:"] + [f"- {n}" for n in res["notes"]]
     if res.get("video"):
-        lines += ["", f"Side by side, {res['slow']}x slower: {res['video']}"]
+        video = Path(res["out_dir"]) / res["video"] if res.get("out_dir") else res["video"]
+        lines += ["", f"Side by side, {res['slow']}x slower: {video}"]
     return "\n".join(lines)

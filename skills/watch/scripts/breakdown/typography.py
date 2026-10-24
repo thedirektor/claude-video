@@ -16,6 +16,7 @@ import re
 
 NOT_DETERMINED = "not determined"
 MIN_CONF = 60
+STEP_S = 0.5  # OCR sampling interval
 IOU_MERGE = 0.6
 REFINE_STEPS = 4
 WORK_W = 320
@@ -26,6 +27,9 @@ CUT_FRAMES = 2
 POST_S = 0.3  # seconds of settled text that must look identical to the settled frame
 MIN_POST = 2
 POST_MAX = 0.002  # share of crop pixels allowed to change across those frames
+TOP_STD_MAX = 35.0  # spread of the text-colour pixels (per channel) above which they are not one colour
+RING_STD_MAX = 30.0  # busy surroundings: a sampled colour would be a guess
+COLOR_CONTRAST_MIN = 90.0  # RGB distance between text and background below which the colour is unreliable
 BG_MOVE_MAX = 0.02  # share of off-band crop pixels allowed to change before text is 'animating'
 
 
@@ -88,8 +92,9 @@ def _detect(ocr, img, cv2) -> list[dict]:
             continue
         key = (d["block_num"][i], d["par_num"][i], d["line_num"][i])
         x, y, bw, bh = d["left"][i], d["top"][i], d["width"][i], d["height"][i]
-        ln = lines.setdefault(key, {"words": [], "x0": x, "y0": y, "x1": x + bw, "y1": y + bh})
+        ln = lines.setdefault(key, {"words": [], "confs": [], "x0": x, "y0": y, "x1": x + bw, "y1": y + bh})
         ln["words"].append(word)
+        ln["confs"].append(conf)
         ln["x0"], ln["y0"] = min(ln["x0"], x), min(ln["y0"], y)
         ln["x1"], ln["y1"] = max(ln["x1"], x + bw), max(ln["y1"], y + bh)
     out = []
@@ -98,7 +103,7 @@ def _detect(ocr, img, cv2) -> list[dict]:
         norm = _norm(text)
         if len(norm) < 3:
             continue
-        out.append({"text": text, "norm": norm,
+        out.append({"text": text, "norm": norm, "conf": sum(ln["confs"]) / len(ln["confs"]) / 100.0,
                     "box": [ln["x0"] / w, ln["y0"] / h, (ln["x1"] - ln["x0"]) / w, (ln["y1"] - ln["y0"]) / h]})
     return out
 
@@ -122,6 +127,11 @@ def _bisect(ocr, cv2, cap, t_seen: float, t_unseen: float, norm) -> float:
     return (lo + hi) / 2.0
 
 
+def _track_conf(samples: int, mean_ocr: float) -> float:
+    """Track confidence: sample count evidence scaled by how well tesseract read the words (0-1)."""
+    return min(0.95, 0.5 + 0.1 * samples) * max(0.0, min(1.0, mean_ocr))
+
+
 def _color_hex(cv2, np, img, box) -> str:
     h, w = img.shape[:2]
     x0, y0 = int(box[0] * w), int(box[1] * h)
@@ -133,10 +143,16 @@ def _color_hex(cv2, np, img, box) -> str:
     inner[y0 - ey0:y1 - ey0, x0 - ex0:x1 - ex0] = True
     ring = reg[~inner.reshape(-1)] if (~inner).any() else reg
     bg = np.median(ring, axis=0)
+    if float(ring.std(axis=0).mean()) > RING_STD_MAX:
+        return NOT_DETERMINED  # busy background: the 'text' colour would be whatever pixel differs most
     box_px = reg[inner.reshape(-1)]
     dist = np.linalg.norm(box_px - bg, axis=1)
     n = max(1, int(len(dist) * 0.1))
     top = box_px[np.argsort(-dist)[:n]]
+    if float(top.std(axis=0).mean()) > TOP_STD_MAX:
+        return NOT_DETERMINED  # the strongest-contrast pixels disagree: they are not one flat text colour
+    if float(np.linalg.norm(top.mean(axis=0) - bg)) < COLOR_CONTRAST_MIN:
+        return NOT_DETERMINED  # text and background too close to tell apart
     return "#%02x%02x%02x" % tuple(int(round(v)) for v in top.mean(axis=0))
 
 
@@ -310,7 +326,7 @@ def _modal(boxes):
     return best
 
 
-def text_tracks(path: str, duration: float, step: float = 0.5) -> tuple[list[dict], list[str]]:
+def text_tracks(path: str, duration: float, step: float = STEP_S) -> tuple[list[dict], list[str]]:
     try:
         cv2, np = _import_cv()
     except Exception:
@@ -346,13 +362,15 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
                     dets.remove(m)
                     tr["last"] = t
                     tr["boxes"].append((t, m["box"]))
+                    tr["confs"].append(m["conf"])
                     still.append(tr)
                 elif t - tr["last"] < 2 * step - 1e-6:  # tolerate one missed OCR sample
                     still.append(tr)
                 else:
                     done.append(tr)
             for d in dets:
-                still.append({"text": d["text"], "norm": d["norm"], "first": t, "last": t, "boxes": [(t, d["box"])]})
+                still.append({"text": d["text"], "norm": d["norm"], "first": t, "last": t, "boxes": [(t, d["box"])],
+                              "confs": [d["conf"]]})
             open_tracks = still
         done.extend(open_tracks)
         out = []
@@ -376,7 +394,7 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
             if a_out is not None:
                 t_out = a_out
             ref = _read(cap, cv2, (t_set_in + t_set_out) / 2.0)  # middle of the stable span: fully opaque
-            conf = min(0.95, 0.5 + 0.1 * len(tr["boxes"]))
+            conf = _track_conf(len(tr["boxes"]), sum(tr["confs"]) / len(tr["confs"]))
             out.append({
                 "text": tr["text"],
                 "t_in": round(t_in, 3), "t_out": round(t_out, 3),
@@ -388,6 +406,7 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
                 "font_family": NOT_DETERMINED,
                 "evidence": {"t_start": round(t_in, 3), "t_end": round(t_out, 3), "method": "ocr",
                              "confidence": round(conf, 3), "samples": len(tr["boxes"]),
+                             "ocr_confidence": round(sum(tr["confs"]) / len(tr["confs"]), 3),
                              "box_track": [[round(tt, 3)] + [round(v, 4) for v in b] for tt, b in tr["boxes"]]},
             })
         out.sort(key=lambda r: (r["t_in"], r["box"][1], r["box"][0]))

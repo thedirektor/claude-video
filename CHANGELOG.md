@@ -7,7 +7,7 @@ All notable changes to `/watch` are documented here.
 Breakdown: measure a reference video into something that can be rebuilt, without inventing anything.
 
 ### Added
-- **`watch.py breakdown`**: shots/cuts, camera, typography, motion, music and transitions with per-element evidence (`measured` / `ocr` / `transcript` / `interpretation`, confidence 0–1); unmeasurable values are `"not determined"`, never guessed. `breakdown.md` opens with the build contract. Optional `--interpret` (one costed LLM call).
+- **`watch.py breakdown`**: shots/cuts, camera, look, typography, music and transitions with per-element evidence (`measured` / `ocr` / `transcript` / `interpretation`, confidence 0–1); unmeasurable values are `"not determined"`, never guessed. `breakdown.md` opens with the build contract. Optional `--interpret` (one costed LLM call).
 - **Timelines**: OpenTimelineIO, FCPXML and CMX3600 EDL at the source frame rate (NTSC as rational), start `01:00:00:00`, clips referencing the original media.
 - **`watch.py motion`**: region tracking over a segment, phases, easing fit, Godot 4 / Unity / CSS / JSON snippets.
 - **`watch.py compare`**: reference vs your version — alignment, timing deltas, slow-motion side-by-side video.

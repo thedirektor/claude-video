@@ -32,6 +32,8 @@ NOTE_KIND = "breakdown"
 NOTE_CHARS = 2000
 MAX_TILES = 48
 EPS = 1e-6
+SAMPLING_NOTE = f"sampled every {typography.STEP_S:g} s; shorter or stylised text may be missed"
+BLIND_SPOT_NOTE = "dissolves between two moving shots can go undetected: cuts and shots are what was measured"
 FOLD_MAX_S = 1.0  # a fade between two cuts this close is one dip, not a shot
 
 
@@ -220,7 +222,8 @@ def _audio_section(m: dict, bd_shots: list[dict], duration: float, segments: lis
     for n in a.get("notes") or []:
         _add_note(notes, n)
     beats = a.get("beats") or []
-    cob = audio_mod.cuts_on_beat(bd_shots, beats, m.get("fps") or 0.0)
+    cob = audio_mod.cuts_on_beat(bd_shots, beats, m.get("fps") or 0.0,
+                                 tempo_conf=a["evidence"]["confidence"], alt_ratio=a.get("tempo_alt_ratio"))
     if isinstance(cob, str):
         cob = {"share": NOT_DETERMINED, "evidence": _ev(0.0, duration, "measured", 0.0)}
     a["cuts_on_beat"] = cob
@@ -245,7 +248,8 @@ def _typography_section(m: dict, duration: float, notes: list[str]) -> dict:
     if tnotes:
         return {"tracks": NOT_DETERMINED, "evidence": _ev(0.0, duration, "ocr", 0.0)}
     conf = max((t["evidence"]["confidence"] for t in tracks), default=0.5)
-    return {"tracks": tracks, "evidence": _ev(0.0, duration, "ocr", conf)}
+    return {"tracks": tracks, "sampling": SAMPLING_NOTE,
+            "evidence": _ev(0.0, duration, "ocr", conf, sampling=SAMPLING_NOTE)}
 
 
 def _rhythm_section(shot_list: list[dict]) -> dict:
@@ -317,10 +321,14 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
     row = conn.execute("SELECT title, url, duration FROM videos WHERE video_key = ?", (video_key,)).fetchone()
     title, url, row_dur = (row["title"], row["url"], row["duration"]) if row else (None, None, 0.0)
     m = media.ensure_media(conn, video_key, store_dir, fetch=fetch)
+    if m.get("path"):
+        media.pin(Path(store_dir) if store_dir is not None else Path(memory_paths()["store_dir"]), video_key)
     duration = float(m.get("duration") or row_dur or 0.0)
     fps = float(m.get("fps") or 0.0)
     notes: list[str] = []
     has_media = bool(m.get("path"))
+    if m.get("fps_note"):
+        _add_note(notes, m["fps_note"])
 
     raw: list[dict] = []
     entries: list[dict] = []
@@ -329,6 +337,7 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
         raw = shots_mod.detect_shots(series, duration)
         if raw:
             entries = transitions.classify(series, raw)
+            _add_note(notes, BLIND_SPOT_NOTE)
         else:
             _add_note(notes, "shot detection produced no shots; cuts not determined")
     else:
@@ -346,7 +355,8 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
              "fps_rational": m.get("fps_rational") or "0/1", "width": width, "height": height,
              "source": m.get("source"),
              "active_aspect": _active_aspect(width, height, shot_list, duration),
-             "evidence": _ev(0.0, duration, "measured", 0.95 if has_media else 0.3)}
+             "evidence": _ev(0.0, duration, "measured",
+                             (0.45 if m.get("fps_offstandard") else 0.95) if has_media else 0.3)}
 
     segs = [dict(r) for r in conn.execute(
         'SELECT start, "end" AS end FROM segments WHERE video_key = ? ORDER BY start', (video_key,))]
@@ -354,6 +364,7 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
 
     bd = {
         "schema": SCHEMA,
+        "contract": CONTRACT,
         "video": video,
         "low_resolution": bool(m.get("low_resolution")),
         "cuts": ({"count": sum(1 for s in shot_list[1:] if s["transition"]["kind"] == "cut"),
@@ -368,13 +379,44 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
     bd["typography"] = _typography_section(m, duration, notes)
     bd["audio"] = _audio_section(m, shot_list, duration, segs, notes)
     bd["notes"] = notes
+    version = _evidence_version(conn, video_key)
     if interpret:
         interp = _interpret(bd, complete, allow_cost)
         if interp:
-            bd["interpretation"] = interp
+            bd["interpretation"] = {**interp, "evidence_version": version, "stale": False}
         else:
             _add_note(notes, "interpretation requested but no LLM reply was available")
+    if "interpretation" not in bd:
+        kept = _stored_interpretation(conn, video_key, store_dir)
+        if kept:
+            bd["interpretation"] = {**kept, "stale": kept.get("evidence_version") != version}
+            _add_note(notes, "interpretation kept from an earlier run (not regenerated); measured fields may "
+                             "have changed since")
     return bd
+
+
+def _evidence_version(conn, video_key: str) -> int:
+    row = conn.execute("SELECT evidence_version FROM videos WHERE video_key = ?", (video_key,)).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def stored_path(conn, video_key: str, store_dir=None) -> Path:
+    root = Path(store_dir) if store_dir is not None else Path(memory_paths()["store_dir"])
+    return breakdown_dir(conn, root, video_key) / "breakdown.json"
+
+
+def read_stored(conn, video_key: str, store_dir=None) -> dict | None:
+    """The stored breakdown.json, or None."""
+    try:
+        return json.loads(stored_path(conn, video_key, store_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _stored_interpretation(conn, video_key: str, store_dir=None) -> dict | None:
+    old = read_stored(conn, video_key, store_dir)
+    interp = (old or {}).get("interpretation")
+    return interp if isinstance(interp, dict) and (interp.get("text") or "").strip() else None
 
 
 # --------------------------------------------------------------------------- brief
@@ -418,7 +460,9 @@ def _bars(lb) -> str:
 
 def brief_md(bd: dict) -> str:
     v = bd["video"]
-    out = [CONTRACT, "", f"# Breakdown: {v.get('title') or v['key']}", ""]
+    out = [CONTRACT, "", f"# Breakdown: {v.get('title') or v['key']}", "",
+           "Full numbers (box tracks, beat times, per-element evidence) are in `breakdown.json` next to this file.",
+           ""]
     out.append(f"- video: `{v['key']}`" + (f" · {v['url']}" if v.get("url") else ""))
     out.append(f"- duration: {_t(v['duration'])} · fps: {v['fps_rational']} ({v['fps']:.3f}) · "
                f"size: {v['width']}x{v['height']}")
@@ -452,12 +496,13 @@ def brief_md(bd: dict) -> str:
         w = r[k]
         out.append(f"- {k.replace('_', ' ')}: " + (_v(w) if w == NOT_DETERMINED
                                                    else f"{_t(w['t_start'])} - {_t(w['t_end'])} (mean shot {_t(w['mean'])})"))
-    out += ["", "## Typography", "", "Box is x, y, w, h as 0-1 fractions of the frame.", ""]
+    out += ["", "## Typography", "", "Box is x, y, w, h as 0-1 fractions of the frame.",
+            f"Text {SAMPLING_NOTE}.", ""]
     tracks = bd["typography"]["tracks"]
     if tracks == NOT_DETERMINED:
         out.append(_v(NOT_DETERMINED))
     elif not tracks:
-        out.append("No on-screen text found.")
+        out.append(f"No on-screen text found in the samples ({SAMPLING_NOTE}).")
     for tr in tracks if isinstance(tracks, list) else []:
         lc = _lc(tr["evidence"])
         out.append(f"- \"{tr['text']}\" {_t(tr['t_in'])} - {_t(tr['t_out'])} · box {tr['box']} · "
@@ -468,12 +513,17 @@ def brief_md(bd: dict) -> str:
             f"- tempo: {_v(a['tempo_bpm'])}" + (" BPM" if a["tempo_bpm"] != NOT_DETERMINED else "")
             + (f" (alternative reading {a['tempo_alt']} BPM; half/double time is ambiguous)" if a.get("tempo_alt") else "")
             + _lc(a["evidence"]),
-            f"- beats: {len(a['beats'])}" if a["beats"] else f"- beats: {_v(NOT_DETERMINED)}"]
+            (f"- beats: {len(a['beats'])}; first {min(16, len(a['beats']))} at "
+             + ", ".join(f"{b:.2f}s" for b in a["beats"][:16])
+             + (" (full list in breakdown.json)" if len(a["beats"]) > 16 else ""))
+            if a["beats"] else f"- beats: {_v(NOT_DETERMINED)}"]
     for n in a.get("notes") or []:
         out.append(f"- tempo note: {_md_nd(n)}")
     cob = a["cuts_on_beat"]
     out.append("- cuts on beat (+-2 frames): " + (_v(cob["share"]) if cob["share"] == NOT_DETERMINED
-                                                  else f"{cob['share']:.0%}") + _lc(cob["evidence"]))
+                                                  else f"{cob['share']:.0%}")
+               + (f" on the primary grid, {cob['share_alt']:.0%} on the other half/double-time grid "
+                  "(tempo octave ambiguous)" if "share_alt" in cob else "") + _lc(cob["evidence"]))
     sg = a["segments"]
     out.append("- speech: " + (_v(sg["speech"]) if sg["speech"] == NOT_DETERMINED
                                else ", ".join(f"{_t(x['t_start'])}-{_t(x['t_end'])}" for x in sg["speech"][:40]))
@@ -490,7 +540,11 @@ def brief_md(bd: dict) -> str:
     if bd.get("interpretation"):
         i = bd["interpretation"]
         out += ["", "## Interpretation (AI-written, not measured)", "",
-                f"> made from: {i['made_from']}", "", i["text"]]
+                f"> made from: {i['made_from']}"
+                + (f" · made on evidence version {i['evidence_version']}"
+                   + (" (kept from an earlier run; the measured fields may have changed since)"
+                      if i.get("stale") else "") if i.get("evidence_version") is not None else ""),
+                "", i["text"]]
     return "\n".join(out) + "\n"
 
 

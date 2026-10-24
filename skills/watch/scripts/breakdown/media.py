@@ -41,6 +41,31 @@ def _rational_to_float(value: str) -> float:
         return 0.0
 
 
+STANDARD_RATES = ("24000/1001", "24/1", "25/1", "30000/1001", "30/1", "48/1", "50/1", "60000/1001", "60/1",
+                  "120/1")
+SNAP_TOL = 0.005  # relative distance to a standard rate within which a measured rate is snapped
+EXACT_TOL = 1e-4  # closer than this is the same rate written differently: no note
+
+
+def snap_fps(rate: str) -> tuple[str, str | None, bool]:
+    """``(fps_rational, note, off_standard)``.
+
+    ffprobe's average rate of a variable-frame-rate file (``1784000/59623``) drifts a timeline
+    over minutes. A rate within 0.5% of a standard one is snapped to it, with a note; further
+    away it is kept as measured, flagged ``off_standard`` so timeline confidence is lowered."""
+    val = _rational_to_float(rate)
+    if val <= 0:
+        return rate, None, False
+    best = min(STANDARD_RATES, key=lambda r: abs(_rational_to_float(r) - val))
+    std = _rational_to_float(best)
+    rel = abs(std - val) / std
+    if rel <= EXACT_TOL:
+        return best, None, False
+    if rel <= SNAP_TOL:
+        return best, f"variable/non-standard frame rate {rate} ({val:.3f} fps) snapped to {best}", False
+    return rate, f"non-standard frame rate {rate} ({val:.3f} fps) kept as measured: timeline timing may drift", True
+
+
 def probe(path: Path) -> dict | None:
     """ffprobe summary of a media file, or None when it is unreadable."""
     try:
@@ -61,9 +86,12 @@ def probe(path: Path) -> dict | None:
         duration = float(data.get("format", {}).get("duration") or video.get("duration") or 0.0)
     except ValueError:
         duration = 0.0
+    rate, fps_note, off_standard = snap_fps(rate)
     return {
         "fps": _rational_to_float(rate),
         "fps_rational": rate,
+        "fps_note": fps_note,
+        "fps_offstandard": off_standard,
         "duration": duration,
         "width": int(video.get("width") or 0),
         "height": int(video.get("height") or 0),

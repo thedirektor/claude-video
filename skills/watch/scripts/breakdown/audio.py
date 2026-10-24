@@ -415,6 +415,7 @@ def analyze(path: str, duration: float = 0.0) -> dict:
             conf = min(conf, AMBIG_CONF)
             notes.append("half/double-time ambiguous")
             extra["tempo_alt"] = round(alt * bpm / bpm0, 1)
+            extra["tempo_alt_ratio"] = round(extra["tempo_alt"] / bpm, 3)
         return {"tempo_bpm": round(bpm, 1), "beats": beats, "loudness": loud, **extra,
                 "evidence": _ev(beats[0], beats[-1], conf, periodicity=round(tempo[1], 3)),
                 "loudness_evidence": _loud_ev(loud, dur),
@@ -423,8 +424,23 @@ def analyze(path: str, duration: float = 0.0) -> dict:
         return _nd(duration, [f"audio analysis failed: {type(exc).__name__}"])
 
 
-def cuts_on_beat(shots: list[dict], beats: list[float], fps: float):
-    """Share of hard cuts within +-2 source frames of a beat, or "not determined"."""
+def _alt_grids(beats: list[float], ratio: float) -> list[list[float]]:
+    """Beat grids for the other octave: double time adds the midpoints, half time keeps
+    every other beat (either parity, since the phase of the slower pulse is unknown)."""
+    if ratio > 1.0:
+        mids = [(a + b) / 2 for a, b in zip(beats, beats[1:])]
+        return [sorted(beats + mids)]
+    return [beats[0::2], beats[1::2]]
+
+
+def cuts_on_beat(shots: list[dict], beats: list[float], fps: float, tempo_conf: float = 1.0,
+                 alt_ratio: float | None = None):
+    """Share of hard cuts within +-2 source frames of a beat, or "not determined".
+
+    The confidence never exceeds ``tempo_conf`` (the evidence for the beat grid itself).
+    When the tempo octave is ambiguous (``alt_ratio`` = alternative tempo / primary tempo)
+    the share on the other octave's grid is reported too as ``share_alt`` (the lower of the
+    two phases for half time): one confident share would be wrong for one of the readings."""
     if not beats or not fps or fps <= 0:
         return NOT_DETERMINED
     cuts = [s["boundary"]["t"] for s in shots or []
@@ -432,10 +448,21 @@ def cuts_on_beat(shots: list[dict], beats: list[float], fps: float):
     if not cuts:
         return NOT_DETERMINED
     tol = TOLERANCE_FRAMES / fps + 1e-6
+
+    def share(grid):
+        return sum(1 for c in cuts if min(abs(c - b) for b in grid) <= tol) / len(cuts)
+
     hits = sum(1 for c in cuts if min(abs(c - b) for b in beats) <= tol)
     n = len(cuts)
-    return {"share": round(hits / n, 3), "tolerance_frames": TOLERANCE_FRAMES,
-            "evidence": _ev(min(cuts), max(cuts), 0.9 * min(1.0, n / 4), n_cuts=n, n_on_beat=hits)}
+    out = {"share": round(hits / n, 3), "tolerance_frames": TOLERANCE_FRAMES}
+    conf = min(0.9 * min(1.0, n / 4), float(tempo_conf))
+    if alt_ratio:
+        grids = [g for g in _alt_grids(beats, alt_ratio) if g]
+        if grids:
+            out["share_alt"] = round(min(share(g) for g in grids), 3)
+            out["alt_ratio"] = alt_ratio
+    out["evidence"] = _ev(min(cuts), max(cuts), conf, n_cuts=n, n_on_beat=hits)
+    return out
 
 
 MUSIC_WINDOW_S = 6.0
