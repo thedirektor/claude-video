@@ -30,6 +30,7 @@ MIN_MOVE_PX = 1.5  # total travel below this is "no motion"
 NOISE_PX = 0.2  # per-frame travel treated as tracking noise
 GAP_FRAMES = 2  # still frames bridged inside one move
 HOLD_MIN_FRAMES = 3
+MERGE_MAX_RMS = 0.02  # a move + its return merge into one overshoot curve only when this tight
 PERP_MAX = 0.5  # path wider than this share of its length is not one straight move
 
 
@@ -267,7 +268,7 @@ def _runs(v, np):
     return merged
 
 
-def _split(T, P, np):
+def _split(P, np):
     """Principal-axis progress ``q`` and its moves; None when there is no motion."""
     D = P - P[0]
     c = P - P.mean(axis=0)
@@ -287,10 +288,26 @@ def _mean_conf(scores) -> float:
     return max(0.0, min(1.0, sum(scores) / len(scores))) if scores else 0.0
 
 
+def _fit_span(T, q, f, ia, ib, prev_end, next_start) -> dict:
+    """Fit the move over samples ia..ib, searching its exact start and end.
+
+    The window runs on past ``ib`` (up to the next move) because an ease tail is
+    below the velocity threshold; ``fit_bounds`` picks the end that fits best.
+    """
+    n = len(T)
+    wa = max(prev_end, ia - 2)
+    we = min(n - 1, max(ib, min(next_start, ib + max(8, 2 * (ib - ia)))))
+    tt = [T[i] for i in range(wa, we + 1)]
+    qq = [float(q[i]) for i in range(wa, we + 1)]
+    s_c = [T[ia] + j * f / 4.0 for j in range(-4, 5)]
+    e_c = [T[ib] + j * f / 4.0 for j in range(0, int((T[we] - T[ib]) / (f / 4.0) + 1e-9) + 1)] or [T[ib]]
+    return easing.fit_bounds(tt, qq, s_c, e_c)
+
+
 def _build_phases(T, P, scores, fps, ppu, W, H, notes):
     import numpy as np  # noqa: PLC0415
     n = len(T)
-    sp = _split(T, P, np)
+    sp = _split(P, np)
     if sp is None:
         notes.append(f"no motion detected (travel below {MIN_MOVE_PX} px); phases not determined")
         return []
@@ -334,42 +351,51 @@ def _build_phases(T, P, scores, fps, ppu, W, H, notes):
         next_start = runs[k + 1][0] if k + 1 < len(runs) else n - 1
         phases.append({"name": name, "run": k, "ia": ia, "ib": ib, "prev_end": prev_end, "next_start": next_start})
 
+    # an overshoot ease (BACK / ELASTIC / SPRING) reads as a move plus a smaller return; try the whole span as one
+    merged_phases = []
+    k = 0
+    while k < len(phases):
+        ph = phases[k]
+        nxt = phases[k + 1] if k + 1 < len(phases) else None
+        if (clean and nxt is not None and ph["name"] == "action" and nxt["name"] == "recovery"
+                and nxt["ia"] - ph["ib"] <= GAP_FRAMES
+                and abs(deltas[nxt["run"]]) < abs(deltas[ph["run"]])):
+            span = _fit_span(T, q, f, ph["ia"], nxt["ib"], ph["prev_end"], nxt["next_start"])
+            if (span.get("godot") != NOT_DETERMINED and isinstance(span.get("error_rms"), float)
+                    and span["error_rms"] <= MERGE_MAX_RMS):
+                notes.append("the move and its return were fitted as one overshoot curve")
+                merged_phases.append({**ph, "ib": nxt["ib"], "next_start": nxt["next_start"], "span": span})
+                k += 2
+                continue
+        merged_phases.append(ph)
+        k += 1
+    phases = merged_phases
+
     out = []
+    refined_end = []
     for ph in phases:
-        ia, ib, k = ph["ia"], ph["ib"], ph["run"]
+        ia, ib = ph["ia"], ph["ib"]
         t_s, t_e = T[ia], T[ib]
         curve: object = NOT_DETERMINED
         cnote = None
         if clean and ib - ia + 1 >= easing.MIN_SAMPLES:
-            if ph["name"] == "action":
-                wa = max(ph["prev_end"], ia - 2)
-                cap_end = min(ph["next_start"], ib + max(8, 2 * (ib - ia)))
-                we = max(ib, cap_end)
-                tt = [T[i] for i in range(wa, we + 1)]
-                qq = [float(q[i]) for i in range(wa, we + 1)]
-                s_c = [T[ia] + j * f / 4.0 for j in range(-4, 5)]
-                e_c = [T[ib] + j * f / 4.0 for j in range(0, int((T[we] - T[ib]) / (f / 4.0)) + 1)] or [T[ib]]
-                curve = easing.fit_bounds(tt, qq, s_c, e_c)
-                if curve.get("godot") != NOT_DETERMINED:
-                    t_s, t_e = curve["t_start"], curve["t_end"]
-            else:
-                curve = easing.fit([T[i] for i in range(ia, ib + 1)], [float(q[i]) for i in range(ia, ib + 1)])
+            curve = ph.get("span") or _fit_span(T, q, f, ia, ib, ph["prev_end"], ph["next_start"])
+            if curve.get("godot") != NOT_DETERMINED:
+                t_s, t_e = curve["t_start"], curve["t_end"]
         elif clean:
             cnote = "too few frames to fit a curve"
-        ie = min(n - 1, max(ia + 1, int(round((t_e - T[0]) * fps)))) if fps else ib
-        ie = min(n - 1, max(ie, ib))
+        ie = ib
         if curve is not NOT_DETERMINED and curve.get("godot") != NOT_DETERMINED:
-            ie = min(n - 1, int(math.ceil((t_e - T[0]) * fps - 1e-6)))
-            ie = max(ie, ib)
+            ie = max(ib, min(n - 1, int(math.ceil((t_e - T[0]) * fps - 1e-6))))
         dx_px, dy_px = float(P[ie][0] - P[ia][0]), float(P[ie][1] - P[ia][1])
         out.append(_phase_dict(ph["name"], t_s, t_e, dx_px, dy_px, W, H, ppu, curve, cnote, conf_track))
-    # holds: still stretches between moves and after the last move
+        refined_end.append(t_e)
+    # holds: still stretches between moves and after the last move, measured from the refined end of the move
     holds = []
     for k, ph in enumerate(phases):
-        e = ph["ib"]
         stop = phases[k + 1]["ia"] if k + 1 < len(phases) else n - 1
-        if stop - e >= HOLD_MIN_FRAMES:
-            holds.append(_phase_dict("hold", out[k]["t_end"], T[stop], 0.0, 0.0, W, H, ppu,
+        if T[stop] - refined_end[k] >= HOLD_MIN_FRAMES * f - 1e-9:
+            holds.append(_phase_dict("hold", refined_end[k], T[stop], 0.0, 0.0, W, H, ppu,
                                      "not applicable", None, conf_track))
     out_all = out + holds
     out_all.sort(key=lambda d: d["t_start"])
@@ -511,9 +537,8 @@ def _analyze(conn, video_key, start, end, region, ppu, store_dir, fetch, out):
         notes.append(f"tracking lost the region at t={T[first_bad]:.3f}s ({lost} of {n} frames); "
                      "phases and curves not determined")
         return
-    import numpy as np2  # noqa: PLC0415
     Tn = list(T)
-    P = np2.array([[pos[i][0] / sc, pos[i][1] / sc] for i in range(n)], dtype=float)
+    P = np.array([[pos[i][0] / sc, pos[i][1] / sc] for i in range(n)], dtype=float)
     scores = [pos[i][2] for i in range(n)]
     out["phases"] = _build_phases(Tn, P, scores, fps, ppu, W, H, notes)
 
@@ -570,6 +595,10 @@ def snippets(m: dict) -> dict:
           "var tween := create_tween()"]
     if not phases:
         gd.append("# no phases determined; nothing to emit")
+    lead = (phases[0]["t_start"] - float(seg.get("start") or 0.0)) if phases else 0.0
+    if lead > 0.05:
+        gd.append(f"# at rest for the first {_fmt(lead, 3)}s of the segment")
+        gd.append(f"tween.tween_interval({_fmt(lead, 3)})")
     for ph in phases:
         gd.extend(_godot_line(ph))
     unity_phases = []

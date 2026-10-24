@@ -360,10 +360,16 @@ def fit_bounds(t, v, s_cands, e_cands, top: int = 12) -> dict:
         return _undetermined("too few samples to fit a curve", n=len(t))
     v0, v1 = v[0], v[-1]
     s0, e0 = s_cands[0], e_cands[0]
-    nm = normalise(t, v, s0, e0, v0, v1)
-    if nm is None:
+    if normalise(t, v, s0, e0, v0, v1) is None:
         return _undetermined("no net change between the endpoints", n=len(t))
-    shortlist = [(r["trans"], r["ease"]) for r in rank(*nm)[:top]]
+    # shortlist from several plausible ends: a curve far off at the first end can be right at a later one
+    picks = sorted({0, len(e_cands) // 3, (2 * len(e_cands)) // 3, len(e_cands) - 1})
+    shortlist = []
+    for pi in picks:
+        xs0, ys0 = normalise(t, v, s0, e_cands[pi], v0, v1)
+        for r in rank(xs0, ys0)[:top]:
+            if (r["trans"], r["ease"]) not in shortlist:
+                shortlist.append((r["trans"], r["ease"]))
     rows = []
     for tr, ea in shortlist:
         f = CURVES[tr][ea]

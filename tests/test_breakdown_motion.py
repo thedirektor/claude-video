@@ -275,3 +275,46 @@ def test_anticipation_action_hold(conn, tmp_path):
     assert ant["displacement"]["x"] < 0 < act["displacement"]["x"]
     assert ant["t_start"] == pytest.approx(0.2, abs=0.05) and act["t_end"] == pytest.approx(1.0, abs=0.06)
     assert act["curve"]["godot"] == {"trans": "SINE", "ease": "IN_OUT"}
+
+
+def _ov(conn, tmp_path, x_expr, d=1.6, size="1280x400", sq=60):
+    import subprocess
+    p = tmp_path / "ov.mp4"
+    graph = (f"color=c=0x202020:s={size}:r=60:d={d}[bg];"
+             f"color=c=0xffd000:s={sq}x{sq}:r=60:d={d},drawbox=x=10:y=10:w=20:h=20:c=red:t=fill[sq];"
+             f"[bg][sq]overlay=x='{x_expr}':y=120:eval=frame,format=yuv420p[v]")
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-filter_complex", graph, "-map", "[v]",
+                    "-c:v", "libx264", "-crf", "14", "-t", str(d), str(p)], check=True)
+    return _store(conn, tmp_path, p, d)
+
+
+def _u(t0, t1):
+    return f"clip((t-{t0})/{t1 - t0}\\,0\\,1)"
+
+
+@pytestmark_media
+def test_anticipation_curve_not_cut_short(conn, tmp_path):
+    cub = f"(1-pow(1-{_u(0.2, 0.4)}\\,3))"
+    root = _ov(conn, tmp_path, f"300-40*{cub}+340*(1-pow(1-{_u(0.4, 0.9)}\\,4))")
+    m = motion.analyze(conn, KEY, 0.0, 1.6, store_dir=root)
+    names = [p["name"] for p in m["phases"]]
+    assert names == ["anticipation", "action", "hold"], (names, m["notes"])  # no hold inside the motion
+    ant = m["phases"][0]
+    assert ant["t_end"] == pytest.approx(0.4, abs=0.04)
+    cands = [ant["curve"]["godot"]] + ([ant["curve"]["runner_up"]] if ant["curve"].get("runner_up") else [])
+    assert any((c["trans"], c.get("ease")) == ("CUBIC", "OUT") for c in cands)
+    assert ant["curve"]["godot"] == {"trans": "CUBIC", "ease": "OUT"}
+
+
+@pytestmark_media
+def test_overshoot_ease_is_one_action(conn, tmp_path):
+    u = _u(0.2, 0.7)
+    back = f"(1+2.70158*pow({u}-1\\,3)+1.70158*pow({u}-1\\,2))"
+    root = _ov(conn, tmp_path, f"100+600*{back}", d=1.2, size="1280x400", sq=80)
+    m = motion.analyze(conn, KEY, 0.0, 1.2, store_dir=root)
+    acts = [p for p in m["phases"] if p["name"] == "action"]
+    assert [p["name"] for p in m["phases"]] == ["action", "hold"], m["phases"]
+    assert acts[0]["curve"]["godot"] == {"trans": "BACK", "ease": "OUT"}
+    assert acts[0]["displacement"]["px"] == pytest.approx(600, abs=10)
+    gd = motion.snippets(m)["godot.gd"]
+    assert gd.count("tween_property") == 1 and "TRANS_BACK" in gd and "EASE_OUT" in gd
