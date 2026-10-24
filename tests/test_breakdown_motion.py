@@ -182,8 +182,9 @@ def test_tracking_lost_not_forced(conn, tmp_path):
                     "-t", "2", str(p)], check=True)
     root = _store(conn, tmp_path, p, 2.0)
     m = motion.analyze(conn, KEY, 0.0, 2.0, region=[0.02, 0.38, 0.12, 0.22], store_dir=root)
-    assert m["phases"] == []
-    assert any("lost" in n for n in m["notes"])
+    # only the stretch actually followed (until the square vanishes at 0.6 s) is measured
+    assert any("held only" in n for n in m["notes"])
+    assert all(ph["t_end"] <= 0.6 + 1 / 30 + 1e-6 for ph in m["phases"])
 
 
 def test_frames_only_not_determined(conn, tmp_path):
@@ -343,3 +344,56 @@ def test_move_plus_separate_return_is_not_a_fake_back(conn, tmp_path, ret):
     for a, b in zip(m["phases"], m["phases"][1:]):
         assert a["t_end"] <= b["t_start"] + 1e-6 or a["name"] != "hold"
     assert holds
+
+
+
+# ---- 0.7.1 backlog -----------------------------------------------------------
+
+
+def _clip(tmp_path, name, graph, dur):
+    import subprocess
+    p = tmp_path / name
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-filter_complex", graph, "-map", "[v]",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-t", str(dur), str(p)], check=True)
+    return p
+
+
+@pytestmark_media
+def test_move_then_exit_keeps_the_measured_move(conn, tmp_path):
+    """CUBIC/OUT move 0.2-0.7 s, a hold, then the square leaves the frame at 1.0 s."""
+    expr = "if(lt(t,1.0),100+500*(1-pow(1-clip((t-0.2)/0.5,0,1),3)),2000)"
+    graph = (f"color=c=black:s=1280x720:r=60:d=1.5[bg];testsrc=s=100x100:r=60:d=1.5[sq];"
+             f"[bg][sq]overlay=x='{expr}':y=310:eval=frame,format=yuv420p[v]")
+    root = _store(conn, tmp_path, _clip(tmp_path, "exit.mp4", graph, 1.5), 1.5)
+    m = motion.analyze(conn, KEY, 0.0, 1.5, region=[0.07, 0.42, 0.09, 0.15], store_dir=root)
+    acts = [p for p in m["phases"] if p["name"] == "action"]
+    assert acts and acts[0]["curve"]["godot"] == {"trans": "CUBIC", "ease": "OUT"}
+    assert any("held only" in n for n in m["notes"])
+
+
+@pytestmark_media
+def test_subject_that_grows_while_moving_is_followed(conn, tmp_path):
+    """A textured square that scales 100 -> 150 px while sliding: the template adapts."""
+    graph = ("color=c=black:s=1280x720:r=30:d=1.5[bg];testsrc=s=100x100:r=30:d=1.5,"
+             "scale=w='100+round(33*t)*2':h='100+round(33*t)*2':eval=frame[sq];"
+             "[bg][sq]overlay=x='100+400*t':y=250:eval=frame,format=yuv420p[v]")
+    root = _store(conn, tmp_path, _clip(tmp_path, "grow.mp4", graph, 1.5), 1.5)
+    m = motion.analyze(conn, KEY, 0.0, 1.5, region=[0.07, 0.34, 0.09, 0.15], store_dir=root)
+    assert len(m["track"]) >= 40  # followed through (it used to be lost as the shape changed)
+    assert not any("lost" in n for n in m["notes"])
+
+
+def test_unity_keys_follow_oscillating_curves():
+    from breakdown import easing
+
+    assert easing.keys_for("BOUNCE") >= 17 and easing.keys_for("CUBIC") == 5
+    fit = easing.fit(*_samples("BOUNCE", "OUT", n=60))
+    if isinstance(fit["godot"], dict) and fit["godot"]["trans"] == "BOUNCE":
+        assert len(fit["unity_keys"]) == easing.keys_for("BOUNCE")
+
+
+@pytestmark_media
+def test_phases_never_overlap(conn, mstored):
+    m = motion.analyze(conn, KEY, 0.0, 1.2, store_dir=mstored)
+    for a, b in zip(m["phases"], m["phases"][1:]):
+        assert b["t_start"] >= a["t_end"] - 1e-9

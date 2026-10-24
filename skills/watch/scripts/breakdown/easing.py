@@ -1,8 +1,9 @@
 """Godot 4 ``Tween`` TRANS x EASE curves and a fitter for sampled motion.
 
-The curves are the standard Penner equations as Godot 4 implements them
-(BACK overshoot constant 1.70158; ``OUT_IN`` is the out-curve over the first
-half and the in-curve over the second). ``fit`` picks the (trans, ease) pair
+The curves are the standard Penner equations Godot 4 uses (BACK overshoot
+constant 1.70158; ``OUT_IN`` is the out-curve over the first half and the
+in-curve over the second). Godot's EXPO adds ±0.1% correction terms so it ends
+exactly on its target; they are left out here (they change no fit: under 0.001). ``fit`` picks the (trans, ease) pair
 that best explains normalised samples, also fits a CSS ``cubic-bezier`` and
 emits Unity ``AnimationCurve`` keys. Pure python (no numpy), so it works
 wherever the plugin runs.
@@ -260,6 +261,12 @@ def fit_bezier(xs, ys) -> tuple[list[float], float]:
 
 # ---- Unity keys -----------------------------------------------------------
 
+def keys_for(trans: str) -> int:
+    """Keys a Unity ``AnimationCurve`` needs to follow the curve: bounces and springs oscillate,
+    so 5 Hermite keys would flatten them."""
+    return {"BOUNCE": 25, "ELASTIC": 25, "SPRING": 17, "BACK": 9}.get(trans, 5)
+
+
 def unity_keys(f, n: int = 5) -> list[dict]:
     """Hermite keys (normalised time/value, tangents = value per unit time) of curve ``f``."""
     h = 1e-3
@@ -307,7 +314,7 @@ def _assemble(ranked: list[dict], xs, ys) -> dict:
         out["notes"].append(f"no Godot TRANS x EASE curve fits (best RMS {best['rms']:.3f} > {MAX_RMS})")
     else:
         out["godot"] = {"trans": best["trans"], "ease": best["ease"]}
-        out["unity_keys"] = unity_keys(CURVES[best["trans"]][best["ease"]])
+        out["unity_keys"] = unity_keys(CURVES[best["trans"]][best["ease"]], keys_for(best["trans"]))
         ambiguous = bool(second) and (second["rms"] - best["rms"]) < max(AMBIG_ABS, AMBIG_REL * best["rms"])
         conf = max(0.0, 1.0 - best["rms"] / MAX_RMS)
         if ambiguous:

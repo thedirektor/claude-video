@@ -25,6 +25,10 @@ NOT_DETERMINED = "not determined"
 WORK_W = 960  # tracking resolution (frames wider than this are downscaled)
 MAX_FRAMES = 1800
 MIN_SCORE = 0.45  # template-match score below which the region counts as lost
+REFRESH_SCORE = 0.75  # below this the template is refreshed from the current match (a subject that changes shape)
+DRIFT_MIN = 0.2  # ...but only while the new patch still resembles the original (no drift onto the background)
+SCALES = (0.9, 1.1)  # tried when the plain match fails (the subject came closer / moved away)
+MIN_SPAN_FRAMES = 6  # shortest tracked stretch still analysed when tracking is lost elsewhere
 FLAT_STD = 3.0  # a template flatter than this cannot be told apart from its surroundings
 MIN_MOVE_PX = 1.5  # total travel below this is "no motion"
 NOISE_PX = 0.2  # per-frame travel treated as tracking noise
@@ -210,23 +214,47 @@ def _track_template(cv2, np, grays, r: int, box):
     pos = [None] * n
     pos[r] = (float(x), float(y), 1.0)
     margin = int(max(2 * max(bw, bh), 0.15 * max(w, h)))
+    orig = tpl.astype(np.float32)
+
+    def match(win, t):
+        if win.shape[0] < t.shape[0] or win.shape[1] < t.shape[1]:
+            return -1.0, (0, 0), None
+        res = cv2.matchTemplate(win, t, cv2.TM_CCOEFF_NORMED)
+        res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        _, mx, _, loc = cv2.minMaxLoc(res)
+        return float(mx), loc, res
+
     for step in (1, -1):
         px, py = float(x), float(y)
+        cur = orig.copy()  # adapts to a subject that changes shape, anchored to the original
         i = r + step
         while 0 <= i < n:
             x0, y0 = max(0, int(px) - margin), max(0, int(py) - margin)
             x1, y1 = min(w, int(px) + bw + margin), min(h, int(py) + bh + margin)
-            win = grays[i][y0:y1, x0:x1]
+            win = grays[i][y0:y1, x0:x1].astype(np.float32)
             if win.shape[0] < bh or win.shape[1] < bw:
                 break
-            res = cv2.matchTemplate(win, tpl, cv2.TM_CCOEFF_NORMED)
-            res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
-            _, mx, _, loc = cv2.minMaxLoc(res)
+            mx, loc, res = match(win, cur)
+            off_x = off_y = 0.0
+            if mx < MIN_SCORE:  # closer / further away: try the template a little smaller and larger
+                for scale in SCALES:
+                    t2 = cv2.resize(cur, (max(4, int(round(bw * scale))), max(4, int(round(bh * scale)))))
+                    m2, l2, r2 = match(win, t2)
+                    if m2 > mx:
+                        mx, loc, res = m2, l2, r2
+                        off_x, off_y = (t2.shape[1] - bw) / 2.0, (t2.shape[0] - bh) / 2.0
             if mx < MIN_SCORE:
                 break
             dx, dy = _subpixel(res, loc)
-            px, py = x0 + loc[0] + dx, y0 + loc[1] + dy
+            px, py = x0 + loc[0] + dx + off_x, y0 + loc[1] + dy + off_y
             pos[i] = (px, py, float(mx))
+            if mx < REFRESH_SCORE:
+                ix, iy = int(round(px)), int(round(py))
+                if 0 <= ix <= w - bw and 0 <= iy <= h - bh:
+                    patch = grays[i][iy:iy + bh, ix:ix + bw].astype(np.float32)
+                    like = float(cv2.matchTemplate(patch, orig, cv2.TM_CCOEFF_NORMED)[0, 0])
+                    if like >= DRIFT_MIN:
+                        cur = 0.7 * cur + 0.3 * patch
             i += step
     return pos, None
 
@@ -376,7 +404,8 @@ def _build_phases(T, P, scores, fps, ppu, W, H, notes):
         if k == main_i:
             name = "action"
         elif deltas[k] > 0:
-            name = "action"
+            # another push the same way (an elastic / repeated move): not the main action
+            name = "action (repeat)"
         elif k < main_i:
             name = "anticipation"
         else:
@@ -409,12 +438,16 @@ def _build_phases(T, P, scores, fps, ppu, W, H, notes):
     for ph in phases:
         ia, ib = ph["ia"], ph["ib"]
         t_s, t_e = T[ia], T[ib]
+        if out:  # a refined start may not reach back into the previous phase (no overlapping phases)
+            t_s = max(t_s, out[-1]["t_end"])
         curve: object = NOT_DETERMINED
         cnote = None
         if clean and ib - ia + 1 >= easing.MIN_SAMPLES:
             curve = ph.get("span") or _fit_span(T, q, f, ia, ib, ph["prev_end"], ph["next_start"])
             if curve.get("godot") != NOT_DETERMINED:
                 t_s, t_e = curve["t_start"], curve["t_end"]
+                if out:
+                    t_s = max(t_s, out[-1]["t_end"])
         elif clean:
             cnote = "too few frames to fit a curve"
         ie = ib
@@ -571,10 +604,28 @@ def _analyze(conn, video_key, start, end, region, ppu, store_dir, fetch, out):
                       "w": round(bw / sc / W, 5), "h": round(bh / sc / H, 5), "score": round(s, 3)})
     out["track"] = track
     if lost:
-        first_bad = next(i for i, p in enumerate(pos) if p is None)
-        notes.append(f"tracking lost the region at t={T[first_bad]:.3f}s ({lost} of {n} frames); "
-                     "phases and curves not determined")
-        return
+        # keep the stretch actually followed around the reference frame (e.g. a move that is done
+        # before the object leaves the frame); everything outside it is not measured
+        a = b = ref_i
+        while a - 1 >= 0 and pos[a - 1] is not None:
+            a -= 1
+        while b + 1 < n and pos[b + 1] is not None:
+            b += 1
+        if b - a + 1 < MIN_SPAN_FRAMES:
+            first_bad = next(i for i, p in enumerate(pos) if p is None)
+            if mode == "auto" and first_bad <= 1:
+                notes.append("the automatically found moving area could not be followed (it may be background "
+                             "texture); pass --region to name what to track")
+            else:
+                notes.append(f"tracking lost the region at t={T[first_bad]:.3f}s ({lost} of {n} frames); "
+                             "phases and curves not determined")
+            return
+        notes.append(f"tracking held only from t={T[a]:.3f}s to t={T[b]:.3f}s; phases measured on that stretch, "
+                     "the rest of the segment is not determined")
+        T = list(T)[a:b + 1]
+        pos = pos[a:b + 1]
+        n = len(pos)
+        out["track"] = [tr for tr in track if T[0] - 1e-9 <= tr["t"] <= T[-1] + 1e-9]
     Tn = list(T)
     P = np.array([[pos[i][0] / sc, pos[i][1] / sc] for i in range(n)], dtype=float)
     scores = [pos[i][2] for i in range(n)]
