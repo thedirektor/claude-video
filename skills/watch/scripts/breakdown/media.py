@@ -18,7 +18,9 @@ from config import memory_paths
 from memory import store
 
 PINNED_MARKER = store.PINNED_MARKER
-FETCH_FORMAT = "bv*[height<=1080]+ba/b"
+# H.264 first: OpenCV's bundled ffmpeg has no software AV1 decoder, so an AV1 download leaves
+# camera / look / typography / motion "not determined" (ensure_media transcodes as a fallback)
+FETCH_FORMAT = "bv*[vcodec^=avc1][height<=1080]+ba/bv*[height<=1080]+ba/b"
 LOW_RES_HEIGHT = 240
 
 
@@ -98,6 +100,7 @@ def probe(path: Path) -> dict | None:
         "width": int(video.get("width") or 0),
         "height": int(video.get("height") or 0),
         "has_audio": any(s.get("codec_type") == "audio" for s in streams),
+        "codec": video.get("codec_name") or "",
     }
 
 
@@ -144,7 +147,48 @@ def _frames_only(duration, vdir: Path) -> dict:
     }
 
 
+def _cv_decodable(path: Path) -> bool:
+    """Can OpenCV read a frame of ``path``? True when OpenCV is absent (nothing to protect)."""
+    try:
+        import cv2  # noqa: PLC0415
+    except Exception:  # ImportError or a broken wheel: the cv2-based fields degrade on their own
+        return True
+    cap = cv2.VideoCapture(str(path))
+    try:
+        return bool(cap.isOpened() and cap.read()[0])
+    finally:
+        cap.release()
+
+
+def _make_decodable(path: Path, info: dict) -> tuple[Path, dict, str | None]:
+    """Transcode media OpenCV cannot decode (e.g. AV1) to H.264 in place, once; it stays the
+    breakdown's pinned media. Returns ``(path, info, note)``; on failure the original is kept."""
+    if _cv_decodable(path):
+        return path, info, None
+    codec = info.get("codec") or "unknown"
+    tmp = path.with_name("media.transcode.mp4")
+    try:
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+                        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(tmp)],
+                       check=True, capture_output=True, timeout=7200)
+        new_info = probe(tmp)
+        if not new_info or not _cv_decodable(tmp):
+            raise RuntimeError("transcoded copy is not readable")
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        tmp.unlink(missing_ok=True)
+        return path, info, (f"media codec {codec} cannot be decoded by OpenCV and transcoding failed "
+                            f"({type(exc).__name__}): camera, look, typography and motion not determined")
+    dest = path.with_name("media.mp4")
+    path.unlink(missing_ok=True)
+    tmp.replace(dest)
+    return dest, new_info, f"media codec {codec} transcoded to H.264 for frame analysis (timing unchanged)"
+
+
 def _result(path: Path, info: dict, source: str) -> dict:
+    path, info, note = _make_decodable(path, info)
+    if note:
+        info = {**info, "media_note": note}
     return {"path": str(path), **info, "low_resolution": info["height"] < LOW_RES_HEIGHT, "source": source}
 
 

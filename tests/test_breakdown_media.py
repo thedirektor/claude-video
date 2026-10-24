@@ -176,3 +176,37 @@ def test_motion_clip(tmp_path):
     gt = make_motion_clip(p, fps=60)
     assert gt == {"start": 0.2, "end": 0.7, "trans": "CUBIC", "ease": "OUT"}
     assert _probe(p, "-select_streams", "v", "-show_entries", "stream=r_frame_rate") == ["60/1"]
+
+
+def test_av1_media_transcoded_for_opencv(conn, tmp_path):
+    """Real-media e2e regression: YouTube served AV1, which OpenCV's bundled ffmpeg cannot decode,
+    so every cv2 field came out not determined. ensure_media now transcodes it to H.264 once."""
+    cv2 = pytest.importorskip("cv2")
+    root = tmp_path / "st"
+    _video_row(conn, KEY_A)
+    vdir = store.video_dir(root, KEY_A)
+    vdir.mkdir(parents=True)
+    src = tmp_path / "src.mp4"
+    make_reference(src, fps=25)
+    av1 = vdir / "media.mkv"
+    res = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+                          "-c:v", "libsvtav1", "-preset", "12", "-c:a", "copy", str(av1)], capture_output=True)
+    if res.returncode:
+        pytest.skip("no AV1 encoder in this ffmpeg")
+    cap = cv2.VideoCapture(str(av1))
+    if cap.isOpened() and cap.read()[0]:
+        pytest.skip("this OpenCV decodes AV1; nothing to transcode")
+    info = media.ensure_media(conn, KEY_A, store_dir=root, fetch=lambda *a, **k: pytest.fail("no fetch"))
+    assert info["path"] == str(vdir / "media.mp4") and not av1.exists()
+    assert info["codec"] == "h264" and "transcoded to H.264" in info["media_note"]
+    assert abs(info["duration"] - 7.0) < 0.1 and info["has_audio"] is True
+    cap = cv2.VideoCapture(info["path"])
+    assert cap.read()[0]
+    assert sorted(p.name for p in vdir.glob("media.*")) == ["media.mp4"]
+    # second call: already decodable, nothing redone
+    again = media.ensure_media(conn, KEY_A, store_dir=root, fetch=lambda *a, **k: pytest.fail("no fetch"))
+    assert again["path"] == info["path"] and "media_note" not in again
+
+
+def test_fetch_prefers_h264():
+    assert media.FETCH_FORMAT.startswith("bv*[vcodec^=avc1]")

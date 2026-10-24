@@ -329,6 +329,8 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
     has_media = bool(m.get("path"))
     if m.get("fps_note"):
         _add_note(notes, m["fps_note"])
+    if m.get("media_note"):
+        _add_note(notes, m["media_note"])
 
     raw: list[dict] = []
     entries: list[dict] = []
