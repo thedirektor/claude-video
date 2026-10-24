@@ -573,3 +573,21 @@ def test_one_video_capture_per_detect_shots(strips, monkeypatch):
     S.detect_shots(series, 4.0)
     assert len(opened) == 1
     assert not any(k.startswith("_") for k in series), "no capture handle left in the series"
+
+
+@pytest.mark.parametrize("v", [2, 3, 4])
+def test_cut_between_two_slowly_drifting_shots_is_kept(mont, v):
+    """The music video's real cut at 59.36 s sits in a slow drift (~1.4 px/frame at 160 px) and its phase
+    correlation reads a small shift close to the drift, so the shift test alone took it for the slide.
+    Here a drifting strip cuts to a drifting negative: the cut step's shift is near the drift but the
+    slide-compensated picture differs completely, so the cut stays at full confidence."""
+    a = _pan(mont, "c", 50, v, 0, 1, f"dr_a{v}.mp4")
+    q = mont / f"dr_b{v}.mp4"
+    _ff("-loop", "1", "-framerate", "25", "-i", str(mont / "c.png"), "-frames:v", "50",
+        "-vf", f"crop=320:180:150+n*{v}:0,negate", *_ENC, str(q))
+    p = mont / f"drift{v}.mp4"
+    _ff("-i", str(a), "-i", str(q), "-filter_complex", "concat=n=2:v=1", *_ENC, str(p))
+    found = S.detect_shots(S.frame_series(str(p), 25), 4.0)
+    bounds = [(s["boundary"]["kind"], round(s["boundary"]["t"], 2), s["boundary"]["evidence"]["confidence"])
+              for s in found if s["boundary"]]
+    assert bounds == [("cut", 2.0, 1.0)], bounds
