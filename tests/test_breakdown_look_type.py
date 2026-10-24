@@ -43,7 +43,18 @@ def test_letterbox_measured(tmp_path):
                     "testsrc=s=640x360:r=25:d=2", "-vf", "drawbox=x=0:y=0:w=640:h=45:color=black:t=fill,"
                     "drawbox=x=0:y=315:w=640:h=45:color=black:t=fill,format=yuv420p", str(p)], check=True)
     lb = L.shot_look(str(p), {"start": 0.0, "end": 2.0})["letterbox"]
-    assert lb and abs(lb["top"] - 0.125) < 0.03 and abs(lb["bottom"] - 0.125) < 0.03
+    # 45 px bars on 360 rows read 0.125 exactly (the 64 px work width used to quantise them to 0.111)
+    assert lb and abs(lb["top"] - 0.125) < 0.004 and abs(lb["bottom"] - 0.125) < 0.004, lb
+
+
+def test_letterbox_odd_bar_sizes_are_measured_at_full_resolution(tmp_path):
+    import subprocess
+    p = tmp_path / "lb2.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc=s=1280x720:r=25:d=2", "-vf", "drawbox=x=0:y=0:w=1280:h=70:color=black:t=fill,"
+                    "drawbox=x=0:y=670:w=1280:h=50:color=black:t=fill,format=yuv420p", str(p)], check=True)
+    lb = L.shot_look(str(p), {"start": 0.0, "end": 2.0})["letterbox"]
+    assert lb and abs(lb["top"] - 70 / 720) < 0.004 and abs(lb["bottom"] - 50 / 720) < 0.004, lb
 
 
 def test_look_without_cv2(ref, monkeypatch):
@@ -90,7 +101,7 @@ def test_pillarbox_measured(tmp_path):
                     "testsrc=s=640x360:r=25:d=2", "-vf", "drawbox=x=0:y=0:w=80:h=360:color=black:t=fill,"
                     "drawbox=x=560:y=0:w=80:h=360:color=black:t=fill,format=yuv420p", str(p)], check=True)
     lb = L.shot_look(str(p), {"start": 0.0, "end": 2.0})["letterbox"]
-    assert lb and abs(lb["left"] - 0.125) < 0.03 and abs(lb["right"] - 0.125) < 0.03
+    assert lb and abs(lb["left"] - 0.125) < 0.004 and abs(lb["right"] - 0.125) < 0.004, lb
     assert lb["top"] == 0.0 and lb["bottom"] == 0.0
 
 
@@ -160,3 +171,109 @@ def test_moving_background_never_invents_motion(tmp_path, name, extra):
             assert not t[k].startswith("slide") and t[k] != "scale", (name, t["text"], k, t[k])
         if "HELLO" in t["text"].upper():
             assert t["t_in"] >= 0.9, (name, t["text"], t["t_in"])
+
+
+# ---- 0.7.1 batch 2: punch words shorter than the OCR step, one-sample tracks, OCR cost ----
+@pytest.mark.parametrize("a,b", [(1.1, 1.4), (2.12, 2.34)], ids=["0.3s", "0.22s"])
+def test_title_shorter_than_ocr_step_is_found(tmp_path, a, b):
+    t = _only(_title_clip(tmp_path / "s.mp4", f"x=40:enable='between(t,{a},{b})'"))
+    assert abs(t["t_in"] - a) <= 0.12 and abs(t["t_out"] - b) <= 0.12, t
+    assert t["evidence"]["method"] == "ocr" and t["evidence"]["confidence"] > 0
+
+
+def test_no_title_means_no_extra_tracks_and_few_extra_ocr_calls(tmp_path, monkeypatch):
+    import subprocess
+    p = tmp_path / "plain.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc2=s=640x360:r=25:d=6", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)], check=True)
+    calls, in_sampling = [], []
+    orig, orig_sample = TY._detect, TY._sample
+    monkeypatch.setattr(TY, "_detect", lambda ocr, img, cv2: (calls.append(1), orig(ocr, img, cv2))[1])
+
+    def counted_sample(*a, **kw):
+        res = orig_sample(*a, **kw)
+        in_sampling.append(len(calls))
+        return res
+    monkeypatch.setattr(TY, "_sample", counted_sample)
+    tracks, notes = TY.text_tracks(str(p), 6.0)
+    assert notes == []
+    # 12 base samples plus a bounded budget of extras (0.6 per base sample + 4) even on a cluttered picture
+    assert in_sampling[0] <= 12 + int(TY.EXTRA_SHARE * 12) + TY.EXTRA_MIN, in_sampling
+
+
+def test_one_sample_track_gets_entrance_and_exit(tmp_path):
+    # visible 1.35-1.7: exactly one OCR sample (t=1.5) sees it
+    t = _only(_title_clip(tmp_path / "one.mp4", "x=40:enable='between(t,1.35,1.7)'"))
+    assert t["evidence"]["samples"] == 1, t["evidence"]
+    assert t["entrance"] == "cut" and t["exit"] == "cut", (t["entrance"], t["exit"])
+
+
+def test_detect_downscales_tall_frames_for_ocr():
+    import numpy as np
+    seen = {}
+
+    class FakePT:
+        class Output:
+            DICT = "dict"
+
+        @staticmethod
+        def image_to_data(pil, output_type=None, config=None):
+            seen["size"] = pil.size
+            return {"text": ["HELLO"], "conf": ["90"], "block_num": [1], "par_num": [1], "line_num": [1],
+                    "left": [100], "top": [50], "width": [200], "height": [40]}
+
+    from PIL import Image
+    import cv2
+    img = np.zeros((2160, 3840, 3), np.uint8)
+    out = TY._detect((FakePT, Image), img, cv2)
+    assert seen["size"][1] <= 720 and seen["size"][0] == round(3840 * seen["size"][1] / 2160)
+    w, h = seen["size"]
+    assert abs(out[0]["box"][0] - 100 / w) < 1e-9 and abs(out[0]["box"][3] - 40 / h) < 1e-9
+
+
+def test_unchanged_frames_are_not_re_ocrd(tmp_path, monkeypatch):
+    path = _title_clip(tmp_path / "static.mp4", "x=40:enable='between(t,1,4)'")
+    calls, in_sampling = [], []
+    orig, orig_sample = TY._detect, TY._sample
+    monkeypatch.setattr(TY, "_detect", lambda ocr, img, cv2: (calls.append(1), orig(ocr, img, cv2))[1])
+
+    def counted_sample(*a, **kw):
+        res = orig_sample(*a, **kw)
+        in_sampling.append(len(calls))
+        return res
+    monkeypatch.setattr(TY, "_sample", counted_sample)
+    tracks, _ = TY.text_tracks(path, 5.0)
+    assert [t for t in tracks if "HELLO" in t["text"].upper()]
+    # 10 base samples used to be 10 OCR runs; a still picture needs one per change
+    assert in_sampling[0] <= 4, in_sampling
+
+
+def test_brief_piece_of_a_longer_line_is_dropped_wherever_it_sits():
+    full = {"text": "HELLO WORLD", "t_in": 1.0, "t_out": 5.0, "box": [0.07, 0.11, 0.6, 0.1],
+            "evidence": {"samples": 8}}
+    piece = {"text": "HELLO", "t_in": 1.18, "t_out": 1.22, "box": [0.69, 0.1, 0.3, 0.16], "evidence": {"samples": 1}}
+    long_other = {"text": "HELLO", "t_in": 1.5, "t_out": 4.0, "box": [0.69, 0.1, 0.3, 0.16], "evidence": {"samples": 6}}
+    assert [t["text"] for t in TY._drop_fragments([full, piece])] == ["HELLO WORLD"]
+    assert len(TY._drop_fragments([full, long_other])) == 2  # a sustained, separately placed line stays
+
+
+def test_title_survives_the_ocr_downscale_on_a_1080p_source(tmp_path):
+    t_ = _title_clip(tmp_path / "hd.mp4", "x=120:enable='between(t,1,3)'", size="150",
+                     src="color=c=navy:s=1920x1080:r=25:d=4")
+    tracks, notes = TY.text_tracks(t_, 4.0)
+    hit = [t for t in tracks if "HELLO" in t["text"].upper() and "WORLD" in t["text"].upper()]
+    assert notes == [] and hit, tracks
+    assert abs(hit[0]["t_in"] - 1.0) <= 0.1 and 0.1 < hit[0]["height_rel"] < 0.2
+
+
+def test_bisect_probes_read_only_a_crop_around_the_text(tmp_path, monkeypatch):
+    path = _title_clip(tmp_path / "crop.mp4", "x=40:enable='between(t,1.2,3.3)'")
+    shapes = []
+    orig = TY._detect
+    monkeypatch.setattr(TY, "_detect", lambda ocr, img, cv2: (shapes.append(img.shape[:2]), orig(ocr, img, cv2))[1])
+    t = _only(path)
+    full = [s for s in shapes if s == (360, 640)]
+    crops = [s for s in shapes if s != (360, 640)]
+    assert crops and len(crops) >= 6, shapes  # the bisect probes
+    assert all(c[0] * c[1] < 0.5 * 360 * 640 for c in crops)
+    assert abs(t["t_in"] - 1.2) <= 0.1 and abs(t["t_out"] - 3.3) <= 0.1

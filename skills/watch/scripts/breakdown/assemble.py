@@ -33,7 +33,8 @@ NOTE_CHARS = 2000
 MAX_TILES = 48
 EPS = 1e-6
 BRIEF_MIN_TEXT_CONF = 0.5  # OCR tracks below this are listed in breakdown.json only
-SAMPLING_NOTE = f"sampled every {typography.STEP_S:g} s; shorter or stylised text may be missed"
+SAMPLING_NOTE = (f"sampled every {typography.STEP_S:g} s, with a word-shape scan every {typography.SCAN_S:g} s that "
+                 "reads extra frames for short titles; very brief, low-contrast or stylised text may still be missed")
 BLIND_SPOT_NOTE = ("dissolves between two moving shots can go undetected and jump cuts within one framing "
                    "may be merged: cuts and shots are what was measured")
 HOLD_MIN_S = 0.5  # a black / white hold this long between two fades is its own shot (0.7.0 ruling)

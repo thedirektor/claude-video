@@ -1,23 +1,30 @@
 """On-screen text tracks from OCR (pytesseract) sampled every ``step`` seconds.
 
-Per-line detections are merged into tracks (same normalised text on adjacent samples). In/out times are refined by bisecting between the last
-sample that saw the text and the next one that did not. Font family is always
-``"not determined"``; size (``height_rel``), colour, position and timing are
-measured. Entrance and exit come from pixels: every frame around the text's
-appearance is diffed against a text-free background frame and the changed
-region's box and contrast ramp are classified (cut / fade / slide_* / scale);
-anything unclear is ``"not determined"``. ``slide_left`` means the text moves
+The video is decoded once, sequentially. Every ``step`` seconds the frame is read by tesseract
+(downscaled to at most 720 px tall; a frame that did not change since the last OCR'd one reuses
+that result). Between those samples a cheap text-likeness scan (every 0.1 s: edge blobs shaped
+like words) triggers an extra OCR when a new word-shaped blob appears and persists for two scan
+frames, so punch-word titles shorter than ``step`` are found; the extras are budgeted.
+
+Per-line detections are merged into tracks (same normalised text on adjacent samples). In/out
+times are first bisected between the last sample that saw the text and the next one that did not
+(the bisected boundary also bounds the settle window of a one-sample track), then replaced by the
+pixel-accurate animation time when the entrance / exit can be measured. Font family is always
+``"not determined"``; size (``height_rel``), colour, position and timing are measured. Entrance
+and exit come from pixels: every frame around the text's appearance is diffed against a text-free
+background frame and the changed region's box and contrast ramp are classified (cut / fade /
+slide_* / scale); anything unclear is ``"not determined"``. ``slide_left`` means the text moves
 leftwards. The per-sample OCR boxes are kept in ``evidence["box_track"]``.
 """
 from __future__ import annotations
 
 import math
 import re
+from bisect import bisect_right
 
 NOT_DETERMINED = "not determined"
 MIN_CONF = 60
 STEP_S = 0.5  # OCR sampling interval
-IOU_MERGE = 0.6
 REFINE_STEPS = 4
 WORK_W = 320
 MASK_T = 12  # grey-level change that counts as text pixels
@@ -30,6 +37,16 @@ POST_MAX = 0.002  # share of crop pixels allowed to change across those frames
 TOP_STD_MAX = 35.0  # spread of the text-colour pixels (per channel) above which they are not one colour
 RING_STD_MAX = 30.0  # busy surroundings: a sampled colour would be a guess
 COLOR_CONTRAST_MIN = 90.0  # RGB distance between text and background below which the colour is unreliable
+OCR_MAX_H = 720  # frames taller than this are downscaled before OCR
+SCAN_S = 0.1  # text-likeness scan cadence between OCR samples
+SCAN_W = 320  # scan / change-detection work width
+UNCHANGED_MAX = 0.0002  # share of pixels changed (> MASK_T) below which a frame counts as unchanged
+EXTRA_SHARE = 0.6  # extra OCR runs allowed per base sample (plus EXTRA_MIN) ...
+EXTRA_MIN = 4
+EXTRA_PER_INTERVAL = 2  # ... and at most this many inside one base interval
+EXTRA_GAP_S = 0.15  # no extra OCR this soon after another OCR run
+NEW_BLOB_MIN = 0.0015  # share of the frame covered by new, persistent word-shaped blobs to trigger an extra OCR
+GRAD_T = 48  # morphological gradient above which a pixel is an edge
 BG_MOVE_MAX = 0.02  # share of off-band crop pixels allowed to change before text is 'animating'
 
 
@@ -77,9 +94,13 @@ def _read(cap, cv2, t: float):
 def _detect(ocr, img, cv2) -> list[dict]:
     """Text lines in one BGR frame: [{"text","norm","box"(0-1)}]."""
     pt, Image = ocr
-    h, w = img.shape[:2]
     # grayscale: tesseract misses white-on-red text in colour but reads it in luma
-    pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if gray.shape[0] > OCR_MAX_H:  # OCR cost is quadratic in the frame size; boxes stay normalised
+        gray = cv2.resize(gray, (int(round(gray.shape[1] * OCR_MAX_H / gray.shape[0])), OCR_MAX_H),
+                          interpolation=cv2.INTER_AREA)
+    h, w = gray.shape[:2]
+    pil = Image.fromarray(gray)
     d = pt.image_to_data(pil, output_type=pt.Output.DICT, config="--psm 11")
     lines: dict = {}
     for i, raw in enumerate(d["text"]):
@@ -108,19 +129,36 @@ def _detect(ocr, img, cv2) -> list[dict]:
     return out
 
 
-def _present(ocr, cv2, cap, t: float, norm: str) -> bool:
+PROBE_MARGIN = 0.6  # crop margin (as a share of the box size) around the text for bisect probes
+
+
+def _crop(img, box):
+    h, w = img.shape[:2]
+    mx, my = max(0.04, box[2] * PROBE_MARGIN), max(0.04, box[3] * PROBE_MARGIN * 2)
+    x0, y0 = max(0, int((box[0] - mx) * w)), max(0, int((box[1] - my) * h))
+    x1, y1 = min(w, int(math.ceil((box[0] + box[2] + mx) * w))), min(h, int(math.ceil((box[1] + box[3] + my) * h)))
+    return img[y0:y1, x0:x1]
+
+
+def _present(ocr, cv2, cap, t: float, norm: str, box=None) -> bool:
+    """Is the line ``norm`` on screen at ``t``? With ``box`` only a crop around it is read: a
+    bisect probe asks about one known line, not about the whole frame."""
     img = _read(cap, cv2, t)
     if img is None:
         return False
+    if box is not None:
+        crop = _crop(img, box)
+        if crop.size:
+            img = crop
     return any(d["norm"] == norm for d in _detect(ocr, img, cv2))
 
 
-def _bisect(ocr, cv2, cap, t_seen: float, t_unseen: float, norm) -> float:
+def _bisect(ocr, cv2, cap, t_seen: float, t_unseen: float, norm, box=None) -> float:
     """Boundary between a time the text is seen and one it is not."""
     lo, hi = t_seen, t_unseen
     for _ in range(REFINE_STEPS):
         mid = (lo + hi) / 2.0
-        if _present(ocr, cv2, cap, mid, norm):
+        if _present(ocr, cv2, cap, mid, norm, box):
             lo = mid
         else:
             hi = mid
@@ -282,14 +320,23 @@ _FLIP = {"slide_left": "slide_right", "slide_right": "slide_left", "slide_up": "
 _SETTLE_AT = (0.5, 0.25, 0.75)  # where in the stable-box span to look for a settled frame
 
 
-def _entrance(cv2, np, cap, fps, t_first, t_in_set, t_out_set, duration, box) -> tuple[str, float | None]:
-    """(class, animation start time) from the frames before the text settles."""
+_BISECT_MARGIN = 0.04  # a bisected boundary is only known to about this much: stay inside the text
+
+
+def _entrance(cv2, np, cap, fps, t_first, t_in_set, t_out_set, duration, box,
+              t_out_cap: float | None = None) -> tuple[str, float | None]:
+    """(class, animation start time) from the frames before the text settles.
+
+    The settle window runs to ``t_out_cap`` (the bisected end of the text) when that is later than
+    the last box sample, so a track seen by a single OCR sample still has frames after its text
+    settled to prove it did not move."""
     if not fps or fps <= 0 or t_first <= 0:
         return NOT_DETERMINED, None
     w0 = max(0.0, t_first - LEAD_S)
+    end = max(t_out_set, t_out_cap - 2.0 / fps) if t_out_cap is not None else t_out_set  # _gray_frames reads up to 2 frames past its end
     for frac in _SETTLE_AT:
         t_f = t_in_set + frac * (t_out_set - t_in_set)
-        frames = _gray_frames(cv2, cap, fps, w0, min(duration, t_out_set, t_f + POST_S), box)
+        frames = _gray_frames(cv2, cap, fps, w0, min(duration, end, t_f + POST_S), box)
         fi = next((i for i, (t, _) in enumerate(frames) if t >= t_f - 1e-6), None)
         if fi is None:
             continue
@@ -299,13 +346,16 @@ def _entrance(cv2, np, cap, fps, t_first, t_in_set, t_out_set, duration, box) ->
     return NOT_DETERMINED, None
 
 
-def _exit(cv2, np, cap, fps, t_in_set, t_out_set, t_end, duration, box) -> tuple[str, float | None]:
-    """(class, time the text is gone) from the frames after the text starts leaving."""
+def _exit(cv2, np, cap, fps, t_in_set, t_out_set, t_end, duration, box,
+          t_in_cap: float | None = None) -> tuple[str, float | None]:
+    """(class, time the text is gone) from the frames after the text starts leaving.
+    ``t_in_cap`` (the bisected start of the text) bounds the settle window from below."""
     if not fps or fps <= 0 or t_end >= duration - 1.0 / fps:
         return NOT_DETERMINED, None
+    start = min(t_in_set, t_in_cap + 1.0 / fps) if t_in_cap is not None else t_in_set  # ...and one frame before its start
     for frac in _SETTLE_AT:
         t_f = t_in_set + frac * (t_out_set - t_in_set)
-        frames = _gray_frames(cv2, cap, fps, max(t_in_set, t_f - POST_S), min(duration, t_end + TAIL_S), box)
+        frames = _gray_frames(cv2, cap, fps, max(start, t_f - POST_S), min(duration, t_end + TAIL_S), box)
         frames.reverse()
         fi = next((i for i, (t, _) in enumerate(frames) if t <= t_f + 1e-6), None)
         if fi is None:
@@ -318,7 +368,8 @@ def _exit(cv2, np, cap, fps, t_in_set, t_out_set, t_end, duration, box) -> tuple
 
 def _drop_fragments(tracks: list[dict]) -> list[dict]:
     """Drop a track whose text is a strict part of a longer track that overlaps it in time and
-    box (OCR sometimes reads one word of a line as its own, confidently read, line)."""
+    box (OCR sometimes reads one word of a line as its own, confidently read, line), or that
+    lasted only one or two samples entirely inside the longer track's lifetime."""
     def inside(a, b):
         iw = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
         ih = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
@@ -327,8 +378,16 @@ def _drop_fragments(tracks: list[dict]) -> list[dict]:
     keep = []
     for t in tracks:
         n = _norm(t["text"])
+        # a short-lived piece of a longer line read while that line animates (a word sliding in
+        # sits elsewhere than where the line settles), so the time span alone makes it a fragment
+        brief = t.get("evidence", {}).get("samples", 99) <= 2
+
+        def inside_in_time(o):
+            return o["t_in"] - 0.05 <= t["t_in"] and t["t_out"] <= o["t_out"] + 0.05
+
         frag = any(o is not t and len(_norm(o["text"])) > len(n) and n in _norm(o["text"])
-                   and min(t["t_out"], o["t_out"]) > max(t["t_in"], o["t_in"]) and inside(t["box"], o["box"])
+                   and min(t["t_out"], o["t_out"]) > max(t["t_in"], o["t_in"])
+                   and (inside(t["box"], o["box"]) or (brief and inside_in_time(o)))
                    for o in tracks)
         if not frag:
             keep.append(t)
@@ -360,19 +419,117 @@ def text_tracks(path: str, duration: float, step: float = STEP_S) -> tuple[list[
         return [], [f"typography failed ({type(exc).__name__}); not determined"]
 
 
+def _small_gray(cv2, img):
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = g.shape[:2]
+    return cv2.resize(g, (SCAN_W, max(2, int(round(h * SCAN_W / w)))), interpolation=cv2.INTER_AREA)
+
+
+def _textlike(cv2, np, g):
+    """Binary mask of word-shaped edge blobs (wide, short, reasonably filled) in a small gray frame."""
+    h = g.shape[0]
+    grad = cv2.morphologyEx(g, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
+    edges = (grad >= GRAD_T).astype(np.uint8)
+    joined = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1)))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    if n <= 1:
+        return np.zeros(g.shape, bool)
+    bw, bh, area = st[1:, cv2.CC_STAT_WIDTH], st[1:, cv2.CC_STAT_HEIGHT], st[1:, cv2.CC_STAT_AREA]
+    ok = (bh >= 3) & (bh <= 0.2 * h) & (bw >= 1.8 * bh) & (bw <= 0.9 * g.shape[1]) & (area >= 0.25 * bw * bh)
+    ids = np.nonzero(ok)[0] + 1
+    return np.isin(lab, ids) if len(ids) else np.zeros(g.shape, bool)
+
+
+def _new_blob(cv2, np, m0, m1, m2) -> bool:
+    """A word-shaped blob present in the last two scan frames (``m1``, ``m2``) but not before (``m0``)."""
+    if m1 is None or m2 is None:
+        return False
+    d = lambda m, k: cv2.dilate(m.astype(np.uint8), np.ones((k, k), np.uint8)).astype(bool)  # noqa: E731
+    new = m2 & d(m1, 5) & ~(d(m0, 7) if m0 is not None else np.zeros_like(m2))
+    return float(new.mean()) >= NEW_BLOB_MIN
+
+
+def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
+    """``[(t, detections)]`` in time order: one entry per base sample (every ``step``), plus the
+    extra OCR runs the text-likeness scan asked for between them.
+
+    One sequential decode. A base sample whose frame did not change since the last OCR run reuses
+    that run's detections. Falls back to seeking (no extras) when the source has no usable fps."""
+    nbase = int(math.ceil(duration / step - 1e-9)) if duration > 0 else 0
+    if not fps or fps <= 0:
+        cap = cv2.VideoCapture(path)
+        try:
+            out = []
+            for k in range(nbase):
+                t = round(k * step, 6)
+                img = _read(cap, cv2, t)
+                out.append((t, _detect(ocr, img, cv2) if img is not None else []))
+            return out
+        finally:
+            cap.release()
+    sub = max(1, int(math.ceil(step / SCAN_S - 1e-9)))
+    scan = step / sub
+    cap = cv2.VideoCapture(path)
+    out: list = []
+    try:
+        k, idx = 0, 0
+        last_g = None
+        last_dets: list = []
+        last_ocr_t = -1e9
+        masks: list = [None, None]  # scan masks k-2, k-1
+        extras_total, extras_here = 0, 0
+        budget = int(EXTRA_SHARE * nbase) + EXTRA_MIN
+        while k < nbase * sub:
+            ts = k * scan
+            if ts >= duration - 1e-9:
+                break
+            if not cap.grab():
+                break
+            t_frame = idx / fps
+            idx += 1
+            if t_frame < ts - 0.5 / fps:
+                continue
+            ok, img = cap.retrieve()
+            if not ok or img is None:
+                k += 1
+                continue
+            g = _small_gray(cv2, img)
+            m = _textlike(cv2, np, g)
+            base = k % sub == 0
+            if base:
+                extras_here = 0
+            run = False
+            if base:
+                run = last_g is None or last_g.shape != g.shape or float(
+                    (np.abs(g.astype(np.int16) - last_g.astype(np.int16)) > MASK_T).mean()) > UNCHANGED_MAX
+                if not run:
+                    out.append((round(ts, 6), list(last_dets)))
+            elif (extras_total < budget and extras_here < EXTRA_PER_INTERVAL and ts - last_ocr_t >= EXTRA_GAP_S
+                    and _new_blob(cv2, np, masks[0], masks[1], m)):
+                run = True
+                extras_total += 1
+                extras_here += 1
+            if run:
+                last_dets = _detect(ocr, img, cv2)
+                last_g, last_ocr_t = g, ts
+                out.append((round(ts, 6), list(last_dets)))
+            masks = [masks[1], m]
+            k += 1
+        return out
+    finally:
+        cap.release()
+
+
 def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
     cap = cv2.VideoCapture(path)
     try:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        times, t = [], 0.0
-        while t < duration - 1e-9:
-            times.append(round(t, 6))
-            t += step
+        samples = _sample(cv2, np, ocr, path, duration, step, fps)
+        stamps = [t for t, _ in samples]
         open_tracks: list[dict] = []
         done: list[dict] = []
-        for t in times:
-            img = _read(cap, cv2, t)
-            dets = _detect(ocr, img, cv2) if img is not None else []
+        for t, found in samples:
+            dets = list(found)
             still = []
             for tr in open_tracks:
                 cands = [d for d in dets if d["norm"] == tr["norm"]]
@@ -398,17 +555,21 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
             t_set_in, box = tr["boxes"][grp[0]]
             t_set_out = tr["boxes"][grp[-1]][0]
             t_first, t_last = tr["first"], tr["last"]
-            nxt = t_last + step
-            if nxt < duration - 1e-9:
-                t_out = _bisect(ocr, cv2, cap, t_last, nxt, tr["norm"])
-            else:
-                t_out = duration
-            prv = t_first - step
-            t_in = _bisect(ocr, cv2, cap, t_first, prv, tr["norm"]) if prv >= 0 else 0.0
-            entrance, a_in = _entrance(cv2, np, cap, fps, t_first, t_set_in, t_set_out, duration, box)
+            i_next = bisect_right(stamps, t_last + 1e-9)
+            nxt = stamps[i_next] if i_next < len(stamps) else None  # first sample after the text's last sighting
+            i_prev = bisect_right(stamps, t_first - 1e-9) - 1
+            prv = stamps[i_prev - 1] if i_prev >= 1 else None  # last sample before its first sighting
+            # the bisected boundaries are the fallback times AND bound the settle window of a
+            # track that only one or two OCR samples saw
+            t_out_b = _bisect(ocr, cv2, cap, t_last, nxt, tr["norm"], box) if nxt is not None else duration
+            t_in_b = _bisect(ocr, cv2, cap, t_first, prv, tr["norm"], box) if prv is not None else 0.0
+            t_in, t_out = t_in_b, t_out_b
+            entrance, a_in = _entrance(cv2, np, cap, fps, t_first, t_set_in, t_set_out, duration, box,
+                                       t_out_b - _BISECT_MARGIN)
             if a_in is not None:
                 t_in = a_in
-            ex, a_out = _exit(cv2, np, cap, fps, t_set_in, t_set_out, t_last + step, duration, box) if nxt < duration - 1e-9 \
+            ex, a_out = _exit(cv2, np, cap, fps, t_set_in, t_set_out, nxt, duration, box,
+                              t_in_b + _BISECT_MARGIN) if nxt is not None and nxt < duration - 1e-9 \
                 else (NOT_DETERMINED, None)
             if a_out is not None:
                 t_out = a_out

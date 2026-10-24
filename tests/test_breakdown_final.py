@@ -135,7 +135,7 @@ def test_no_text_brief_discloses_sampling(conn, one_shot):
     bd = assemble.build(conn, KEY, store_dir=one_shot)
     md = assemble.brief_md(bd)
     assert "No on-screen text found." not in md
-    assert "sampled every 0.5 s; shorter or stylised text may be missed" in md
+    assert assemble.SAMPLING_NOTE in md and "sampled every 0.5 s, with a word-shape scan every 0.1 s" in md
     assert "sampled every 0.5 s" in bd["typography"]["evidence"]["sampling"]
 
 

@@ -1,7 +1,7 @@
 """Per-shot look: palette, brightness, contrast, saturation, temperature, letterbox.
 
 Everything is measured on a handful of 64 px frames sampled inside the shot
-(numpy k-means for the palette). Without OpenCV/numpy the shot's look is
+(numpy k-means for the palette); letterbox bars are read at full resolution. Without OpenCV/numpy the shot's look is
 ``"not determined"`` with a note naming the dependency; nothing is guessed.
 """
 from __future__ import annotations
@@ -44,12 +44,15 @@ def shot_look(path: str, shot: dict) -> dict:
         return _nd(shot, f"look failed ({type(exc).__name__}); not determined")
 
 
-def _frames(cv2, path: str, shot: dict) -> list:
+def _frames(cv2, path: str, shot: dict) -> tuple[list, list]:
+    """``(small BGR frames, [(row max, column max) of the full-resolution luma])``. The bars are
+    read from the full-resolution profiles so that their size is not quantised by the 64 px work
+    width."""
     cap = cv2.VideoCapture(path)
     try:
         start, end = float(shot.get("start", 0.0)), float(shot.get("end", 0.0))
         span = max(end - start, 0.0)
-        out = []
+        out, prof = [], []
         for i in range(SAMPLES):
             t = start + span * (0.1 + 0.8 * i / (SAMPLES - 1))
             cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
@@ -57,8 +60,10 @@ def _frames(cv2, path: str, shot: dict) -> list:
             if not ok or img is None:
                 continue
             h, w = img.shape[:2]
+            g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            prof.append((g.max(axis=1), g.max(axis=0)))
             out.append(cv2.resize(img, (WORK_W, max(2, int(round(h * WORK_W / w)))), interpolation=cv2.INTER_AREA))
-        return out
+        return out, prof
     finally:
         cap.release()
 
@@ -116,11 +121,12 @@ def _bars(np, black):
     return lo / n, hi / n
 
 
-def _letterbox(np, grays):
-    """Bar sizes (fraction of height / width) black in every sampled frame, else None."""
-    gs = [g for g in grays if g.shape == grays[0].shape]
-    rows = np.all([(g.max(axis=1) < BLACK_LUMA) for g in gs], axis=0)
-    cols = np.all([(g.max(axis=0) < BLACK_LUMA) for g in gs], axis=0)
+def _letterbox(np, profiles):
+    """Bar sizes (fraction of height / width) black in every sampled frame, else None.
+    ``profiles`` are the full-resolution (row max, column max) luma of each frame."""
+    ps = [p for p in profiles if p[0].shape == profiles[0][0].shape and p[1].shape == profiles[0][1].shape]
+    rows = np.all([(r < BLACK_LUMA) for r, _ in ps], axis=0)
+    cols = np.all([(c < BLACK_LUMA) for _, c in ps], axis=0)
     if rows.all() or cols.all():
         return None
     (tf, bf), (lf, rf) = _bars(np, rows), _bars(np, cols)
@@ -132,7 +138,7 @@ def _letterbox(np, grays):
 
 
 def _measure(cv2, np, path: str, shot: dict) -> dict:
-    frames = _frames(cv2, path, shot)
+    frames, profiles = _frames(cv2, path, shot)
     if not frames:
         return _nd(shot, "no frames could be decoded for this shot; look not determined")
     rgb = np.concatenate([cv2.cvtColor(f, cv2.COLOR_BGR2RGB).reshape(-1, 3) for f in frames]).astype(np.float64) / 255.0
@@ -148,7 +154,7 @@ def _measure(cv2, np, path: str, shot: dict) -> dict:
         "contrast": round(float(luma.std()), 4),
         "saturation": round(float(hsv[:, 1].mean() / 255.0), 4),
         "temperature": temp,
-        "letterbox": _letterbox(np, grays),
+        "letterbox": _letterbox(np, profiles),
         "evidence": _evidence(shot, conf),
         "notes": [],
     }
