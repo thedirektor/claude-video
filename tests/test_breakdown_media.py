@@ -361,3 +361,32 @@ def test_over_cap_ladder_steps_down_to_480p_and_resets_when_cap_is_raised(conn, 
     monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", "2048")  # cap raised: back to the full-size format
     media.ensure_media(conn, KEY_A, store_dir=root)
     assert seen[-1] is None and not (vdir / media.OVER_CAP_MARKER).exists()
+
+
+def test_lowest_rung_over_cap_is_kept_and_pinned(conn, tmp_path, monkeypatch):
+    """At 480p there is nothing smaller to fetch: evicting the copy only restarts the cycle."""
+    root = tmp_path / "st"
+    _video_row(conn, KEY_A, url="https://example.com/clip")
+    vdir = store.video_dir(root, KEY_A)
+    monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", "0.001")
+    _over_cap_fetch(conn, root, tmp_path, monkeypatch, "0.001")      # full-size: over
+    for m in vdir.glob("media.*"):
+        m.unlink()
+
+    def fake_default(url, vd, fmt=None):
+        c = tmp_path / "dl" / f"r{fake_default.n}.mp4"
+        fake_default.n += 1
+        make_reference(c, with_audio=False)
+        return {"video_path": str(c)}
+    fake_default.n = 0
+    monkeypatch.setattr(media, "default_fetch", fake_default)
+    media.ensure_media(conn, KEY_A, store_dir=root)                  # 720p: over
+    for m in vdir.glob("media.*"):
+        m.unlink()
+    info = media.ensure_media(conn, KEY_A, store_dir=root)           # 480p: still over -> the floor
+    assert info["over_cap"] is True and "lowest rung" in info["media_note"]
+    assert media.pin(root, KEY_A) is True and media.is_pinned(root, KEY_A)
+    store.enforce_retention(conn, root, max_bytes=1)                 # even under pressure
+    assert list(vdir.glob("media.*"))
+    monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", "2048")      # a raised cap voids the floor
+    assert store.at_floor(vdir) is False

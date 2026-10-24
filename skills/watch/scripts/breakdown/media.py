@@ -18,7 +18,8 @@ from config import memory_paths
 from memory import store
 
 PINNED_MARKER = store.PINNED_MARKER
-OVER_CAP_MARKER = ".over_cap"  # the full-size fetch exceeded the cap once: refetch smaller next time
+FLOOR_RUNG = store.FLOOR_RUNG
+OVER_CAP_MARKER = store.OVER_CAP_MARKER  # the full-size fetch exceeded the cap once: refetch smaller next time
 LIGHT_FETCH_FORMAT = "bv*[vcodec^=avc1][height<=720]+ba/bv*[height<=720]+ba/b[height<=720]"
 LIGHTER_FETCH_FORMAT = "bv*[vcodec^=avc1][height<=480]+ba/bv*[height<=480]+ba/b[height<=480]"
 # H.264 first: OpenCV's bundled ffmpeg has no software AV1 decoder, so an AV1 download leaves
@@ -33,6 +34,9 @@ def pin(store_dir: Path, video_key: str) -> bool:
     vdir = store.video_dir(Path(store_dir), video_key)
     vdir.mkdir(parents=True, exist_ok=True)
     cap = store._breakdown_media_cap_bytes()
+    if store.at_floor(vdir):  # nothing smaller exists to fall back to: keep and pin this copy
+        (vdir / PINNED_MARKER).touch()
+        return True
     if any(m.stat().st_size > cap for m in vdir.glob("media.*") if m.is_file()):
         (vdir / PINNED_MARKER).unlink(missing_ok=True)  # a stale marker would claim an exemption it no longer has
         return False
@@ -261,9 +265,14 @@ def ensure_media(conn, video_key: str, store_dir: Path | None = None, fetch=None
                                          f"refetched at <={480 if rung >= 2 else 720}p")
                 if dest.stat().st_size > store._breakdown_media_cap_bytes():
                     vdir.mkdir(parents=True, exist_ok=True)
-                    (vdir / OVER_CAP_MARKER).write_text(f"{store._breakdown_media_cap_bytes()} {min(2, rung + 1)}")
+                    (vdir / OVER_CAP_MARKER).write_text(f"{store._breakdown_media_cap_bytes()} {min(FLOOR_RUNG, rung + 1)}")
                     res["over_cap"] = True
-                    res["media_note"] = ("fetched media exceeds WATCH_BREAKDOWN_MEDIA_MAX_MB: used for this "
+                    if rung >= FLOOR_RUNG - 1:  # a 480p fetch is still over the cap
+                        res["media_note"] = ("media exceeds WATCH_BREAKDOWN_MEDIA_MAX_MB at the lowest rung "
+                                             "(480p): kept and pinned anyway, the cap stays a policy for "
+                                             "the higher rungs")
+                    else:
+                        res["media_note"] = ("fetched media exceeds WATCH_BREAKDOWN_MEDIA_MAX_MB: used for this "
                                          "run but not pinned, so retention may evict it and a later run refetch it")
                 return res
     return _frames_only(row["duration"] if row else 0.0, vdir)

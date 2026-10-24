@@ -8,10 +8,9 @@ is ``"not determined"`` with confidence 0 -- never a guess.
 from __future__ import annotations
 
 import bisect
-import math
 import statistics
 
-from .shots import THUMB_H, THUMB_W, correlation as _correlation
+from .shots import THUMB_H, THUMB_W, correlation as _correlation, translating as _translating, blend_residual as _blend_residual
 
 NOT_DETERMINED = "not determined"
 DARK_Y = 28.0  # a fade need not reach legal black (16); real fades end near 20
@@ -22,12 +21,6 @@ MIN_FRAMES = 3
 MIN_DROP = 15.0
 RAMP_TOL = 1.0  # luma levels from the extreme at which a fade ramp counts as having arrived / left
 SAME_CONTENT = 0.8  # thumbnail correlation above which two frames are the same picture (a fade step)
-SHIFT_MAX = 9  # cap on the frame-to-frame translation tried, in thumbnail columns: past ~60% of the
-# width two frames no longer overlap enough to compare (faster moves: see shots._collapse_bursts)
-SHIFT_TRAVEL = 1.5  # a move across the window cannot exceed this many frame widths: bounds the per-step shift
-SHIFT_IMPROVE = 0.25  # a shift that explains a frame step this much better than no shift = motion
-SHIFT_MEDIAN = 0.4  # median improvement above which the in-between frames are a translating picture
-SHIFT_SHARE = 0.75  # share of frame steps that must improve for the same
 BLEND_TOL = 0.06  # mean abs thumbnail residual (0..1) allowed against a straight blend
 
 
@@ -50,21 +43,6 @@ def _extreme(series: dict, i: int) -> str | None:
     if len(thumb) == len(series["t"]) and statistics.pstdev(thumb[i]) >= UNIFORM_STD:
         return None
     return k
-
-
-def _blend_residual(thumb: list, i0: int, i1: int) -> float | None:
-    """Mean residual of in-between frames against the end-frame blend."""
-    a, b = thumb[i0], thumb[i1]
-    d = [y - x for x, y in zip(a, b)]
-    dd = sum(v * v for v in d)
-    if dd == 0 or i1 - i0 < 2:
-        return None
-    res = []
-    for i in range(i0 + 1, i1):
-        f = thumb[i]
-        alpha = max(0.0, min(1.0, sum((fv - x) * dv for fv, x, dv in zip(f, a, d)) / dd))
-        res.append(sum(abs(fv - (x + alpha * dv)) for fv, x, dv in zip(f, a, d)) / (255.0 * len(f)))
-    return sum(res) / len(res)
 
 
 def _walk(y: list[float], i: int, step: int, sign: int, cuts: frozenset = frozenset()) -> int:
@@ -107,68 +85,6 @@ def _on_ramp(y: list[float], c: int, thumb: list | None = None) -> bool:
         if corr is not None and corr < SAME_CONTENT:
             return False
     return True
-
-
-def _gray(th) -> list[list[float]]:
-    w = THUMB_W
-    return [[(th[(r * w + x) * 3] + th[(r * w + x) * 3 + 1] + th[(r * w + x) * 3 + 2]) / 3.0
-             for x in range(w)] for r in range(THUMB_H)]
-
-
-def _step_error(a, b, dx: float, dy: int) -> float | None:
-    """Mean abs difference of ``b`` against ``a`` shifted by (dx cols, dy rows); overlap only."""
-    tot, cnt = 0.0, 0
-    for r in range(THUMB_H):
-        r2 = r - dy
-        if not 0 <= r2 < THUMB_H:
-            continue
-        for x in range(THUMB_W):
-            xs = x - dx
-            if xs < 0 or xs > THUMB_W - 1:
-                continue
-            x0 = int(xs)
-            fx = xs - x0
-            x1 = min(THUMB_W - 1, x0 + 1)
-            tot += abs(b[r][x] - (a[r2][x0] * (1 - fx) + a[r2][x1] * fx))
-            cnt += 1
-    return tot / cnt / 255.0 if cnt >= 0.4 * THUMB_W * THUMB_H else None
-
-
-def _translating(thumb: list, i0: int, i1: int) -> bool:
-    """True when the frames of a window are one picture sliding: each step is explained far better
-    by a small shift than by no shift. A dissolve only cross-fades in place, so shifting never helps.
-
-    A pan over a soft scene also fits a straight blend (residual tiny), which is why the blend test
-    alone would call a whip pan between held framings a confident dissolve."""
-    g = [_gray(thumb[k]) for k in range(i0, i1 + 1)]
-    # the range scales with the window: a short window has to cover the same ground in fewer steps
-    reach = min(SHIFT_MAX, max(2, math.ceil(SHIFT_TRAVEL * THUMB_W / max(1, len(g) - 1))))
-    gains = []
-    for k in range(len(g) - 1):
-        base = _step_error(g[k], g[k + 1], 0.0, 0)
-        if not base or base < 1e-6:
-            gains.append(0.0)
-            continue
-        best, at = base, (0.0, 0)
-        for dy in (-1, 0, 1):  # coarse: whole columns
-            for dx in range(-reach, reach + 1):
-                if dx == 0 and dy == 0:
-                    continue
-                e = _step_error(g[k], g[k + 1], float(dx), dy)
-                if e is not None and e < best:
-                    best, at = e, (float(dx), dy)
-        if at != (0.0, 0):  # fine: quarter columns around the best whole shift
-            for step in (-0.75, -0.5, -0.25, 0.25, 0.5, 0.75):
-                e = _step_error(g[k], g[k + 1], at[0] + step, at[1])
-                if e is not None and e < best:
-                    best = e
-        gains.append(1.0 - best / base)
-    if not gains:
-        return False
-    gains_sorted = sorted(gains)
-    median = gains_sorted[len(gains_sorted) // 2]
-    share = sum(1 for v in gains if v > SHIFT_IMPROVE) / len(gains)
-    return median >= SHIFT_MEDIAN and share >= SHIFT_SHARE
 
 
 def _fades(series: dict, cuts: frozenset = frozenset()) -> tuple[list[dict], list[tuple[float, float]]]:

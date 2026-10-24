@@ -8,6 +8,7 @@ accurate because they come from per-frame timestamps, never from sampling.
 """
 from __future__ import annotations
 
+import math
 import re
 import statistics
 import subprocess
@@ -121,6 +122,7 @@ def frame_series(path: str, fps: float) -> dict:
     flush()
     series["thumb"] = _thumbs(path, len(series["t"]), pre)
     series["crop"] = crop
+    series["path"] = str(path)
     return series
 
 
@@ -199,6 +201,8 @@ def _flash_cuts(cands: list[int], strength: list[float], series: dict) -> set[in
     return drop
 
 
+HARD_STEP = 0.5  # share of a window's change that one frame may carry before it is a cut
+HARD_STEP_CONF = 0.7
 REFINE_ALPHA = 0.03  # a frame this close to either end frame (share of the blend) is still outside the dissolve
 REFINE_CONTEXT = 3  # stable frames on each side of the window used as the pure end frames
 
@@ -227,6 +231,148 @@ def _refine_window(thumb: list, i0: int, i1: int) -> tuple[int, int]:
     if r1 - r0 < GRADUAL_MIN_FRAMES:
         return i0, i1
     return r0, r1
+
+
+SHIFT_MAX = 9  # cap on the frame-to-frame translation tried, in thumbnail columns: past ~60% of the
+# width two frames no longer overlap enough to compare (faster moves: see shots._collapse_bursts)
+SHIFT_TRAVEL = 1.5  # a move across the window cannot exceed this many frame widths: bounds the per-step shift
+SHIFT_IMPROVE = 0.25  # a shift that explains a frame step this much better than no shift = motion
+SHIFT_MEDIAN = 0.4  # median improvement above which the in-between frames are a translating picture
+SHIFT_SHARE = 0.75  # share of frame steps that must improve for the same
+
+
+def _gray(th) -> list[list[float]]:
+    w = THUMB_W
+    return [[(th[(r * w + x) * 3] + th[(r * w + x) * 3 + 1] + th[(r * w + x) * 3 + 2]) / 3.0
+             for x in range(w)] for r in range(THUMB_H)]
+
+
+def _step_error(a, b, dx: float, dy: int) -> float | None:
+    """Mean abs difference of ``b`` against ``a`` shifted by (dx cols, dy rows); overlap only."""
+    tot, cnt = 0.0, 0
+    for r in range(THUMB_H):
+        r2 = r - dy
+        if not 0 <= r2 < THUMB_H:
+            continue
+        for x in range(THUMB_W):
+            xs = x - dx
+            if xs < 0 or xs > THUMB_W - 1:
+                continue
+            x0 = int(xs)
+            fx = xs - x0
+            x1 = min(THUMB_W - 1, x0 + 1)
+            tot += abs(b[r][x] - (a[r2][x0] * (1 - fx) + a[r2][x1] * fx))
+            cnt += 1
+    return tot / cnt / 255.0 if cnt >= 0.4 * THUMB_W * THUMB_H else None
+
+
+def translating(thumb: list, i0: int, i1: int) -> bool:
+    """True when the frames of a window are one picture sliding: each step is explained far better
+    by a small shift than by no shift. A dissolve only cross-fades in place, so shifting never helps.
+
+    A pan over a soft scene also fits a straight blend (residual tiny), which is why the blend test
+    alone would call a whip pan between held framings a confident dissolve."""
+    g = [_gray(thumb[k]) for k in range(i0, i1 + 1)]
+    # the range scales with the window: a short window has to cover the same ground in fewer steps
+    reach = min(SHIFT_MAX, max(2, math.ceil(SHIFT_TRAVEL * THUMB_W / max(1, len(g) - 1))))
+    gains = []
+    for k in range(len(g) - 1):
+        base = _step_error(g[k], g[k + 1], 0.0, 0)
+        if not base or base < 1e-6:
+            gains.append(0.0)
+            continue
+        best, at = base, (0.0, 0)
+        for dy in (-1, 0, 1):  # coarse: whole columns
+            for dx in range(-reach, reach + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                e = _step_error(g[k], g[k + 1], float(dx), dy)
+                if e is not None and e < best:
+                    best, at = e, (float(dx), dy)
+        if at != (0.0, 0):  # fine: quarter columns around the best whole shift
+            for step in (-0.75, -0.5, -0.25, 0.25, 0.5, 0.75):
+                e = _step_error(g[k], g[k + 1], at[0] + step, at[1])
+                if e is not None and e < best:
+                    best = e
+        gains.append(1.0 - best / base)
+    if not gains:
+        return False
+    gains_sorted = sorted(gains)
+    median = gains_sorted[len(gains_sorted) // 2]
+    share = sum(1 for v in gains if v > SHIFT_IMPROVE) / len(gains)
+    return median >= SHIFT_MEDIAN and share >= SHIFT_SHARE
+
+
+
+def blend_residual(thumb: list, i0: int, i1: int) -> float | None:
+    """Mean residual of in-between frames against the end-frame blend."""
+    a, b = thumb[i0], thumb[i1]
+    d = [y - x for x, y in zip(a, b)]
+    dd = sum(v * v for v in d)
+    if dd == 0 or i1 - i0 < 2:
+        return None
+    res = []
+    for i in range(i0 + 1, i1):
+        f = thumb[i]
+        alpha = max(0.0, min(1.0, sum((fv - x) * dv for fv, x, dv in zip(f, a, d)) / dd))
+        res.append(sum(abs(fv - (x + alpha * dv)) for fv, x, dv in zip(f, a, d)) / (255.0 * len(f)))
+    return sum(res) / len(res)
+
+
+
+PAN_MIN_PX = 1.2  # frame-to-frame translation (of a 160 px wide frame) that counts as moving
+PAN_MIN_RESPONSE = 0.1  # phase-correlation peak below which a shift is not trusted
+
+
+def _shift_at(cv2, np, cap, t: float, crop):
+    """(dx, dy) between two consecutive frames at ``t`` on a 160 px wide picture, or None."""
+    cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+    ok1, a = cap.read()
+    ok2, b = cap.read()
+    if not (ok1 and ok2) or a is None or b is None:
+        return None
+    gray = []
+    for img in (a, b):
+        h, w = img.shape[:2]
+        m = re.fullmatch(r"crop=(\d+):(\d+):(\d+):(\d+)", crop or "")
+        if m:
+            cw, ch, cx, cy = (int(v) for v in m.groups())
+            if cx + cw <= w and cy + ch <= h:
+                img, h, w = img[cy:cy + ch, cx:cx + cw], ch, cw
+        img = cv2.resize(img, (160, max(2, int(h * 160 / w))), interpolation=cv2.INTER_AREA)
+        gray.append(np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)))
+    win = cv2.createHanningWindow(gray[0].shape[::-1], cv2.CV_32F)
+    (dx, dy), resp = cv2.phaseCorrelate(gray[0], gray[1], win)
+    return (dx, dy) if resp >= PAN_MIN_RESPONSE else None
+
+
+def continuous_pan(series: dict, i_before: int, i_after: int) -> bool:
+    """True when the picture is already sliding the same way before frame ``i_before`` and still
+    sliding after ``i_after``: the span between is one continuous camera move, not an edit. A whip
+    between held framings starts and ends at rest, so it is not. Needs OpenCV and the media path."""
+    path = series.get("path")
+    t = series["t"]
+    if not path or i_before < 1 or i_after + 2 >= len(t):
+        return False
+    try:
+        import cv2  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+    except Exception:
+        return False
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return False
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        out = [_shift_at(cv2, np, cap, max(0.0, t[i] - 0.5 / fps), series.get("crop")) for i in (i_before - 1, i_after + 1)]
+    finally:
+        cap.release()
+    if None in out:
+        return False
+    (bx, by), (ax, ay) = out
+    axis = 0 if abs(bx) + abs(ax) >= abs(by) + abs(ay) else 1
+    b, a = out[0][axis], out[1][axis]
+    return abs(b) >= PAN_MIN_PX and abs(a) >= PAN_MIN_PX and b * a > 0
 
 
 def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
@@ -271,6 +417,16 @@ def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
             continue
         taken.append((i0, i1))
         r0, r1 = _refine_window(thumb, i0, i1)
+        steps = [_dist(thumb[k - 1], thumb[k]) for k in range(r0 + 1, r1 + 1)]
+        if steps and max(steps) >= HARD_STEP * cross:
+            # nearly all of the change is one frame: a hard cut between two moving pictures that the
+            # score missed, not a gradual boundary
+            k = r0 + 1 + steps.index(max(steps))
+            out.append({"kind": "cut", "t": t[k], "frames": 1, "t_start": t[k - 1], "t_end": t[k],
+                        "confidence": HARD_STEP_CONF})
+            continue
+        if continuous_pan(series, r0 - 3, r1 + 3):
+            continue  # one camera move through the window, still moving the same way after it
         out.append({"kind": "gradual", "t": round((t[r0] + t[r1]) / 2, 6), "frames": r1 - r0,
                     "t_start": t[r0], "t_end": t[r1],
                     "confidence": round(_clamp(0.4 + 0.08 * score), 3)})
@@ -395,6 +551,11 @@ def _collapse_bursts(series: dict, bounds: list[dict]) -> list[dict]:
                 lo = g[0][0]
             if keep and keep[-1] is last[1]:
                 hi = g[-1][0]
+        if not held or continuous_pan(series, lo - 3, hi + 3):
+            # no held picture either side, or the move carries on in the same direction after it:
+            # continuous motion, not an edit
+            drop.update(id(b) for _, b in g)
+            continue
         drop.update(id(b) for _, b in g)
         merged.append({"kind": "motion", "t": round((t[lo - 1] + t[hi]) / 2, 6), "frames": hi - lo + 1,
                        "t_start": t[lo - 1], "t_end": t[hi],
@@ -407,26 +568,33 @@ def _collapse_bursts(series: dict, bounds: list[dict]) -> list[dict]:
 
 
 def correlation(a, b) -> float | None:
-    """Pearson correlation of two thumbnails; None when either is flat."""
-    n = len(a)
-    ma, mb = sum(a) / n, sum(b) / n
-    va = sum((x - ma) ** 2 for x in a)
-    vb = sum((x - mb) ** 2 for x in b)
-    if va < 1e-9 or vb < 1e-9:
-        return None
-    return sum((x - ma) * (z - mb) for x, z in zip(a, b)) / (va * vb) ** 0.5
+    """Mean per-colour-channel Pearson correlation of two RGB thumbnails (interleaved bytes); None
+    when no channel has any spread. Per channel, because a single-colour frame is not "textured" just
+    because its R, G and B levels differ."""
+    cs = []
+    for c in range(3):
+        x, z = a[c::3], b[c::3]
+        n = len(x)
+        mx, mz = sum(x) / n, sum(z) / n
+        vx = sum((v - mx) ** 2 for v in x)
+        vz = sum((v - mz) ** 2 for v in z)
+        if vx < 36.0 * n or vz < 36.0 * n:  # spread under ~6 levels: a flat channel, its pattern is noise
+            continue
+        cs.append(sum((v - mx) * (w - mz) for v, w in zip(x, z)) / (vx * vz) ** 0.5)
+    return sum(cs) / len(cs) if cs else None
 
 
 SAME_PICTURE = 0.8  # frames either side of a "cut" correlating this well are one picture
 CUT_STAND_OUT = 2.5  # a cut's step must exceed the change around it by this factor
-SAME_PICTURE_CONF = 0.4
 
 
 def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
     """Cuts need a jump that stands out of the picture's own motion. A step under CUT_STAND_OUT x the
     median change within +-5 frames is the same picture moving (a brightness or position nudge, a
     fast gesture): no cut. Correlated frames on either side with a standing-out jump may still be a
-    jump cut inside one set, so that stays a cut at no more than SAME_PICTURE_CONF. Needs thumbnails."""
+    jump cut inside one set, but frames that correlate that well are the same picture, so it is
+    dropped as well (a 0.1 s sliver shot labelled cut was worse than the rare missed jump cut).
+    Needs thumbnails."""
     t, th = series["t"], series.get("thumb") or []
     if len(th) != len(t):
         return bounds
@@ -450,7 +618,7 @@ def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
             continue
         corr = correlation(th[i - 1], th[i])
         if corr is not None and corr >= SAME_PICTURE:
-            b = {**b, "confidence": min(b["confidence"], SAME_PICTURE_CONF)}
+            continue  # the same picture either side: a step inside one shot, not an edit
         out.append(b)
     return out
 

@@ -228,6 +228,20 @@ def _breakdown_media_cap_bytes() -> int:
         return 2048 * _MB
 
 
+OVER_CAP_MARKER = ".over_cap"  # "<cap bytes> <rung>": breakdown media fetched over the cap, see breakdown.media
+FLOOR_RUNG = 3  # a fetch at the lowest quality (480p) was still over the cap
+
+
+def at_floor(vdir: Path) -> bool:
+    """The media is the smallest copy there is and still exceeds the breakdown cap: retention keeps it
+    (evicting it would only make every later run fetch the same oversized file again)."""
+    try:
+        cap, rung = (int(x) for x in (Path(vdir) / OVER_CAP_MARKER).read_text().split())
+    except (OSError, ValueError):
+        return False
+    return rung >= FLOOR_RUNG and _breakdown_media_cap_bytes() <= cap
+
+
 def enforce_retention(conn, store_dir: Path, max_bytes: int | None = None,
                       protect: frozenset[str] = frozenset()) -> dict:
     """Evict media, then frames, in least-recently-accessed order until the
@@ -248,7 +262,8 @@ def enforce_retention(conn, store_dir: Path, max_bytes: int | None = None,
         vdir = video_dir(root, key)
         if not (vdir / PINNED_MARKER).exists():
             return []
-        return [m for m in vdir.glob("media.*") if _size(m) <= cap]
+        floor = at_floor(vdir)
+        return [m for m in vdir.glob("media.*") if floor or _size(m) <= cap]
 
     # Pinned media within its own per-video cap is outside the store budget.
     all_keys = [r[0] for r in conn.execute("SELECT video_key FROM videos")]
@@ -268,7 +283,7 @@ def enforce_retention(conn, store_dir: Path, max_bytes: int | None = None,
         pinned = (vdir / PINNED_MARKER).exists()
         for media in sorted(vdir.glob("media.*")):
             size = _size(media)
-            if pinned and size <= cap:
+            if pinned and (size <= cap or at_floor(vdir)):
                 continue
             media.unlink(missing_ok=True)
             total -= size

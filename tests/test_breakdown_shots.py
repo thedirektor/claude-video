@@ -315,12 +315,46 @@ def test_same_picture_nudge_is_not_a_cut_but_a_real_cut_stays():
     assert [round(b["t"] * 25) for b in out] == [20]
 
 
-def test_same_picture_jump_cut_is_demoted_not_dropped():
+# ------------------------------------------------------------------ fix round 3
+
+@pytest.fixture(scope="module")
+def strips(tmp_path_factory):
+    d = tmp_path_factory.mktemp("strips")
+    _ff("-f", "lavfi", "-i", "mandelbrot=s=4000x180:start_scale=0.05:start_x=-0.74:start_y=0.1", "-frames:v", "1", str(d / "a.png"))
+    _ff("-f", "lavfi", "-i", "testsrc2=s=4000x180:d=1", "-frames:v", "1", str(d / "b.png"))
+    return d
+
+
+def _pan(d, img, frames, v, start, sign, name):
+    q = d / name
+    x = f"{start}{'+' if sign > 0 else '-'}n*{v}"
+    _ff("-loop", "1", "-framerate", "25", "-i", str(d / f"{img}.png"), "-frames:v", str(frames),
+        "-vf", f"crop=320:180:{x}:0", *_ENC, str(q))
+    return q
+
+
+@pytest.mark.parametrize("v", [10, 20, 40])
+def test_hard_cut_between_two_pans_is_a_cut(strips, v):
+    """A hard cut between two moving pictures used to be read as a gradual boundary at 1.0."""
+    a, b = _pan(strips, "a", 50, v, 0, 1, f"ca{v}.mp4"), _pan(strips, "b", 50, v, 3000, -1, f"cb{v}.mp4")
+    p = strips / f"cut{v}.mp4"
+    _ff("-i", str(a), "-i", str(b), "-filter_complex", "concat=n=2:v=1", *_ENC, str(p))
+    found = S.detect_shots(S.frame_series(str(p), 25), 4.0)
+    kinds = [(s["boundary"]["kind"], round(s["boundary"]["t"], 2)) for s in found if s["boundary"]]
+    assert [k for k, _ in kinds] == ["cut"] and abs(kinds[0][1] - 2.0) <= 0.04, kinds
+
+
+@pytest.mark.parametrize("v", [10, 20, 40])
+def test_one_continuous_pan_is_one_shot(strips, v):
+    p = _pan(strips, "b", 50, v, 3000, -1, f"one{v}.mp4")
+    assert len(S.detect_shots(S.frame_series(str(p), 25), 2.0)) == 1
+
+
+def test_same_picture_frames_are_dropped_not_demoted():
     import random
     rnd = random.Random(8)
     base = [rnd.randrange(40, 200) for _ in range(432)]
     jump = [min(255, max(0, v + (60 if i % 7 == 0 else 0))) for i, v in enumerate(base)]
     thumbs = [bytes(base)] * 8 + [bytes(jump)] * 8
     series = {"t": [i / 25 for i in range(16)], "scene": [0.0] * 16, "yavg": [0.0] * 16, "thumb": thumbs}
-    out = S._vet_cuts(series, [_cut(series, 8)])
-    assert len(out) == 1 and out[0]["confidence"] <= S.SAME_PICTURE_CONF
+    assert S._vet_cuts(series, [_cut(series, 8)]) == []
