@@ -11,7 +11,7 @@ import bisect
 import math
 import statistics
 
-from .shots import THUMB_H, THUMB_W
+from .shots import THUMB_H, THUMB_W, correlation as _correlation
 
 NOT_DETERMINED = "not determined"
 DARK_Y = 28.0  # a fade need not reach legal black (16); real fades end near 20
@@ -87,17 +87,6 @@ def _walk(y: list[float], i: int, step: int, sign: int, cuts: frozenset = frozen
             i = j1
         else:
             return i
-
-
-def _correlation(a, b) -> float | None:
-    """Pearson correlation of two thumbnails; None when either is flat."""
-    n = len(a)
-    ma, mb = sum(a) / n, sum(b) / n
-    va = sum((x - ma) ** 2 for x in a)
-    vb = sum((x - mb) ** 2 for x in b)
-    if va < 1e-9 or vb < 1e-9:
-        return None
-    return sum((x - ma) * (z - mb) for x, z in zip(a, b)) / (va * vb) ** 0.5
 
 
 def _on_ramp(y: list[float], c: int, thumb: list | None = None) -> bool:
@@ -280,7 +269,8 @@ def classify(series: dict, shots: list[dict]) -> list[dict]:
             out.append(_entry(b["t"], "cut", 0.0, ev["t_start"], ev["t_end"], ev["confidence"]))
         elif b["kind"] == "gradual":
             out.append(_classify_gradual(series, b))
-        else:
-            out.append(_entry(b["t"], NOT_DETERMINED, 0.0, ev["t_start"], ev["t_end"], 0))
+        else:  # "motion" spans a move: its length is what was measured
+            span = ev["t_end"] - ev["t_start"] if b["kind"] == "motion" else 0.0
+            out.append(_entry(b["t"], NOT_DETERMINED, span, ev["t_start"], ev["t_end"], 0))
     out.sort(key=lambda e: e["t"])
     return out

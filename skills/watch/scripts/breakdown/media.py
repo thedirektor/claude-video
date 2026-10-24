@@ -19,7 +19,8 @@ from memory import store
 
 PINNED_MARKER = store.PINNED_MARKER
 OVER_CAP_MARKER = ".over_cap"  # the full-size fetch exceeded the cap once: refetch smaller next time
-LIGHT_FETCH_FORMAT = "bv*[vcodec^=avc1][height<=720]+ba/bv*[height<=720]+ba/b[height<=720]/b"
+LIGHT_FETCH_FORMAT = "bv*[vcodec^=avc1][height<=720]+ba/bv*[height<=720]+ba/b[height<=720]"
+LIGHTER_FETCH_FORMAT = "bv*[vcodec^=avc1][height<=480]+ba/bv*[height<=480]+ba/b[height<=480]"
 # H.264 first: OpenCV's bundled ffmpeg has no software AV1 decoder, so an AV1 download leaves
 # camera / look / typography / motion "not determined" (ensure_media transcodes as a fallback)
 FETCH_FORMAT = "bv*[vcodec^=avc1][height<=1080]+ba/bv*[height<=1080]+ba/b"
@@ -111,6 +112,19 @@ def probe(path: Path) -> dict | None:
         "has_audio": any(s.get("codec_type") == "audio" for s in streams),
         "codec": video.get("codec_name") or "",
     }
+
+
+def _over_cap_rung(vdir: Path) -> int:
+    """How many fetches in a row exceeded the cap (0 = none). The marker stores ``<cap bytes> <rung>``
+    and is void once the cap has been raised above what it recorded."""
+    try:
+        cap, rung = (int(x) for x in (vdir / OVER_CAP_MARKER).read_text().split())
+    except (OSError, ValueError):
+        return 1 if (vdir / OVER_CAP_MARKER).exists() else 0
+    if store._breakdown_media_cap_bytes() > cap:
+        (vdir / OVER_CAP_MARKER).unlink(missing_ok=True)
+        return 0
+    return rung
 
 
 def default_fetch(url: str, vdir: Path, fmt: str | None = None) -> dict | None:
@@ -218,10 +232,12 @@ def ensure_media(conn, video_key: str, store_dir: Path | None = None, fetch=None
     url = (row["url"] or row["source"]) if row else None
     if url and url.startswith(("http://", "https://")):
         fetcher = fetch or default_fetch
-        light = vdir.is_dir() and (vdir / OVER_CAP_MARKER).exists()
+        rung = _over_cap_rung(vdir) if vdir.is_dir() else 0
+        light = rung > 0
+        light_fmt = LIGHTER_FETCH_FORMAT if rung >= 2 else LIGHT_FETCH_FORMAT
         try:
             # once the full-size copy was over the cap, fetch the <=720p one instead of looping
-            got = fetcher(url, vdir, fmt=LIGHT_FETCH_FORMAT) if light and fetcher is default_fetch \
+            got = fetcher(url, vdir, fmt=light_fmt) if light and fetcher is default_fetch \
                 else fetcher(url, vdir)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
@@ -242,10 +258,10 @@ def ensure_media(conn, video_key: str, store_dir: Path | None = None, fetch=None
                     res["low_resolution"] = True
                 if light and fetcher is default_fetch:
                     res["media_note"] = ("full-size media exceeded WATCH_BREAKDOWN_MEDIA_MAX_MB earlier: "
-                                         "refetched at <=720p")
+                                         f"refetched at <={480 if rung >= 2 else 720}p")
                 if dest.stat().st_size > store._breakdown_media_cap_bytes():
                     vdir.mkdir(parents=True, exist_ok=True)
-                    (vdir / OVER_CAP_MARKER).touch()
+                    (vdir / OVER_CAP_MARKER).write_text(f"{store._breakdown_media_cap_bytes()} {min(2, rung + 1)}")
                     res["over_cap"] = True
                     res["media_note"] = ("fetched media exceeds WATCH_BREAKDOWN_MEDIA_MAX_MB: used for this "
                                          "run but not pinned, so retention may evict it and a later run refetch it")

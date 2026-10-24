@@ -387,3 +387,11 @@ def test_translation_search_scales_with_the_window():
                 px += [v, v, v]
         thumbs.append(bytes(px))
     assert T._translating(thumbs, 0, 5) is True
+
+
+def test_motion_boundary_duration_is_its_measured_span():
+    series = {"t": [i / 25 for i in range(10)], "scene": [0.0] * 10, "yavg": [100.0] * 10, "thumb": []}
+    shots = [{"index": 1, "boundary": {"kind": "motion", "t": 0.2, "frames": 5,
+                                       "evidence": {"t_start": 0.08, "t_end": 0.28, "confidence": 0.4}}}]
+    out = T.classify(series, shots)
+    assert out[0]["kind"] == T.NOT_DETERMINED and out[0]["duration"] == pytest.approx(0.2)

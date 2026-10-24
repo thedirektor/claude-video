@@ -264,3 +264,63 @@ def test_montage_of_unrelated_stills_keeps_every_cut(tmp_path):
     found = _shots(p, 59 / 25)
     kinds = [s["boundary"]["kind"] for s in found if s["boundary"]]
     assert kinds == ["cut"] * 4, kinds
+
+
+# ------------------------------------------------------------------ fix round 2
+
+def _flat_series(levels, fps=25):
+    """Thumbnails of one flat level each: the step between frames is exactly |dv| / 255."""
+    return {"t": [i / fps for i in range(len(levels))], "scene": [0.0] * len(levels),
+            "yavg": [float(v) for v in levels], "thumb": [bytes([v]) * 432 for v in levels]}
+
+
+def _cut(series, i, conf=1.0):
+    t = series["t"]
+    return {"kind": "cut", "t": t[i], "frames": 1, "t_start": t[i - 1], "t_end": t[i], "confidence": conf}
+
+
+def test_handheld_move_between_two_real_cuts_keeps_both_cuts():
+    """Held A -> cut -> ~1 s fast handheld motion with cut-like jumps -> cut -> held B: the bracketing
+    edits are real; only the move between them is not a set of cuts."""
+    levels = [100] * 10
+    levels.append(176)  # cut 1: step 76 (0.30), outer side held
+    for k in range(25):  # interior: steps 23-43 levels, a jump every third frame
+        levels.append(levels[-1] + (43 if k % 3 == 0 else 23) * (1 if k % 2 == 0 else -1))
+    levels.append(levels[-1] - 60)  # cut 2: step 60 (0.235)
+    levels += [levels[-1]] * 10
+    assert min(levels) >= 0 and max(levels) <= 255
+    series = _flat_series(levels)
+    first, last = 10, 10 + 26
+    jumps = [i for i in range(first + 1, last) if (i - first - 1) % 3 == 0]
+    bounds = [_cut(series, first)] + [_cut(series, i) for i in jumps] + [_cut(series, last)]
+    out = S._collapse_bursts(series, bounds)
+    assert [round(b["t"], 2) for b in out] == [round(series["t"][first], 2), round(series["t"][last], 2)]
+    assert all(b["kind"] == "cut" for b in out)
+    assert len(S.build_shots(out, len(levels) / 25)) == 3
+
+
+def test_same_picture_nudge_is_not_a_cut_but_a_real_cut_stays():
+    import random
+    rnd = random.Random(5)
+    base = [rnd.randrange(40, 200) for _ in range(432)]
+    other = [rnd.randrange(40, 200) for _ in range(432)]
+
+    def frame(pic, shift=0):
+        return bytes(max(0, min(255, v + shift + rnd.randint(-9, 9))) for v in pic)
+
+    thumbs = [frame(base) for _ in range(10)] + [frame(base, 14) for _ in range(10)]   # brightness nudge at 10
+    thumbs += [frame(other) for _ in range(10)]                                         # real cut at 20
+    series = {"t": [i / 25 for i in range(30)], "scene": [0.0] * 30, "yavg": [0.0] * 30, "thumb": thumbs}
+    out = S._vet_cuts(series, [_cut(series, 10), _cut(series, 20)])
+    assert [round(b["t"] * 25) for b in out] == [20]
+
+
+def test_same_picture_jump_cut_is_demoted_not_dropped():
+    import random
+    rnd = random.Random(8)
+    base = [rnd.randrange(40, 200) for _ in range(432)]
+    jump = [min(255, max(0, v + (60 if i % 7 == 0 else 0))) for i, v in enumerate(base)]
+    thumbs = [bytes(base)] * 8 + [bytes(jump)] * 8
+    series = {"t": [i / 25 for i in range(16)], "scene": [0.0] * 16, "yavg": [0.0] * 16, "thumb": thumbs}
+    out = S._vet_cuts(series, [_cut(series, 8)])
+    assert len(out) == 1 and out[0]["confidence"] <= S.SAME_PICTURE_CONF

@@ -374,14 +374,78 @@ def _collapse_bursts(series: dict, bounds: list[dict]) -> list[dict]:
             continue  # separate edits, however fast
         if not (held or flurry):
             continue  # ordinary footage in motion between two cuts
+        keep: list[dict] = []
+        if len(g) >= 3:  # real edits can bracket a move: a cut that stands out of the motion and has a
+            # held picture on its outer side stays a cut; only what lies between them is the move
+            interior = sorted(d[k] for k in range(g[0][0] + 1, g[-1][0]))
+            med = interior[len(interior) // 2] if interior else 0.0
+            first, last = g[0], g[-1]
+            if d[first[0]] >= 2 * med and first[0] - 1 >= 1 and d[first[0] - 1] < BURST_ACTIVE:
+                keep.append(first[1])
+                g = g[1:]
+            if len(g) >= 2 and d[last[0]] >= 2 * med and last[0] + 1 < n and d[last[0] + 1] < BURST_ACTIVE:
+                keep.append(last[1])
+                g = g[:-1]
+            if not g:
+                continue
+            if len(keep) == 2:  # a camera move inside one shot between two real cuts: no boundary
+                drop.update(id(b) for _, b in g)
+                continue
+            if keep and keep[0] is first[1]:
+                lo = g[0][0]
+            if keep and keep[-1] is last[1]:
+                hi = g[-1][0]
         drop.update(id(b) for _, b in g)
         merged.append({"kind": "motion", "t": round((t[lo - 1] + t[hi]) / 2, 6), "frames": hi - lo + 1,
                        "t_start": t[lo - 1], "t_end": t[hi],
                        "confidence": min(BURST_CONF, min(b["confidence"] for _, b in g))})
-    if not merged:
+    if not merged and not drop:
         return bounds
     out = [b for b in bounds if id(b) not in drop] + merged
     out.sort(key=lambda b: b["t"])
+    return out
+
+
+def correlation(a, b) -> float | None:
+    """Pearson correlation of two thumbnails; None when either is flat."""
+    n = len(a)
+    ma, mb = sum(a) / n, sum(b) / n
+    va = sum((x - ma) ** 2 for x in a)
+    vb = sum((x - mb) ** 2 for x in b)
+    if va < 1e-9 or vb < 1e-9:
+        return None
+    return sum((x - ma) * (z - mb) for x, z in zip(a, b)) / (va * vb) ** 0.5
+
+
+SAME_PICTURE = 0.8  # frames either side of a "cut" correlating this well are one picture
+CUT_STAND_OUT = 2.5  # a cut's step must exceed the change around it by this factor
+SAME_PICTURE_CONF = 0.4
+
+
+def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
+    """Cuts need a jump that stands out of the picture's own motion. A step under CUT_STAND_OUT x the
+    median change within +-5 frames is the same picture moving (a brightness or position nudge, a
+    fast gesture): no cut. Correlated frames on either side with a standing-out jump may still be a
+    jump cut inside one set, so that stays a cut at no more than SAME_PICTURE_CONF. Needs thumbnails."""
+    t, th = series["t"], series.get("thumb") or []
+    if len(th) != len(t):
+        return bounds
+    d = _steps(series)
+    pos = {round(x, 6): i for i, x in enumerate(t)}
+    out = []
+    for b in bounds:
+        i = pos.get(round(b["t"], 6)) if b["kind"] == "cut" else None
+        if i is None or i < 1:
+            out.append(b)
+            continue
+        near = sorted(d[k] for k in range(max(1, i - 5), min(len(d), i + 6)) if k != i)
+        med = near[len(near) // 2] if near else 0.0
+        if med > 0 and d[i] < CUT_STAND_OUT * med:
+            continue
+        corr = correlation(th[i - 1], th[i])
+        if corr is not None and corr >= SAME_PICTURE:
+            b = {**b, "confidence": min(b["confidence"], SAME_PICTURE_CONF)}
+        out.append(b)
     return out
 
 
@@ -392,7 +456,7 @@ def detect_shots(series: dict, duration: float) -> list[dict]:
     """Shots from a frame series. Empty list when nothing can be measured."""
     if not series or len(series.get("t", [])) < 2 or not duration or duration <= 0:
         return []
-    bounds = _collapse_bursts(series, _boundaries(series))
+    bounds = _vet_cuts(series, _collapse_bursts(series, _boundaries(series)))
     return build_shots(bounds, duration)
 
 

@@ -320,3 +320,44 @@ def test_pin_over_cap_removes_a_stale_marker(conn, tmp_path, monkeypatch):
     monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", "0.001")
     assert media.pin(root, KEY_A) is False
     assert not media.is_pinned(root, KEY_A)
+
+
+def test_light_formats_are_bounded():
+    assert not media.LIGHT_FETCH_FORMAT.endswith("/b") and media.LIGHT_FETCH_FORMAT.endswith("b[height<=720]")
+    assert media.LIGHTER_FETCH_FORMAT.endswith("b[height<=480]")
+
+
+def _over_cap_fetch(conn, root, tmp_path, monkeypatch, cap):
+    src = tmp_path / "dl" / "video.mp4"
+    src.parent.mkdir(exist_ok=True)
+    make_reference(src, with_audio=False)
+    monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", cap)
+    return media.ensure_media(conn, KEY_A, store_dir=root, fetch=lambda u, v: src)
+
+
+def test_over_cap_ladder_steps_down_to_480p_and_resets_when_cap_is_raised(conn, tmp_path, monkeypatch):
+    root = tmp_path / "st"
+    _video_row(conn, KEY_A, url="https://example.com/clip")
+    vdir = store.video_dir(root, KEY_A)
+    assert _over_cap_fetch(conn, root, tmp_path, monkeypatch, "0.001")["over_cap"] is True
+    for m in vdir.glob("media.*"):
+        m.unlink()
+    seen = []
+
+    def fake_default(url, vd, fmt=None):
+        seen.append(fmt)
+        c = tmp_path / "dl" / f"again{len(seen)}.mp4"
+        make_reference(c, with_audio=False)
+        return {"video_path": str(c)}
+
+    monkeypatch.setattr(media, "default_fetch", fake_default)
+    media.ensure_media(conn, KEY_A, store_dir=root)          # 2nd fetch: 720p, still over cap
+    for m in vdir.glob("media.*"):
+        m.unlink()
+    media.ensure_media(conn, KEY_A, store_dir=root)          # 3rd fetch: 480p
+    assert seen == [media.LIGHT_FETCH_FORMAT, media.LIGHTER_FETCH_FORMAT]
+    for m in vdir.glob("media.*"):
+        m.unlink()
+    monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", "2048")  # cap raised: back to the full-size format
+    media.ensure_media(conn, KEY_A, store_dir=root)
+    assert seen[-1] is None and not (vdir / media.OVER_CAP_MARKER).exists()
