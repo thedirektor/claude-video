@@ -200,7 +200,7 @@ def test_frames_only(conn, tmp_path, monkeypatch):
 
 def test_cli_formats_validated(conn, stored, monkeypatch, capsys):
     assert cli.main(["breakdown", KEY, "--formats", "nope"]) == 2
-    assert cli.main(["motion", "x"]) == 2
+    assert cli.main(["compare", "x"]) == 2  # not available yet
 
 
 def test_music_windows_half_music_half_silence(conn, tmp_path):

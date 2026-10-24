@@ -10,12 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import cost
 from config import memory_paths
 from memory import index, retrieval
 
-from . import assemble, interchange
+from . import assemble, interchange, media, motion
 
 EXIT_NOT_FOUND = 3
 EXIT_AMBIGUOUS = 4
@@ -78,7 +79,51 @@ def _cmd_breakdown(argv: list[str]) -> int:
     return 0
 
 
-COMMANDS = {"breakdown": _cmd_breakdown}
+def _cmd_motion(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="watch motion",
+                                 description="Track a region over a segment: phases, easing fit, engine snippets.")
+    ap.add_argument("video", help="video_key, URL/path or title fragment of an already watched video")
+    ap.add_argument("--start", type=float, required=True, help="segment start, seconds")
+    ap.add_argument("--end", type=float, required=True, help="segment end, seconds")
+    ap.add_argument("--region", default=None, help='"x,y,w,h" (normalised 0-1) or a short text resolved by OCR')
+    ap.add_argument("--px-per-unit", type=float, default=None, help="pixels per game unit, to convert displacements")
+    ap.add_argument("--json", action="store_true", help="print motion.json instead of the table")
+    a = ap.parse_args(argv)
+    if a.end <= a.start or a.start < 0:
+        print("[watch] --end must be after --start (both >= 0)", file=sys.stderr)
+        return 2
+    if a.px_per_unit is not None and a.px_per_unit <= 0:
+        print("[watch] --px-per-unit must be positive", file=sys.stderr)
+        return 2
+    conn = index.connect(memory_paths()["index_db"])
+    try:
+        try:
+            key = retrieval.resolve_video(conn, a.video)["video_key"]
+        except retrieval.VideoNotFound as exc:
+            print(f"[watch] {exc}. Run watch on it first.", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        except retrieval.AmbiguousVideo as exc:
+            print(f"[watch] {exc}", file=sys.stderr)
+            return EXIT_AMBIGUOUS
+        root = Path(memory_paths()["store_dir"])
+        # a follow-up call on a stored video may refetch evicted media (same as breakdown)
+        m = motion.analyze(conn, key, a.start, a.end, region=a.region, px_per_unit=a.px_per_unit,
+                           store_dir=root, fetch=media.default_fetch)
+        out_dir = assemble.breakdown_dir(conn, root, key) / f"motion-{a.start:g}-{a.end:g}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sn = motion.snippets(m)
+        (out_dir / "motion.json").write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
+        for name, text in sn.items():
+            (out_dir / name).write_text(text, encoding="utf-8")
+        media.pin(root, key)
+    finally:
+        conn.close()
+    print(json.dumps(m, ensure_ascii=False, indent=1) if a.json else sn["table.md"])
+    print(f"[watch] motion stored in {out_dir}", file=sys.stderr)
+    return 0
+
+
+COMMANDS = {"breakdown": _cmd_breakdown, "motion": _cmd_motion}
 
 
 def main(argv: list[str]) -> int:
