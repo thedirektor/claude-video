@@ -340,25 +340,82 @@ def _small_gray(cv2, np, img, crop):
     return np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
 
 
-def _pan_shifts(cv2, np, cap, t: list[float], lo: int, hi: int, crop) -> list[tuple[float, float, float]]:
-    """Phase-correlation ``(dx, dy, response)`` of every frame step ``lo..hi`` (frame k-1 -> k) on a
-    160 px wide picture, one seek and a sequential decode; shorter when the decode stops early."""
+PAN_OUTLIER = 3.0  # a step this many tolerances off the slide is a break in it, wherever it falls
+PAN_BREAK_RATIO = 3.0  # a step whose slide-compensated residual exceeds this many x the median ...
+PAN_BREAK_FLOOR = 0.02  # ... plus this (0..1 grey) is a picture the slide does not explain: a cut
+SLIDE_SPAN_FRAC = 0.4  # residual spans cover at most this share of the frame width of travel
+SLIDE_SPAN_MAX = 8
+SLIDE_RATIO = 2.0  # a window changing this much more than the slide around it (after compensation)
+SLIDE_FLOOR = 0.01  # ... plus this much (0..1 mean abs grey level) is a picture change, not the pan
+
+
+class _PanReader:
+    """One ``cv2.VideoCapture`` for every pan check of one ``detect_shots`` call (opening a capture per
+    cut cost a container probe each time)."""
+
+    def __init__(self, path: str):
+        self.path, self.cap, self.failed = path, None, False
+
+    def open(self, cv2):
+        if self.cap is None and not self.failed:
+            self.cap = cv2.VideoCapture(str(self.path))
+            if not self.cap.isOpened():
+                self.cap.release()
+                self.cap, self.failed = None, True
+        return self.cap
+
+    def close(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+
+def _pan_frames(cv2, np, cap, t: list[float], first: int, last: int, crop) -> list:
+    """Grey 160 px frames ``first..last``: one seek, then a sequential decode (shorter if it stops)."""
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t[lo - 1] - 0.5 / fps) * 1000.0)
+    cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t[first] - 0.5 / fps) * 1000.0)
     grays = []
-    for _ in range(hi - lo + 2):
+    for _ in range(last - first + 1):
         ok, img = cap.read()
         if not ok or img is None:
             break
         grays.append(_small_gray(cv2, np, img, crop))
+    return grays
+
+
+def _shifts_of(cv2, grays: list) -> list[tuple[float, float, float]]:
+    """Phase-correlation ``(dx, dy, response)`` of each consecutive pair."""
     if len(grays) < 2:
         return []
     win = cv2.createHanningWindow(grays[0].shape[::-1], cv2.CV_32F)
     out = []
     for a, b in zip(grays, grays[1:]):
-        (dx, dy), resp = cv2.phaseCorrelate(a, b, win)
+        # phaseCorrelate multiplies its inputs by the window in place: without copies every frame is
+        # windowed twice (once as b, once as a) and the frames are no longer the picture afterwards
+        (dx, dy), resp = cv2.phaseCorrelate(a.copy(), b.copy(), win)
         out.append((dx, dy, resp))
     return out
+
+
+def _with_capture(series: dict, fn):
+    """Run ``fn(cv2, np, cap)`` on the media; None when OpenCV, the path or the media is missing."""
+    path = series.get("path")
+    if not path:
+        return None
+    try:
+        import cv2  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+    except Exception:
+        return None
+    reader = series.get("_pan_reader")
+    if reader is not None:
+        cap = reader.open(cv2)
+        return None if cap is None else fn(cv2, np, cap)
+    cap = cv2.VideoCapture(str(path))
+    try:
+        return fn(cv2, np, cap) if cap.isOpened() else None
+    finally:
+        cap.release()
 
 
 class _Unclear:
@@ -376,54 +433,193 @@ UNCLEAR = _Unclear()
 PAN_UNCLEAR_NOTE = "picture moving through the window; one continuous pan could not be ruled out"
 
 
+def _slide(steps: list) -> tuple | None:
+    """(axis, speed, drift, tol) of a run of steps, or None when the picture is not moving."""
+    axis = 0 if sum(abs(s[0]) for s in steps) >= sum(abs(s[1]) for s in steps) else 1
+    speed = statistics.median(s[axis] for s in steps)
+    drift = statistics.median(s[1 - axis] for s in steps)
+    if abs(speed) < PAN_MIN_PX:
+        return None
+    return axis, speed, drift, max(PAN_TOL_PX, PAN_TOL * abs(speed))
+
+
+def _residual(cv2, np, a, b, dx: float, dy: float) -> float | None:
+    """Mean abs grey difference (0..1) of ``b`` against ``a`` moved by (dx, dy), on their overlap."""
+    h, w = a.shape[:2]
+    moved = cv2.warpAffine(a, np.float32([[1, 0, dx], [0, 1, dy]]), (w, h))
+    x0, x1 = int(max(0.0, dx)) + 1, int(min(w, w + dx)) - 1
+    y0, y1 = int(max(0.0, dy)) + 1, int(min(h, h + dy)) - 1
+    if x1 - x0 < 0.3 * w or y1 - y0 < 0.3 * h:
+        return None
+    return float(np.mean(np.abs(moved[y0:y1, x0:x1] - b[y0:y1, x0:x1]))) / 255.0
+
+
 def continuous_pan(series: dict, i_before: int, i_after: int):
     """True when every frame step from ``i_before`` to ``i_after`` (clamped to the clip) is one picture
-    sliding the same way at about the same speed, including the step that carries the biggest picture
-    change (the would-be cut): one continuous camera move, not an edit. A whip between held framings
-    starts and ends at rest, and a real cut between two pans, even two pans the same way, jumps to an
-    unrelated shift at the cut, so neither is. None when the check could not run (no OpenCV / media
-    path / unreadable media) and ``UNCLEAR`` (falsy) when the picture moves but its shifts disagree:
-    callers cap a gradual boundary's confidence and say so."""
-    path = series.get("path")
+    sliding the same way at about the same speed: one continuous camera move, not an edit. A whip
+    between held framings starts and ends at rest (False). A step whose measured shift is off the
+    slide is re-checked by moving its first frame by the slide: a repeating texture can fool phase
+    correlation, but the slide still explains the picture; a real cut, even between two pans the same
+    way, does not. Any step that stays more than PAN_OUTLIER tolerances off breaks the slide wherever
+    it falls, so the verdict does not depend on the seek landing on the exact frame. None when the
+    check could not run (no OpenCV / media path / unreadable media); ``UNCLEAR`` (falsy) when the
+    picture moves but is not one unbroken slide: callers keep the boundary and cap a gradual one."""
     t = series["t"]
     lo, hi = max(1, i_before), min(len(t) - 1, i_after)
     if hi - lo + 1 < PAN_MIN_STEPS:
         return False  # too little picture around the window to show a move
-    if not path:
-        return None
-    try:
-        import cv2  # noqa: PLC0415
-        import numpy as np  # noqa: PLC0415
-    except Exception:
-        return None
-    cap = cv2.VideoCapture(str(path))
-    try:
-        if not cap.isOpened():
-            return None
-        steps = _pan_shifts(cv2, np, cap, t, lo, hi, series.get("crop"))
-    finally:
-        cap.release()
-    if len(steps) < PAN_MIN_STEPS:
-        return False
-    axis = 0 if sum(abs(s[0]) for s in steps) >= sum(abs(s[1]) for s in steps) else 1
-    # the agreement of the shifts is the evidence, not the peak height: a fast pan over smooth detail
-    # gives weak peaks (0.02-0.08) that still land on the same shift step after step, while a cut
-    # between unrelated pictures lands anywhere (real cuts measured: shift off by 10-40 px)
-    speed = statistics.median(s[axis] for s in steps)
-    drift = statistics.median(s[1 - axis] for s in steps)
-    if abs(speed) < PAN_MIN_PX:
-        return False
-    tol = max(PAN_TOL_PX, PAN_TOL * abs(speed))
-    agree = [abs(s[axis] - speed) <= tol and abs(s[1 - axis] - drift) <= tol for s in steps]
-    if sum(agree) < PAN_SHARE * len(agree):
-        return UNCLEAR  # the picture moves but the slide cannot be confirmed (featureless or changing move)
-    th = series.get("thumb") or []
-    if len(th) == len(t):
-        d = _steps(series)
-        k = max(range(lo, lo + len(steps)), key=lambda j: d[j])
-        if not agree[k - lo]:
-            return False  # the biggest change is not part of the slide: an edit inside the move
-    return True
+
+    def run(cv2, np, cap):
+        grays = _pan_frames(cv2, np, cap, t, lo - 1, hi, series.get("crop"))
+        steps = _shifts_of(cv2, grays)
+        if len(steps) < PAN_MIN_STEPS:
+            return False
+        # the agreement of the shifts is the evidence, not the peak height: a fast pan over smooth
+        # detail gives weak peaks (0.02-0.08) that still land on the same shift step after step
+        sl = _slide(steps)
+        if sl is None:
+            return False
+        axis, speed, drift, tol = sl
+        off = [max(abs(s[axis] - speed), abs(s[1 - axis] - drift)) for s in steps]
+        dx, dy = (speed, drift) if axis == 0 else (drift, speed)
+        res = [_residual(cv2, np, grays[j], grays[j + 1], dx, dy) for j in range(len(steps))]
+        known = [r for r in res if r is not None]
+        if known and any(r is not None and r > PAN_BREAK_RATIO * statistics.median(known) + PAN_BREAK_FLOOR
+                         for r in res):
+            return UNCLEAR  # one step the slide cannot explain, wherever the seek put it: an edit
+        ok = [r for r, o in zip(res, off) if r is not None and o <= tol]
+        if ok:  # a wild shift the slide still explains: a repeating texture fooled the correlation
+            # (only gross misreads are re-checked: a speed ramp or a stop stays a disagreement, since
+            # on soft detail a wrong compensation leaves little residual too)
+            ref = SLIDE_RATIO * statistics.median(ok) + SLIDE_FLOOR
+            off = [0.0 if (o > PAN_OUTLIER * tol and r is not None and r <= ref) else o for o, r in zip(off, res)]
+        if sum(o <= tol for o in off) < PAN_SHARE * len(off) or max(off) > PAN_OUTLIER * tol:
+            return UNCLEAR  # moving, but not one unbroken slide
+        return True
+
+    return _with_capture(series, run)
+
+
+def _span_residuals(cv2, np, grays: list, steps: list, speed: float):
+    """(m, residuals): frames ``m`` apart (as far as the overlap allows, at most SLIDE_SPAN_MAX)
+    compared after moving the first by the measured travel between them; None where no overlap."""
+    w = grays[0].shape[1]
+    m = max(1, min(SLIDE_SPAN_MAX, int(SLIDE_SPAN_FRAC * w / abs(speed))))
+    res = []
+    for j in range(len(grays) - m):
+        dx = sum(s[0] for s in steps[j:j + m])
+        dy = sum(s[1] for s in steps[j:j + m])
+        res.append(_residual(cv2, np, grays[j], grays[j + m], dx, dy))
+    return m, res
+
+
+def slide_explains_window(series: dict, r0: int, r1: int):
+    """For a gradual window that reads as one pan step by step: does the slide alone explain how the
+    picture changes across it? Both layers of a dissolve between two pans the same way slide by the
+    same step, so the per-step shifts cannot tell; the picture after compensating the slide can.
+    True when the window's residual stays within SLIDE_RATIO x the residual of the slide around it;
+    UNCLEAR when it does not or there is no slide context to compare with; None when it cannot run."""
+    t = series["t"]
+    n = len(t)
+
+    def run(cv2, np, cap):
+        first = max(0, r0 - SLIDE_SPAN_MAX - 3)
+        last = min(n - 1, r1 + SLIDE_SPAN_MAX + 3)
+        grays = _pan_frames(cv2, np, cap, t, first, last, series.get("crop"))
+        steps = _shifts_of(cv2, grays)
+        sl = _slide(steps) if steps else None
+        if sl is None:
+            return UNCLEAR
+        m, res = _span_residuals(cv2, np, grays, steps, sl[1])
+        inside = [r for j, r in enumerate(res) if r is not None and r0 <= first + j and first + j + m <= r1]
+        outside = [r for j, r in enumerate(res) if r is not None and (first + j + m <= r0 or first + j >= r1)]
+        if not inside or not outside:
+            return UNCLEAR
+        return statistics.mean(inside) <= SLIDE_RATIO * statistics.median(outside) + SLIDE_FLOOR or UNCLEAR
+
+    return _with_capture(series, run)
+
+
+DISSOLVE_MIN_RUN_S = 1.5  # a moving stretch this long (no cut, picture changing every frame) is scanned
+DISSOLVE_GAP_S = 2.5  # quiet stretch (no thumbnail change) bridged between two moving runs
+DISSOLVE_SCAN_MAX = 750  # frames decoded per scan chunk
+DISSOLVE_K = 6.0  # spans whose slide residual exceeds this many x the stretch's median ...
+DISSOLVE_MIN = 0.012  # ... and this level (0..1 grey) carry a picture change the slide does not explain
+DISSOLVE_MIN_SPANS = 8  # consecutive such spans: a dissolve, not a glitch
+
+
+def _moving_dissolves(series: dict, cut_idx: set[int], taken: list[tuple[int, int]]) -> list[dict]:
+    """Dissolves between two moving shots, which the thumbnail test cannot see (the picture changes on
+    every frame anyway): in a steady slide, frames compared after compensating the slide differ only
+    by codec noise, while across a dissolve the incoming picture fades up and leaves a residual that
+    rises for the whole cross-fade. Reported capped at UNCHECKED_CONF with PAN_UNCLEAR_NOTE: the
+    window is measured, what happens inside it is not confirmed. Needs OpenCV and the media path."""
+    t, th = series["t"], series.get("thumb") or []
+    n = len(t)
+    if len(th) != n or n < 8 or not series.get("path"):
+        return []
+    fps = _fps_of(t)
+    d = _steps(series)
+    # moving stretches: runs of changing thumbnails, merged across quiet gaps up to DISSOLVE_GAP_S
+    # (a dissolve over featureless detail barely changes the thumbnails) and split at every cut
+    active, k = [], 1
+    while k < n:
+        if d[k] >= BURST_ACTIVE and k not in cut_idx:
+            s0 = k
+            while k + 1 < n and d[k + 1] >= BURST_ACTIVE and k + 1 not in cut_idx:
+                k += 1
+            active.append((s0, k))
+        k += 1
+    runs: list[list[int]] = []
+    for s0, e in active:
+        if runs and t[s0] - t[runs[-1][1]] <= DISSOLVE_GAP_S and not any(runs[-1][1] < c <= s0 for c in cut_idx):
+            runs[-1][1] = e
+        else:
+            runs.append([s0, e])
+    runs = [(s0 - 1, e) for s0, e in runs if t[e] - t[s0 - 1] >= DISSOLVE_MIN_RUN_S]
+    out: list[dict] = []
+    for f_lo, f_hi in runs:
+        for c0 in range(f_lo, f_hi, DISSOLVE_SCAN_MAX // 2):
+            c1 = min(f_hi, c0 + DISSOLVE_SCAN_MAX)
+
+            def run(cv2, np, cap, c0=c0, c1=c1):
+                grays = _pan_frames(cv2, np, cap, t, c0, c1, series.get("crop"))
+                steps = _shifts_of(cv2, grays)
+                sl = _slide(steps) if len(steps) >= PAN_MIN_STEPS else None
+                if sl is None:
+                    return []
+                axis, speed, drift, tol = sl
+                agree = sum(max(abs(s[axis] - speed), abs(s[1 - axis] - drift)) <= tol for s in steps)
+                if agree < PAN_SHARE * len(steps):
+                    return []  # not one steady slide: nothing to compensate
+                m, res = _span_residuals(cv2, np, grays, steps, speed)
+                vals = [r for r in res if r is not None]
+                if len(vals) < 3 * DISSOLVE_MIN_SPANS:
+                    return []
+                thr = max(DISSOLVE_K * statistics.median(vals), DISSOLVE_MIN)
+                found, j = [], 0
+                while j < len(res):
+                    if res[j] is not None and res[j] > thr:
+                        j0 = j
+                        while j + 1 < len(res) and res[j + 1] is not None and res[j + 1] > thr:
+                            j += 1
+                        if j - j0 + 1 >= DISSOLVE_MIN_SPANS and j0 >= m and j + 2 * m < len(res):
+                            found.append((c0 + min(j0 + m, j), c0 + j))  # spans overlap the fade by m
+                    j += 1
+                return found
+
+            for a0, a1 in _with_capture(series, run) or []:
+                if a1 - a0 > MAX_GRADUAL_S * fps or any(a0 <= e + 1 and s0 - 1 <= a1 for s0, e in taken):
+                    continue
+                taken.append((a0, a1))
+                out.append({"kind": "gradual", "t": round((t[a0] + t[a1]) / 2, 6), "frames": a1 - a0,
+                            "t_start": t[a0], "t_end": t[a1], "confidence": UNCHECKED_CONF,
+                            "note": PAN_UNCLEAR_NOTE})
+    return out
+
+
+def _count_pan_drop(series: dict, k: int = 1) -> None:
+    series["pan_dropped"] = series.get("pan_dropped", 0) + k
 
 
 UNCHECKED_CONF = 0.4
@@ -493,6 +689,9 @@ def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
             continue
         pan = continuous_pan(series, r0 - 3, r1 + 3)
         if pan:
+            pan = slide_explains_window(series, r0, r1)
+        if pan:
+            _count_pan_drop(series)
             continue  # one camera move through the window, still moving the same way after it
         unchecked = pan is None or pan is UNCLEAR
         conf = _clamp(0.4 + 0.08 * score)
@@ -529,7 +728,10 @@ def _boundaries(series: dict) -> list[dict]:
         cut_idx.add(i)
         out.append({"kind": "cut", "t": t[i], "frames": 1, "t_start": t[i - 1], "t_end": t[i],
                     "confidence": _clamp(0.5 + strength[i] / (2 * thr))})
-    out += _gradual(series, cut_idx)
+    grads = _gradual(series, cut_idx)
+    pos = {round(x, 6): i for i, x in enumerate(t)}
+    taken = [(pos.get(round(g["t_start"], 6), 0), pos.get(round(g["t_end"], 6), 0)) for g in grads]
+    out += grads + _moving_dissolves(series, cut_idx, taken)
     out.sort(key=lambda b: b["t"])
     return out
 
@@ -605,15 +807,25 @@ def _collapse_bursts(series: dict, bounds: list[dict]) -> list[dict]:
         if not (held or flurry):
             continue  # ordinary footage in motion between two cuts
         keep: list[dict] = []
+        first_b, last_b = g[0][1], g[-1][1]
         if len(g) >= 3:  # real edits can bracket a move: a cut that stands out of the motion and has a
             # held picture on its outer side stays a cut; only what lies between them is the move
             interior = sorted(d[k] for k in range(g[0][0] + 1, g[-1][0]))
             med = interior[len(interior) // 2] if interior else 0.0
             first, last = g[0], g[-1]
-            if d[first[0]] >= 2 * med and first[0] - 1 >= 1 and d[first[0] - 1] < BURST_ACTIVE:
+
+            def outer_steady(lo_i: int, hi_i: int) -> bool:
+                # a held picture, or one steady slide (a cut from / into a pan): either way the cut's
+                # outer side is one shot, so the cut is an edit and not part of the move (one frame of
+                # margin from the cut: a seek landing a frame off must not pull the cut step in)
+                return bool(continuous_pan(series, lo_i, hi_i))
+
+            if d[first[0]] >= 2 * med and first[0] - 1 >= 1 and (
+                    d[first[0] - 1] < BURST_ACTIVE or outer_steady(first[0] - 2 - 2 * PAN_CONTEXT, first[0] - 2)):
                 keep.append(first[1])
                 g = g[1:]
-            if len(g) >= 2 and d[last[0]] >= 2 * med and last[0] + 1 < n and d[last[0] + 1] < BURST_ACTIVE:
+            if len(g) >= 2 and d[last[0]] >= 2 * med and last[0] + 1 < n and (
+                    d[last[0] + 1] < BURST_ACTIVE or outer_steady(last[0] + 2, last[0] + 2 + 2 * PAN_CONTEXT)):
                 keep.append(last[1])
                 g = g[:-1]
             if not g:
@@ -625,11 +837,20 @@ def _collapse_bursts(series: dict, bounds: list[dict]) -> list[dict]:
                 lo = g[0][0]
             if keep and keep[-1] is last[1]:
                 hi = g[-1][0]
-        pan = continuous_pan(series, lo - 3, hi + 3)
+        # a kept edge cut is an edit: the move is checked on its own side only
+        p_lo = lo - 3
+        p_hi = hi + 3
+        if keep and keep[0] is first_b:
+            p_lo = max(lo, pos[round(first_b["t"], 6)] + 2)
+        if keep and keep[-1] is last_b:
+            p_hi = min(hi, pos[round(last_b["t"], 6)] - 2)
+        pan = continuous_pan(series, p_lo, p_hi)
         if not held or pan:
             # no held picture either side, or the move carries on in the same direction after it:
             # continuous motion, not an edit
             drop.update(id(b) for _, b in g)
+            if pan:
+                _count_pan_drop(series, len(g))
             continue
         drop.update(id(b) for _, b in g)
         merged.append({"kind": "motion", "t": round((t[lo - 1] + t[hi]) / 2, 6), "frames": hi - lo + 1,
@@ -714,7 +935,6 @@ def _drop_pan_cuts(series: dict, bounds: list[dict]) -> list[dict]:
     pos = {round(x, 6): i for i, x in enumerate(t)}
     d = _steps(series) if len(th) == len(t) else []
     out = []
-    dropped = 0
     for b in bounds:
         i = pos.get(round(b["t"], 6)) if b["kind"] == "cut" else None
         if i is None:
@@ -722,13 +942,12 @@ def _drop_pan_cuts(series: dict, bounds: list[dict]) -> list[dict]:
             continue
         pan = continuous_pan(series, i - PAN_CONTEXT, i + PAN_CONTEXT)
         if pan:
-            dropped += 1
+            _count_pan_drop(series)
             continue
         moving = bool(d) and all(d[k] >= BURST_ACTIVE for k in range(max(1, i - PAN_CONTEXT), min(len(d), i + PAN_CONTEXT + 1)))
         if pan is None and moving:
             b = {**b, "confidence": min(b["confidence"], UNCHECKED_CONF), "note": _pan_skip_note()}
         out.append(b)
-    series["pan_dropped"] = dropped
     return out
 
 
@@ -739,7 +958,14 @@ def detect_shots(series: dict, duration: float) -> list[dict]:
     """Shots from a frame series. Empty list when nothing can be measured."""
     if not series or len(series.get("t", [])) < 2 or not duration or duration <= 0:
         return []
-    bounds = _drop_pan_cuts(series, _vet_cuts(series, _collapse_bursts(series, _boundaries(series))))
+    series["pan_dropped"] = 0
+    reader = series["_pan_reader"] = _PanReader(series["path"]) if series.get("path") else None
+    try:
+        bounds = _drop_pan_cuts(series, _vet_cuts(series, _collapse_bursts(series, _boundaries(series))))
+    finally:
+        series.pop("_pan_reader", None)
+        if reader is not None:
+            reader.close()
     return build_shots(bounds, duration)
 
 

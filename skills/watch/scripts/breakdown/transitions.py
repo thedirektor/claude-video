@@ -184,7 +184,10 @@ def classify(series: dict, shots: list[dict]) -> list[dict]:
         if b["kind"] == "cut":
             out.append(_entry(b["t"], "cut", 0.0, ev["t_start"], ev["t_end"], ev["confidence"]))
         elif b["kind"] == "gradual":
-            out.append(_classify_gradual(series, b))
+            e = _classify_gradual(series, b)
+            if b.get("note"):  # a capped boundary (pan not ruled out / check skipped): the label claims no more
+                e["evidence"]["confidence"] = min(e["evidence"]["confidence"], ev["confidence"])
+            out.append(e)
         else:  # "motion" spans a move: its length is what was measured
             span = ev["t_end"] - ev["t_start"] if b["kind"] == "motion" else 0.0
             out.append(_entry(b["t"], NOT_DETERMINED, span, ev["t_start"], ev["t_end"], 0))

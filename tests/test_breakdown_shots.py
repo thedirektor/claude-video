@@ -493,3 +493,83 @@ def test_without_opencv_a_pan_boundary_is_capped_and_says_so(strips, monkeypatch
     assert all(b["evidence"]["confidence"] <= 0.4 and "opencv missing" in b["note"] for b in bounds)
     monkeypatch.undo()
     assert [s for s in S.detect_shots(series, 4.0) if s["boundary"] and s["boundary"]["kind"] != "cut"] == []
+
+
+# ------------------------------------------------------------------ fix round 6
+
+@pytest.mark.parametrize("v", [10, 20])
+def test_dissolve_between_two_same_direction_pans_is_kept_capped(strips, v):
+    """Both layers of a dissolve slide by the same step, so every frame step reads as one pan: the window
+    used to be dropped. The picture still changes beyond the slide, so the boundary stays, capped."""
+    a = _pan(strips, "a", 75, v, 0, 1, f"da{v}.mp4")
+    b = _pan(strips, "b", 75, v, 0, 1, f"db{v}.mp4")
+    p = strips / f"dis{v}.mp4"
+    _ff("-i", str(a), "-i", str(b), "-filter_complex", "[0][1]xfade=transition=fade:duration=1:offset=1.5", *_ENC, str(p))
+    from breakdown import transitions as T
+    series = S.frame_series(str(p), 25)
+    found = S.detect_shots(series, 5.0)
+    bounds = [s["boundary"] for s in found if s["boundary"]]
+    hits = [b for b in bounds if 1.5 <= b["t"] <= 2.5]
+    assert hits and all(b["evidence"]["confidence"] <= 0.4 and b.get("note") == S.PAN_UNCLEAR_NOTE for b in hits), bounds
+    assert [b for b in bounds if not 1.5 <= b["t"] <= 2.5] == []
+    assert all(e["evidence"]["confidence"] <= 0.4 for e in T.classify(series, found) if 1.5 <= e["t"] <= 2.5)
+
+
+def _seek_off(monkeypatch, frames: int):
+    import cv2
+    real = cv2.VideoCapture
+
+    class Off:
+        def __init__(self, *a):
+            self._c = real(*a)
+
+        def set(self, prop, val):
+            if prop == cv2.CAP_PROP_POS_MSEC:
+                val = max(0.0, val + frames * 40.0)
+            elif prop == cv2.CAP_PROP_POS_FRAMES:
+                val = max(0, val + frames)
+            return self._c.set(prop, val)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    monkeypatch.setattr(cv2, "VideoCapture", Off)
+
+
+@pytest.mark.parametrize("off", [1, -1])
+@pytest.mark.parametrize("v", [10, 20, 40])
+def test_cut_between_same_direction_pans_survives_a_seek_one_frame_off(wide, monkeypatch, v, off):
+    """A seek that lands one frame off must not hide the cut step inside the slide."""
+    # both shots textured (testsrc2, 3000 px apart): only the cut step itself breaks the slide
+    a = _pan(wide, "b", 50, v, 0, 1, f"oa{v}.mp4")
+    b = _pan(wide, "b", 50, v, 3000, 1, f"ob{v}.mp4")
+    p = wide / f"off{v}.mp4"
+    _ff("-i", str(a), "-i", str(b), "-filter_complex", "concat=n=2:v=1", *_ENC, str(p))
+    series = S.frame_series(str(p), 25)
+    _seek_off(monkeypatch, off)
+    kinds = [(s["boundary"]["kind"], round(s["boundary"]["t"], 2)) for s in S.detect_shots(series, 4.0) if s["boundary"]]
+    assert [k for k, _ in kinds] == ["cut"] and abs(kinds[0][1] - 2.0) <= 0.04, kinds
+
+
+def test_pan_drops_of_every_kind_are_counted(strips, monkeypatch):
+    series = S.frame_series(str(_pan(strips, "b", 100, 20, 0, 1, "nocv.mp4")), 25)
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    unchecked = len([s for s in S.detect_shots(dict(series), 4.0) if s["boundary"]])
+    monkeypatch.undo()
+    assert len(S.detect_shots(series, 4.0)) == 1
+    assert series["pan_dropped"] >= unchecked > 0
+
+
+def test_one_video_capture_per_detect_shots(strips, monkeypatch):
+    import cv2
+    real, opened = cv2.VideoCapture, []
+
+    def counting(*a):
+        opened.append(a)
+        return real(*a)
+
+    series = S.frame_series(str(_pan(strips, "b", 100, 20, 0, 1, "rv20.mp4")), 25)
+    monkeypatch.setattr(cv2, "VideoCapture", counting)
+    S.detect_shots(series, 4.0)
+    assert len(opened) == 1
+    assert not any(k.startswith("_") for k in series), "no capture handle left in the series"
