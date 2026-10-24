@@ -210,3 +210,75 @@ def test_av1_media_transcoded_for_opencv(conn, tmp_path):
 
 def test_fetch_prefers_h264():
     assert media.FETCH_FORMAT.startswith("bv*[vcodec^=avc1]")
+
+
+# ------------------------------------------------------------------ 0.7.1 minors
+
+def test_failed_fetch_leaves_no_scratch(conn, tmp_path, monkeypatch):
+    """A fetch that dies after writing partial files must not leave <vdir>/.fetch behind."""
+    import download
+
+    def boom(url, tmp, fmt=None):
+        Path(tmp).mkdir(parents=True, exist_ok=True)
+        (Path(tmp) / "partial.mp4.part").write_bytes(b"x" * 100)
+        raise SystemExit("yt-dlp failed mid-download")
+
+    monkeypatch.setattr(download, "download_url", boom)
+    vdir = tmp_path / "st" / "v"
+    vdir.mkdir(parents=True)
+    assert media.default_fetch("https://example.com/v", vdir) is None
+    assert not (vdir / ".fetch").exists()
+
+
+def test_injected_fetch_exception_is_logged(conn, tmp_path, capsys):
+    root = tmp_path / "st"
+    _video_row(conn, KEY_A, url="https://example.com/clip")
+
+    def fetch(url, vdir):
+        raise RuntimeError("proxy exploded")
+
+    info = media.ensure_media(conn, KEY_A, store_dir=root, fetch=fetch)
+    assert info["source"] == "frames"
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err and "proxy exploded" in err
+
+
+def test_over_cap_fetch_is_flagged_and_not_pinned(conn, tmp_path, monkeypatch):
+    """Media above WATCH_BREAKDOWN_MEDIA_MAX_MB is usable for this run but retention may evict it:
+    saying "pinned" would be false and every later run would silently refetch."""
+    root = tmp_path / "st"
+    _video_row(conn, KEY_A, url="https://example.com/clip")
+    src = tmp_path / "dl" / "video.mp4"
+    src.parent.mkdir()
+    make_reference(src, with_audio=False)
+    monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", "0.001")  # ~1 KB: the fixture is far larger
+    info = media.ensure_media(conn, KEY_A, store_dir=root, fetch=lambda u, v: src)
+    assert info["source"] == "fetched" and info["over_cap"] is True
+    assert "WATCH_BREAKDOWN_MEDIA_MAX_MB" in info["media_note"]
+    assert media.pin(root, KEY_A) is False and not media.is_pinned(root, KEY_A)
+    monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", "2048")
+    assert media.pin(root, KEY_A) is True and media.is_pinned(root, KEY_A)
+
+
+def test_frames_only_fallback_probes_stored_frame_size(conn, tmp_path):
+    """Storyboard-only: no media, so width/height come from a stored frame."""
+    root = tmp_path / "st"
+    _video_row(conn, KEY_A, duration=12.0)
+    fdir = store.video_dir(root, KEY_A) / "frames"
+    fdir.mkdir(parents=True)
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "color=c=red:s=320x180:d=0.1", "-frames:v", "1", str(fdir / "1000.jpg")], check=True)
+    info = media.ensure_media(conn, KEY_A, store_dir=root, fetch=lambda *a: None)
+    assert info["source"] == "frames" and info["path"] is None
+    assert (info["width"], info["height"]) == (320, 180)
+    assert info["low_resolution"] is True and info["duration"] == 12.0
+
+
+def test_fixture_skips_explicitly_without_font(tmp_path, monkeypatch):
+    """No font -> ground truth must not silently lack the title: the helper skips, with a reason."""
+    import breakdown_fixtures
+
+    monkeypatch.setattr(breakdown_fixtures, "_font", lambda: None)
+    with pytest.raises(pytest.skip.Exception) as ei:
+        make_reference(tmp_path / "ref.mp4")
+    assert "font" in str(ei.value).lower()

@@ -90,7 +90,9 @@ def write_run(conn, store_dir: Path, run, result) -> Path:
 
     if run.media_path and Path(run.media_path).is_file():
         mp = Path(run.media_path)
-        if keep_media(mp.stat().st_size):
+        # a pinned (breakdown) video keeps the file its timestamps were measured on: a re-watch
+        # often fetched a smaller copy, and swapping it would shift every measurement
+        if keep_media(mp.stat().st_size) and not (vdir / PINNED_MARKER).exists():
             for old in vdir.glob("media.*"):
                 old.unlink(missing_ok=True)
             shutil.copy2(mp, vdir / ("media" + mp.suffix.lower()))

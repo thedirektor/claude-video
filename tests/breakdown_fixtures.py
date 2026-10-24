@@ -41,6 +41,10 @@ def make_reference(path, *, fps: int = 25, with_audio: bool = True) -> dict:
     """
     path = Path(path)
     font = _font()
+    if font is None:
+        # ground truth lists the title: without a font it would silently not be rendered
+        import pytest
+        pytest.skip("no TrueType font found for drawtext: reference fixture needs its title")
     text_filter = ""
     if font:
         text_filter = (

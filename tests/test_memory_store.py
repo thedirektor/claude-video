@@ -115,3 +115,23 @@ def test_qdrant_inbox_atomic_and_front_matter(tmp_path):
     assert text.startswith("---\nvideo_key: yt:AAAAAAAAAAA\n") and text.endswith("body")
     p2 = store.write_qdrant_inbox(inbox, "yt:AAAAAAAAAAA", None, None, "2026-10-23", "b2")
     assert p2.name.startswith("yt-aaaaaaaaaaa-") and "title: null" in p2.read_text()
+
+
+def test_rewatch_keeps_pinned_media(conn, tmp_path):
+    """A breakdown pins the media its timestamps were measured on; a re-watch that downloaded a
+    smaller copy (<=720p) must not replace it."""
+    run, res = _record(conn, tmp_path)
+    root = tmp_path / "st"
+    vdir = store.video_dir(root, KEY)
+    vdir.mkdir(parents=True)
+    (vdir / "media.mp4").write_bytes(b"1080p-original")
+    (vdir / store.PINNED_MARKER).touch()
+    small = tmp_path / "small.mp4"
+    small.write_bytes(b"720p")
+    run.media_path = str(small)
+    store.write_run(conn, root, run, res)
+    assert (vdir / "media.mp4").read_bytes() == b"1080p-original"
+    # unpinned media is still refreshed as before
+    (vdir / store.PINNED_MARKER).unlink()
+    store.write_run(conn, root, run, res)
+    assert (vdir / "media.mp4").read_bytes() == b"720p"

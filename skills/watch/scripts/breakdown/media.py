@@ -24,10 +24,16 @@ FETCH_FORMAT = "bv*[vcodec^=avc1][height<=1080]+ba/bv*[height<=1080]+ba/b"
 LOW_RES_HEIGHT = 240
 
 
-def pin(store_dir: Path, video_key: str) -> None:
+def pin(store_dir: Path, video_key: str) -> bool:
+    """Exempt a video's media from retention. Returns False (no marker) when the media is above
+    ``WATCH_BREAKDOWN_MEDIA_MAX_MB``: retention would evict it anyway, so "pinned" would be false."""
     vdir = store.video_dir(Path(store_dir), video_key)
     vdir.mkdir(parents=True, exist_ok=True)
+    cap = store._breakdown_media_cap_bytes()
+    if any(m.stat().st_size > cap for m in vdir.glob("media.*") if m.is_file()):
+        return False
     (vdir / PINNED_MARKER).touch()
+    return True
 
 
 def is_pinned(store_dir: Path, video_key: str) -> bool:
@@ -114,8 +120,12 @@ def default_fetch(url: str, vdir: Path) -> dict | None:
     shutil.rmtree(tmp, ignore_errors=True)
     try:
         res = download.download_url(url, tmp, fmt=FETCH_FORMAT)
-        return res if res.get("video_path") else None
+        if res.get("video_path"):
+            return res
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
     except BaseException as exc:  # yt-dlp failures surface as SystemExit
+        shutil.rmtree(tmp, ignore_errors=True)  # partial downloads are scratch, not media
         if isinstance(exc, KeyboardInterrupt):
             raise
         print(f"[watch] breakdown media refetch failed: {exc}", file=sys.stderr)
@@ -210,6 +220,7 @@ def ensure_media(conn, video_key: str, store_dir: Path | None = None, fetch=None
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 raise
+            print(f"[watch] breakdown media refetch failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             got = None
         proxied = False
         if isinstance(got, dict):
@@ -223,5 +234,9 @@ def ensure_media(conn, video_key: str, store_dir: Path | None = None, fetch=None
                 res = _result(dest, info, "fetched")
                 if proxied:  # fallback proxy forces <=480p
                     res["low_resolution"] = True
+                if dest.stat().st_size > store._breakdown_media_cap_bytes():
+                    res["over_cap"] = True
+                    res["media_note"] = ("fetched media exceeds WATCH_BREAKDOWN_MEDIA_MAX_MB: used for this "
+                                         "run but not pinned, so retention may evict it and a later run refetch it")
                 return res
     return _frames_only(row["duration"] if row else 0.0, vdir)
