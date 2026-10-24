@@ -155,7 +155,9 @@ def test_probe_snaps_vfr(monkeypatch, tmp_path):
     monkeypatch.setattr(media.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=out, stderr=""))
     info = media.probe(tmp_path / "x.mp4")
-    assert info["fps_rational"] == "30000/1001" and abs(info["fps"] - 29.97) < 0.01
+    # analysis keeps the measured rate; only timelines use the snapped one
+    assert info["fps_rational"] == "1784000/59623" and abs(info["fps"] - 29.921) < 0.01
+    assert info["timeline_fps_rational"] == "30000/1001"
     assert info["fps_note"] and info["fps_offstandard"] is False
 
 
@@ -164,7 +166,8 @@ def test_offstandard_fps_lowers_confidence_and_notes(conn, stored, monkeypatch):
 
     def fake(*a, **k):
         m = real(*a, **k)
-        return {**m, "fps_rational": "1000/33", "fps": 1000 / 33, "fps_offstandard": True,
+        return {**m, "fps_rational": "1000/33", "timeline_fps_rational": "1000/33", "fps": 1000 / 33,
+                "fps_offstandard": True,
                 "fps_note": "non-standard frame rate 1000/33 kept as measured"}
 
     monkeypatch.setattr(media, "ensure_media", fake)
@@ -346,3 +349,50 @@ def test_cli_compare_reports_output_folder(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(compare, "summary_md", lambda res: "summary")
     assert cli.main(["compare", "ref", "cand"]) == 0
     assert f"[watch] compare stored in {tmp_path}" in capsys.readouterr().err
+
+
+def test_timeline_uses_snapped_rate_analysis_uses_measured(conn, stored, monkeypatch):
+    real = media.ensure_media
+
+    def fake(*a, **k):
+        m = real(*a, **k)
+        return {**m, "fps_rational": "1784000/59623", "fps": 1784000 / 59623,
+                "timeline_fps_rational": "30000/1001", "fps_note": "snapped"}
+
+    monkeypatch.setattr(media, "ensure_media", fake)
+    seen = {}
+    real_fs = assemble.shots_mod.frame_series
+    monkeypatch.setattr(assemble.shots_mod, "frame_series",
+                        lambda path, fps: seen.setdefault("fps", fps) and real_fs(path, 25.0))
+    bd = assemble.build(conn, KEY, store_dir=stored)
+    assert seen["fps"] == pytest.approx(29.921, abs=0.01)
+    assert bd["video"]["fps_rational"] == "30000/1001" and bd["video"]["fps"] == pytest.approx(29.921, abs=0.01)
+
+
+def test_probe_nonstandard_clip_keeps_true_rate(tmp_path):
+    p = tmp_path / "v.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "color=c=gray:s=160x90:r=59.8:d=2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)],
+                   check=True)
+    info = media.probe(p)
+    assert info["fps"] == pytest.approx(59.8, abs=0.1)  # not snapped to 60 for frame-index -> time maths
+    assert info["timeline_fps_rational"] in ("60/1", "60000/1001")
+
+
+# ---- re-review residuals ----
+def test_stored_path_prints_output_folder(conn, stored, monkeypatch, capsys):
+    monkeypatch.setenv("WATCH_STORE_DIR", str(stored))
+    assert cli.main(["breakdown", KEY]) == 0
+    capsys.readouterr()
+    assert cli.main(["breakdown", KEY, "--stored", "--json"]) == 0
+    err = capsys.readouterr().err
+    assert "[watch] breakdown stored in " in err and err.strip().endswith("breakdown")
+
+
+def test_fragment_track_dropped_when_inside_longer_overlapping_track():
+    box = [0.1, 0.1, 0.3, 0.1]
+    full = {"text": "HELLO WORLD", "t_in": 1.0, "t_out": 3.0, "box": box, "evidence": {"confidence": 0.9}}
+    frag = {"text": "ORLD", "t_in": 1.0, "t_out": 3.0, "box": [0.25, 0.1, 0.15, 0.1], "evidence": {"confidence": 0.87}}
+    other = {"text": "ORLD", "t_in": 4.0, "t_out": 5.0, "box": [0.25, 0.1, 0.15, 0.1], "evidence": {"confidence": 0.87}}
+    out = TY._drop_fragments([full, frag, other])
+    assert [t["text"] for t in out] == ["HELLO WORLD", "ORLD"] and out[1]["t_in"] == 4.0

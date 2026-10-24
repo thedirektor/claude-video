@@ -316,6 +316,25 @@ def _exit(cv2, np, cap, fps, t_in_set, t_out_set, t_end, duration, box) -> tuple
     return NOT_DETERMINED, None
 
 
+def _drop_fragments(tracks: list[dict]) -> list[dict]:
+    """Drop a track whose text is a strict part of a longer track that overlaps it in time and
+    box (OCR sometimes reads one word of a line as its own, confidently read, line)."""
+    def inside(a, b):
+        iw = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+        ih = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+        return a[2] * a[3] > 0 and iw * ih / (a[2] * a[3]) >= 0.5
+
+    keep = []
+    for t in tracks:
+        n = _norm(t["text"])
+        frag = any(o is not t and len(_norm(o["text"])) > len(n) and n in _norm(o["text"])
+                   and min(t["t_out"], o["t_out"]) > max(t["t_in"], o["t_in"]) and inside(t["box"], o["box"])
+                   for o in tracks)
+        if not frag:
+            keep.append(t)
+    return keep
+
+
 def _modal(boxes):
     """Indices of the largest group of samples whose boxes agree (IoU >= 0.9), later wins ties."""
     best = []
@@ -409,6 +428,7 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
                              "ocr_confidence": round(sum(tr["confs"]) / len(tr["confs"]), 3),
                              "box_track": [[round(tt, 3)] + [round(v, 4) for v in b] for tt, b in tr["boxes"]]},
             })
+        out = _drop_fragments(out)
         out.sort(key=lambda r: (r["t_in"], r["box"][1], r["box"][0]))
         return out
     finally:

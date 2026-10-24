@@ -86,10 +86,12 @@ def probe(path: Path) -> dict | None:
         duration = float(data.get("format", {}).get("duration") or video.get("duration") or 0.0)
     except ValueError:
         duration = 0.0
-    rate, fps_note, off_standard = snap_fps(rate)
+    snapped, fps_note, off_standard = snap_fps(rate)
+    # analysis (frame index -> time) uses the measured rate; only timelines use the snapped one
     return {
         "fps": _rational_to_float(rate),
         "fps_rational": rate,
+        "timeline_fps_rational": snapped,
         "fps_note": fps_note,
         "fps_offstandard": off_standard,
         "duration": duration,
@@ -136,7 +138,7 @@ def _frames_only(duration, vdir: Path) -> dict:
         if info:
             width, height = info["width"], info["height"]
     return {
-        "path": None, "fps": 0.0, "fps_rational": "0/1",
+        "path": None, "fps": 0.0, "fps_rational": "0/1", "timeline_fps_rational": "0/1",
         "duration": float(duration or 0.0), "width": width, "height": height,
         "has_audio": False, "low_resolution": True, "source": "frames",
     }

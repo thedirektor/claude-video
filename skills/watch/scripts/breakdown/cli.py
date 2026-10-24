@@ -80,6 +80,7 @@ def _cmd_breakdown(argv: list[str]) -> int:
                 print("[watch] no stored breakdown for this video; run `breakdown` without --stored first",
                       file=sys.stderr)
                 return 2
+            print(f"[watch] breakdown stored in {out_dir}", file=sys.stderr)
             if not a.json:
                 md = out_dir / "breakdown.md"
                 print(md.read_text(encoding="utf-8") if md.is_file() else assemble.brief_md(bd))

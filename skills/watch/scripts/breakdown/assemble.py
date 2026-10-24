@@ -352,7 +352,8 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
 
     width, height = int(m.get("width") or 0), int(m.get("height") or 0)
     video = {"key": video_key, "title": title, "url": url, "duration": duration, "fps": fps,
-             "fps_rational": m.get("fps_rational") or "0/1", "width": width, "height": height,
+             "fps_rational": m.get("timeline_fps_rational") or m.get("fps_rational") or "0/1",
+             "fps_measured_rational": m.get("fps_rational") or "0/1", "width": width, "height": height,
              "source": m.get("source"),
              "active_aspect": _active_aspect(width, height, shot_list, duration),
              "evidence": _ev(0.0, duration, "measured",
