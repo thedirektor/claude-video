@@ -2,6 +2,21 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.7.1] — 2026-10-24
+
+Breakdown backlog cleared: fewer invented values, more measured.
+
+### Fixed
+- **Cuts**: fast whip pans and handheld moves no longer read as bursts of cuts; same-picture jumps, colour/lighting changes and strobes are not claimed as cuts (kept at low confidence with a note); continuous pans produce no boundaries; a cut between two pans or to a recoloured picture is still found; a black hold between fades stays its own shot.
+- **Transitions / camera**: fades to white or colour at clip edges, dissolves between moving shots (low confidence, noted), camera motion measured on the active picture (textureless = not determined).
+- **Typography**: punch-word titles shorter than the OCR step are found (also over moving footage via text-isolated OCR, start refined from the text's pixels); real frame times on low / variable frame rates; OCR downscaled to 720p; letterbox measured to ~1 px.
+- **Audio**: kick-only beats determined; half-time, double-time and 3:2 readings are never confident (alternative given); no false octave-change note; honest ffmpeg error wording.
+- **Timelines**: the reference audio travels with OTIO / FCPXML / EDL; text markers continue across cuts; FCPXML is skipped rather than guessed without a frame size; one-line EDL comments.
+- **Motion**: follows subjects that change shape or size; keeps the tracked stretch when the subject leaves later; Unity keys sized to bounces and springs; no overlapping phases.
+- **Compare**: exact pairs next to flash frames are paired; onset alignment checked against the edit's own cut period.
+- **Media**: over-cap downloads step down to 720p / 480p and stop looping; pinned media refreshed only by a sharper copy; bundle import never overwrites a newer breakdown.
+- `breakdown --spend-out` (the service records the --interpret cost on the job).
+
 ## [0.7.0] — 2026-10-24
 
 Breakdown: measure a reference video into something that can be rebuilt, without inventing anything.

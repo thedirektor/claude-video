@@ -1205,7 +1205,7 @@ def rhythm(shots: list[dict]) -> dict:
     durs = [s["duration"] for s in shots]
     span = shots[-1]["end"] - shots[0]["start"]
     # a window is 3 shots on longer edits, fewer on short ones so fastest and slowest differ
-    size = 3 if len(shots) >= 6 else max(1, len(shots) // 2)
+    size = 3 if len(shots) >= 4 else max(1, len(shots) // 2)
     best = min(range(len(shots) - size + 1), key=lambda i: sum(durs[i:i + size]))
     win = shots[best:best + size]
     worst = max(range(len(shots) - size + 1), key=lambda i: sum(durs[i:i + size]))
