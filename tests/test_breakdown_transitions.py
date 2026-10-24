@@ -189,3 +189,90 @@ def test_cut_then_fade_out(tmp_path):
     assert [e["kind"] for e in out] == ["cut", "fade_to_black"]
     assert abs(out[0]["t"] - 2.0) <= 0.04 + 1e-6
     assert out[1]["evidence"]["t_start"] >= 2.0 - 1e-6
+
+
+# ------------------------------------------------------------------ 0.7.1 minors
+
+@pytest.mark.parametrize("name,expect_to,expect_from", [("fadeblack", "black", "black"), ("fadewhite", "white", "white")])
+def test_xfade_dip_halves_match_the_luma_ramp(tmp_path, name, expect_to, expect_from):
+    """xfade's dip fades out over the first 20% (0.2 s) and in over the rest (0.8 s); the halves were
+    measured 0.16 s and 0.64 s because the ramp end was taken where luma entered the black / white band."""
+    a, b, p = tmp_path / "a.mp4", tmp_path / "b.mp4", tmp_path / "x.mp4"
+    _ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=3", *ENC, str(a))
+    _ff("-f", "lavfi", "-i", "testsrc=s=320x180:r=25:d=3", *ENC, str(b))
+    _ff("-i", str(a), "-i", str(b), "-filter_complex", f"[0][1]xfade=transition={name}:duration=1:offset=2", *ENC, str(p))
+    _, out = _series(p)
+    kinds = [e["kind"] for e in out]
+    assert kinds == [f"fade_to_{expect_to}", f"fade_from_{expect_from}"]
+    to, frm = out
+    assert to["duration"] == pytest.approx(0.2, abs=0.05)
+    assert frm["duration"] == pytest.approx(0.8, abs=0.05)
+    assert to["evidence"]["t_start"] == pytest.approx(2.0, abs=0.05) and frm["evidence"]["t_end"] == pytest.approx(3.0, abs=0.05)
+
+
+@pytest.fixture(scope="module")
+def soft(tmp_path_factory):
+    d = tmp_path_factory.mktemp("soft")
+    _ff("-f", "lavfi", "-i", "mandelbrot=s=1920x180:r=25:start_scale=0.05:start_x=-0.74:start_y=0.1", "-frames:v", "1", str(d / "s1.png"))
+    _ff("-f", "lavfi", "-i", "mandelbrot=s=1920x180:r=25:start_scale=0.4:start_x=-0.6:start_y=0.0", "-frames:v", "1", str(d / "s2.png"))
+    return d
+
+
+@pytest.mark.parametrize("travel,secs", [(300, 0.5), (500, 0.5), (300, 1.0), (500, 1.0)])
+def test_whip_pan_between_held_framings_is_never_a_dissolve(soft, travel, secs):
+    """A smooth pan over a soft scene fits a straight blend, so it used to come out as a dissolve at
+    0.9+ confidence. The in-between frames are one picture sliding, not a cross-fade."""
+    ss = f"(3*pow((t-1.5)/{secs},2)-2*pow((t-1.5)/{secs},3))"
+    x = f"if(lt(t,1.5),0,if(lt(t,{1.5 + secs}),{travel}*{ss},{travel}))"
+    p = soft / f"pan{travel}_{secs}.mp4"
+    _ff("-loop", "1", "-framerate", "25", "-i", str(soft / "s1.png"), "-t", "4", "-vf", f"crop=320:180:x='{x}':y=0",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25", str(p))
+    s, out = _series(p, 4.0)
+    assert out, "the pan should at least register as a boundary"
+    for e in out:
+        assert e["kind"] != "dissolve", e
+        if e["kind"] == T.NOT_DETERMINED:
+            assert e["evidence"]["confidence"] == 0
+
+
+@pytest.mark.parametrize("xa,xb", [(0, 0), (0, 900), (300, 310)])
+def test_real_dissolve_of_soft_stills_is_still_a_dissolve(soft, xa, xb):
+    p = soft / f"dis{xa}_{xb}.mp4"
+    _ff("-loop", "1", "-framerate", "25", "-i", str(soft / "s1.png"), "-loop", "1", "-framerate", "25", "-i", str(soft / "s2.png"),
+        "-t", "4", "-filter_complex", f"[0]crop=320:180:{xa}:0[a];[1]crop=320:180:{xb}:0[b];[a][b]xfade=transition=fade:duration=1:offset=1.5",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25", str(p))
+    _, out = _series(p, 4.0)
+    assert [e["kind"] for e in out] == ["dissolve"]
+
+
+def _synthetic_fade_with_cut(real_cut: bool):
+    """40 frames at 25 fps: picture A at full level, a 20-frame ramp to black that (a) keeps scaling
+    the same picture or (b) hands over to a different picture at frame 30 on the same luma ramp, then a
+    black hold."""
+    import random
+    rnd = random.Random(7)
+    pa = [rnd.randrange(60, 200) for _ in range(16 * 9 * 3)]
+    pb = [rnd.randrange(60, 200) for _ in range(16 * 9 * 3)]
+    n, thumbs = 50, []
+    for i in range(n):
+        scale = 1.0 if i < 20 else max(0.0, 1.0 - (i - 20) * 0.05) if i < 40 else 0.0
+        pic = pb if (real_cut and 30 <= i < 40) else pa
+        thumbs.append(bytes(int(v * scale) for v in pic))
+    y = [sum(th) / len(th) for th in thumbs]
+    return {"t": [i / 25 for i in range(n)], "scene": [0.0] * n, "yavg": y, "thumb": thumbs}
+
+
+def test_on_ramp_does_not_absorb_a_real_cut_between_matched_ramps():
+    series = _synthetic_fade_with_cut(real_cut=True)
+    shots = [{"index": 1, "boundary": {"kind": "cut", "t": series["t"][30],
+                                       "evidence": {"t_start": series["t"][29], "t_end": series["t"][30], "confidence": 0.9}}}]
+    kinds = [e["kind"] for e in T.classify(series, shots)]
+    assert "cut" in kinds, kinds
+
+
+def test_on_ramp_still_absorbs_a_fade_step():
+    series = _synthetic_fade_with_cut(real_cut=False)
+    shots = [{"index": 1, "boundary": {"kind": "cut", "t": series["t"][30],
+                                       "evidence": {"t_start": series["t"][29], "t_end": series["t"][30], "confidence": 0.9}}}]
+    kinds = [e["kind"] for e in T.classify(series, shots)]
+    assert "cut" not in kinds and "fade_to_black" in kinds, kinds

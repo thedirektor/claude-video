@@ -10,6 +10,8 @@ from __future__ import annotations
 import bisect
 import statistics
 
+from .shots import THUMB_H, THUMB_W
+
 NOT_DETERMINED = "not determined"
 DARK_Y = 28.0  # a fade need not reach legal black (16); real fades end near 20
 LIGHT_Y = 220.0
@@ -17,6 +19,12 @@ UNIFORM_STD = 10.0  # thumbnail std below this reads as a blank (faded) frame
 TREND_STEP = 0.3
 MIN_FRAMES = 3
 MIN_DROP = 15.0
+RAMP_TOL = 1.0  # luma levels from the extreme at which a fade ramp counts as having arrived / left
+SAME_CONTENT = 0.8  # thumbnail correlation above which two frames are the same picture (a fade step)
+SHIFT_DX = tuple(d / 4 for d in range(-16, 17))  # candidate frame-to-frame translations, in thumbnail columns
+SHIFT_IMPROVE = 0.25  # a shift that explains a frame step this much better than no shift = motion
+SHIFT_MEDIAN = 0.4  # median improvement above which the in-between frames are a translating picture
+SHIFT_SHARE = 0.75  # share of frame steps that must improve for the same
 BLEND_TOL = 0.06  # mean abs thumbnail residual (0..1) allowed against a straight blend
 
 
@@ -78,14 +86,90 @@ def _walk(y: list[float], i: int, step: int, sign: int, cuts: frozenset = frozen
             return i
 
 
-def _on_ramp(y: list[float], c: int) -> bool:
-    """A "cut" that is just one step of a steep fade ramp (same direction, similar size)."""
+def _correlation(a, b) -> float | None:
+    """Pearson correlation of two thumbnails; None when either is flat."""
+    n = len(a)
+    ma, mb = sum(a) / n, sum(b) / n
+    va = sum((x - ma) ** 2 for x in a)
+    vb = sum((x - mb) ** 2 for x in b)
+    if va < 1e-9 or vb < 1e-9:
+        return None
+    return sum((x - ma) * (z - mb) for x, z in zip(a, b)) / (va * vb) ** 0.5
+
+
+def _on_ramp(y: list[float], c: int, thumb: list | None = None) -> bool:
+    """A "cut" that is just one step of a steep fade ramp (same direction, similar size).
+
+    Luma alone cannot tell a fade step from a real cut between two dimmed shots whose luma happens
+    to continue the ramp, so with thumbnails the frames either side must also be the same picture
+    (a fade only scales one picture toward black / white, which keeps its correlation)."""
     if c < 2 or c + 1 >= len(y):
         return False
     d0, d1, d2 = y[c - 1] - y[c - 2], y[c] - y[c - 1], y[c + 1] - y[c]
     if min(abs(d0), abs(d1), abs(d2)) < 2.0 or d0 * d1 <= 0 or d1 * d2 <= 0:
         return False
-    return abs(d1) <= 1.5 * max(abs(d0), abs(d2))
+    if abs(d1) > 1.5 * max(abs(d0), abs(d2)):
+        return False
+    if thumb and len(thumb) == len(y):
+        corr = _correlation(thumb[c - 1], thumb[c])
+        if corr is not None and corr < SAME_CONTENT:
+            return False
+    return True
+
+
+def _gray(th) -> list[list[float]]:
+    w = THUMB_W
+    return [[(th[(r * w + x) * 3] + th[(r * w + x) * 3 + 1] + th[(r * w + x) * 3 + 2]) / 3.0
+             for x in range(w)] for r in range(THUMB_H)]
+
+
+def _step_error(a, b, dx: float, dy: int) -> float | None:
+    """Mean abs difference of ``b`` against ``a`` shifted by (dx cols, dy rows); overlap only."""
+    tot, cnt = 0.0, 0
+    for r in range(THUMB_H):
+        r2 = r - dy
+        if not 0 <= r2 < THUMB_H:
+            continue
+        for x in range(THUMB_W):
+            xs = x - dx
+            if xs < 0 or xs > THUMB_W - 1:
+                continue
+            x0 = int(xs)
+            fx = xs - x0
+            x1 = min(THUMB_W - 1, x0 + 1)
+            tot += abs(b[r][x] - (a[r2][x0] * (1 - fx) + a[r2][x1] * fx))
+            cnt += 1
+    return tot / cnt / 255.0 if cnt >= 0.4 * THUMB_W * THUMB_H else None
+
+
+def _translating(thumb: list, i0: int, i1: int) -> bool:
+    """True when the frames of a window are one picture sliding: each step is explained far better
+    by a small shift than by no shift. A dissolve only cross-fades in place, so shifting never helps.
+
+    A pan over a soft scene also fits a straight blend (residual tiny), which is why the blend test
+    alone would call a whip pan between held framings a confident dissolve."""
+    g = [_gray(thumb[k]) for k in range(i0, i1 + 1)]
+    gains = []
+    for k in range(len(g) - 1):
+        base = _step_error(g[k], g[k + 1], 0.0, 0)
+        if not base or base < 1e-6:
+            gains.append(0.0)
+            continue
+        best = base
+        for dy in (-1, 0, 1):
+            for dx in SHIFT_DX:
+                if dx == 0 and dy == 0:
+                    continue
+                e = _step_error(g[k], g[k + 1], dx, dy)
+                if e is not None and e < best:
+                    best = e
+        gains.append(1.0 - best / base)
+    if not gains:
+        return False
+    gains_sorted = sorted(gains)
+    median = gains_sorted[len(gains_sorted) // 2]
+    share = sum(1 for v in gains if v > SHIFT_IMPROVE) / len(gains)
+    return median >= SHIFT_MEDIAN and share >= SHIFT_SHARE
 
 
 def _fades(series: dict, cuts: frozenset = frozenset()) -> tuple[list[dict], list[tuple[float, float]]]:
@@ -115,14 +199,19 @@ def _fades(series: dict, cuts: frozenset = frozenset()) -> tuple[list[dict], lis
         b = _walk(y, j, 1, sign, cuts) if j < n - 1 else j
         to_ok = i > 0 and i - a >= MIN_FRAMES and sign * (y[a] - ext) >= MIN_DROP
         from_ok = j < n - 1 and b - j >= MIN_FRAMES and sign * (y[b] - ext) >= MIN_DROP
+        # the extreme run is "luma beyond DARK_Y / LIGHT_Y", not the ramp's own endpoint: a fade-to
+        # reaches its floor at the first frame within RAMP_TOL of the extreme, a fade-from leaves it
+        # at the last such frame (xfade's fadeblack ramps down in 0.2 s but up over 0.8 s)
+        near = [m for m in range(i, j + 1) if sign * (y[m] - ext) <= RAMP_TOL]
+        i2, j2 = (near[0], near[-1]) if near else (i, j)
         if to_ok:
-            out.append(_entry((t[a] + t[i]) / 2, f"fade_to_{k}", t[i] - t[a], t[a], t[i], 0.85))
+            out.append(_entry((t[a] + t[i2]) / 2, f"fade_to_{k}", t[i2] - t[a], t[a], t[i2], 0.85))
         if from_ok:
-            out.append(_entry((t[j] + t[b]) / 2, f"fade_from_{k}", t[b] - t[j], t[j], t[b], 0.85))
+            out.append(_entry((t[j2] + t[b]) / 2, f"fade_from_{k}", t[b] - t[j2], t[j2], t[b], 0.85))
         if to_ok:
-            spans.append((t[a], t[i]))
+            spans.append((t[a], t[i2]))
         if from_ok:
-            spans.append((t[j], t[b]))
+            spans.append((t[j2], t[b]))
         if to_ok and from_ok:
             spans.append((t[a], t[b]))
         i = j + 1
@@ -145,6 +234,8 @@ def _classify_gradual(series: dict, b: dict) -> dict:
         return _entry(b["t"], NOT_DETERMINED, dur, t0, t1, 0)
     resid = _blend_residual(thumb, i0, i1)
     if resid is not None and resid <= BLEND_TOL:
+        if _translating(thumb, i0, i1):  # a camera move between held framings, not a cross-fade
+            return _entry(b["t"], NOT_DETERMINED, dur, t0, t1, 0)
         return _entry(b["t"], "dissolve", dur, t0, t1, 1 - resid / BLEND_TOL * 0.4)
     return _entry(b["t"], NOT_DETERMINED, dur, t0, t1, 0)
 
@@ -160,7 +251,7 @@ def classify(series: dict, shots: list[dict]) -> list[dict]:
         bd = sh.get("boundary")
         if bd and bd["kind"] == "cut":
             c = bisect.bisect_left(tt, bd["t"] - 1e-9)
-            if not _on_ramp(y, c):
+            if not _on_ramp(y, c, series.get("thumb")):
                 cuts.add(c)
     cuts = frozenset(cuts)
     fades, spans = _fades(series, cuts)

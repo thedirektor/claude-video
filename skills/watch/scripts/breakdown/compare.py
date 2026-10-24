@@ -102,7 +102,7 @@ def _gray(path: str, np):
     try:
         res = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path, "-an",
-             "-vf", f"{(crop + ',') if crop else ''}scale={THUMB_W}:{THUMB_H},format=gray", "-vsync", "0",
+             "-vf", f"{(crop + ',') if crop else ''}scale={THUMB_W}:{THUMB_H},format=gray", *shots._passthrough(),
              "-f", "rawvideo", "-"],
             capture_output=True, timeout=1800)
     except (OSError, subprocess.SubprocessError):

@@ -26,6 +26,23 @@ _SCENE = re.compile(r"lavfi\.scene_score=([0-9.eE+-]+)")
 _YAVG = re.compile(r"lavfi\.signalstats\.YAVG=([0-9.eE+-]+)")
 
 
+_PASSTHROUGH: list[str] | None = None
+
+
+def _passthrough() -> list[str]:
+    """One output frame per input frame: ``-fps_mode passthrough`` (ffmpeg >= 5.1), else the older
+    ``-vsync 0`` that newer builds deprecate."""
+    global _PASSTHROUGH
+    if _PASSTHROUGH is None:
+        try:
+            out = subprocess.run(["ffmpeg", "-hide_banner", "-h", "full"], capture_output=True, text=True,
+                                 timeout=60).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        _PASSTHROUGH = ["-fps_mode", "passthrough"] if "-fps_mode" in out else ["-vsync", "0"]
+    return _PASSTHROUGH
+
+
 def _empty() -> dict:
     return {"t": [], "scene": [], "yavg": [], "thumb": []}
 
@@ -60,8 +77,13 @@ def active_crop(path: str) -> str | None:
 
 
 def frame_series(path: str, fps: float) -> dict:
-    """Per-frame ``{"t", "scene", "yavg", "thumb"}`` over the active picture (black bars cropped);
-    empty when fps is unknown (0)."""
+    """Per-frame ``{"t", "scene", "yavg", "thumb", "crop"}`` over the active picture (black bars cropped).
+
+    Pass one measures scene score and mean luma per frame; a second pass decodes a 16x9 RGB thumbnail
+    per frame (``bytes``, 432 per frame). Empty when fps is unknown (0), when ffmpeg fails (a
+    truncated series would silently stretch the last shot to the media duration) or when the passes
+    disagree on the frame count (no thumbnails: gradual boundaries and transitions are then not
+    determined)."""
     if not fps or fps <= 0:
         return _empty()
     crop = active_crop(path)
@@ -70,9 +92,11 @@ def frame_series(path: str, fps: float) -> dict:
     try:
         res = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-an",
-             "-vf", vf, "-vsync", "0", "-f", "null", "-"],
+             "-vf", vf, *_passthrough(), "-f", "null", "-"],
             capture_output=True, text=True, timeout=1800)
     except (OSError, subprocess.SubprocessError):
+        return _empty()
+    if res.returncode != 0:  # decode error / killed: a partial series is worse than none
         return _empty()
     series = _empty()
     cur: dict = {}
@@ -100,20 +124,21 @@ def frame_series(path: str, fps: float) -> dict:
     return series
 
 
-def _thumbs(path: str, count: int, pre: str = "") -> list[list[int]]:
-    """Tiny RGB thumbnail per frame (second pass); [] when the count disagrees."""
+def _thumbs(path: str, count: int, pre: str = "") -> list[bytes]:
+    """Tiny RGB thumbnail per frame (second pass), as ``bytes`` slices (a third of the memory of int
+    lists: ~370 MB/h at 30 fps otherwise); [] when the pass fails or the count disagrees."""
     size = THUMB_W * THUMB_H * 3
     try:
         res = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-an", "-vf",
-             f"{pre}scale={THUMB_W}:{THUMB_H}:flags=area,format=rgb24", "-vsync", "0", "-f", "rawvideo", "-"],
+             f"{pre}scale={THUMB_W}:{THUMB_H}:flags=area,format=rgb24", *_passthrough(), "-f", "rawvideo", "-"],
             capture_output=True, timeout=1800)
     except (OSError, subprocess.SubprocessError):
         return []
     raw = res.stdout
-    if len(raw) != size * count:
+    if res.returncode != 0 or len(raw) != size * count:
         return []
-    return [list(raw[i * size:(i + 1) * size]) for i in range(count)]
+    return [raw[i * size:(i + 1) * size] for i in range(count)]
 
 
 def _cut_threshold(scene: list[float]) -> float:
@@ -140,10 +165,16 @@ def _dist(a, b) -> float:
     return sum(abs(x - y) for x, y in zip(a, b)) / (255.0 * len(a))
 
 
+FLAT_STD = 10.0  # thumbnail spread below this is a blank, single-colour frame
+
+
 def _flat_extreme(th) -> bool:
-    """Near-black or near-white thumbnail (the end of a fade, not content)."""
+    """Near-black, near-white or single-colour thumbnail (the end of a fade, not content)."""
     m = sum(th) / len(th)
-    return m < DARK or m > WHITE_MEAN
+    if m < DARK or m > WHITE_MEAN:
+        return True
+    # per colour channel: a saturated single colour (red = 255, 0, 0 per pixel) is flat, not spread
+    return max(statistics.pstdev(th[c::3]) for c in range(3)) < FLAT_STD
 
 
 def _fps_of(t: list[float]) -> float:
@@ -168,6 +199,36 @@ def _flash_cuts(cands: list[int], strength: list[float], series: dict) -> set[in
     return drop
 
 
+REFINE_ALPHA = 0.03  # a frame this close to either end frame (share of the blend) is still outside the dissolve
+REFINE_CONTEXT = 3  # stable frames on each side of the window used as the pure end frames
+
+
+def _refine_window(thumb: list, i0: int, i1: int) -> tuple[int, int]:
+    """Tighten a quantised dissolve window onto the blend ramp.
+
+    Projects every frame near the window onto the line between the (pure) frames just outside
+    it: the dissolve starts where that share first leaves ~0 and ends where it reaches ~1.
+    Falls back to the window itself when the ends are indistinguishable or the ramp is not
+    monotone enough to read."""
+    n = len(thumb)
+    a, b = max(0, i0 - REFINE_CONTEXT), min(n - 1, i1 + REFINE_CONTEXT)
+    ta, tb = thumb[a], thumb[b]
+    d = [y - x for x, y in zip(ta, tb)]
+    dd = sum(v * v for v in d)
+    if dd == 0:
+        return i0, i1
+    alpha = [max(0.0, min(1.0, sum((fv - x) * dv for fv, x, dv in zip(thumb[k], ta, d)) / dd))
+             for k in range(a, b + 1)]
+    first = next((k for k, al in enumerate(alpha) if al > REFINE_ALPHA), None)
+    last = next((k for k in range(len(alpha) - 1, -1, -1) if alpha[k] < 1 - REFINE_ALPHA), None)
+    if first is None or last is None:
+        return i0, i1
+    r0, r1 = a + max(0, first - 1), a + min(len(alpha) - 1, last + 1)
+    if r1 - r0 < GRADUAL_MIN_FRAMES:
+        return i0, i1
+    return r0, r1
+
+
 def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
     """Dissolves: a window whose end frames differ a lot while the content on
     either side of the window is stable. Needs thumbnails; never guesses."""
@@ -177,6 +238,7 @@ def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
         return []
     fps = _fps_of(t)
     cap = int(MAX_GRADUAL_S * fps)
+    flat_start, flat_end = _flat_extreme(thumb[0]), _flat_extreme(thumb[-1])
     cands = []
     for i0 in range(n):
         for length in _LENGTHS:
@@ -190,8 +252,10 @@ def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
             if any(i0 < c <= i1 for c in cut_idx):
                 continue
             # a fade in from / out to black near a clip edge is not a shot boundary
+            # (to black, white or any single colour: judged by the clip's own edge frame, since a
+            # window can end a few frames before the picture has fully left)
             near = int(0.5 * fps)
-            if (i0 < near and _flat_extreme(thumb[i0])) or (n - 1 - i1 < near and _flat_extreme(thumb[i1])):
+            if (i0 < near and flat_start) or (n - 1 - i1 < near and flat_end):
                 continue
             cross = _dist(thumb[i0], thumb[i1])
             if cross < MIN_CROSS:
@@ -206,8 +270,9 @@ def _gradual(series: dict, cut_idx: set[int]) -> list[dict]:
         if any(i0 <= e + 1 and s0 - 1 <= i1 for s0, e in taken):
             continue
         taken.append((i0, i1))
-        out.append({"kind": "gradual", "t": round((t[i0] + t[i1]) / 2, 6), "frames": i1 - i0,
-                    "t_start": t[i0], "t_end": t[i1],
+        r0, r1 = _refine_window(thumb, i0, i1)
+        out.append({"kind": "gradual", "t": round((t[r0] + t[r1]) / 2, 6), "frames": r1 - r0,
+                    "t_start": t[r0], "t_end": t[r1],
                     "confidence": round(_clamp(0.4 + 0.08 * score), 3)})
     return out
 
