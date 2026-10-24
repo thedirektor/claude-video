@@ -13,6 +13,12 @@ Breakdown: measure a reference video into something that can be rebuilt, without
 - **`watch.py compare`**: reference vs your version — alignment, timing deltas, slow-motion side-by-side video.
 - Media pinning for videos with a breakdown (`WATCH_BREAKDOWN_MEDIA_MAX_MB`).
 - MCP tools `breakdown`, `motion`, `compare` (local stdio server); `doctor` checks `opencv` and `numpy` and names the breakdown fields affected.
+- `breakdown --stored` returns the stored breakdown without re-measuring; PC breakdowns and motion outputs are pushed to the central memory with the run bundle.
+
+### Fixed during end-to-end testing
+- AV1 media (OpenCV's bundled ffmpeg cannot decode it): downloads prefer H.264, undecodable stored media is transcoded once.
+- Cuts are measured on the active picture: black bars (a 16:9 edit inside a 9:16 phone frame, pillarboxed 4:3) no longer hide them.
+- Low-confidence OCR readings stay in `breakdown.json`, out of the brief; transcript voice is labelled speech or sung lyrics.
 
 ## [0.6.0] — 2026-10-23
 
