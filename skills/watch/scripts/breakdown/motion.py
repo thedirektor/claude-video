@@ -30,6 +30,8 @@ MIN_MOVE_PX = 1.5  # total travel below this is "no motion"
 NOISE_PX = 0.2  # per-frame travel treated as tracking noise
 GAP_FRAMES = 2  # still frames bridged inside one move
 HOLD_MIN_FRAMES = 3
+MERGE_CLEAR_RMS = 0.005  # ...and either this tight or clearly below the split pair's RMS
+MERGE_PEAK_TOL = 0.15  # measured vs fitted overshoot peak, relative
 MERGE_MAX_RMS = 0.02  # a move + its return merge into one overshoot curve only when this tight
 PERP_MAX = 0.5  # path wider than this share of its length is not one straight move
 
@@ -304,6 +306,37 @@ def _fit_span(T, q, f, ia, ib, prev_end, next_start) -> dict:
     return easing.fit_bounds(tt, qq, s_c, e_c)
 
 
+def _rms_of(fit) -> float:
+    r = fit.get("error_rms") if isinstance(fit, dict) else None
+    return float(r) if isinstance(r, (int, float)) and fit.get("godot") != NOT_DETERMINED else float("inf")
+
+
+def _accept_merge(T, q, f, ph, nxt, span) -> bool:
+    """A move + its return is one overshoot curve only when that is clearly the better story.
+
+    The merged fit must be tight, clearly better than the split pair, and its own
+    peak overshoot must match the measured one (a BACK curve cannot explain a
+    separate return of a different size).
+    """
+    g = span.get("godot")
+    merged = _rms_of(span)
+    if g == NOT_DETERMINED or merged > MERGE_MAX_RMS:
+        return False
+    split = max(_rms_of(_fit_span(T, q, f, ph["ia"], ph["ib"], ph["prev_end"], nxt["ia"])),
+                _rms_of(_fit_span(T, q, f, nxt["ia"], nxt["ib"], ph["ib"], nxt["next_start"])))
+    if not (merged <= MERGE_CLEAR_RMS or merged < 0.5 * split):
+        return False
+    fc = easing.curve(g["trans"], g["ease"])
+    fitted = max(fc(i / 200.0) for i in range(201)) - 1.0
+    q0, q_end = float(q[max(ph["prev_end"], ph["ia"] - 2)]), float(q[nxt["ib"]])
+    total = q_end - q0
+    if abs(total) < 1e-9:
+        return False
+    peak = max(float(q[i]) for i in range(ph["ia"], nxt["ib"] + 1))
+    measured = (peak - q_end) / total
+    return abs(measured - fitted) <= max(MERGE_PEAK_TOL * max(fitted, 0.0), 0.005)
+
+
 def _build_phases(T, P, scores, fps, ppu, W, H, notes):
     import numpy as np  # noqa: PLC0415
     n = len(T)
@@ -361,8 +394,7 @@ def _build_phases(T, P, scores, fps, ppu, W, H, notes):
                 and nxt["ia"] - ph["ib"] <= GAP_FRAMES
                 and abs(deltas[nxt["run"]]) < abs(deltas[ph["run"]])):
             span = _fit_span(T, q, f, ph["ia"], nxt["ib"], ph["prev_end"], nxt["next_start"])
-            if (span.get("godot") != NOT_DETERMINED and isinstance(span.get("error_rms"), float)
-                    and span["error_rms"] <= MERGE_MAX_RMS):
+            if _accept_merge(T, q, f, ph, nxt, span):
                 notes.append("the move and its return were fitted as one overshoot curve")
                 merged_phases.append({**ph, "ib": nxt["ib"], "next_start": nxt["next_start"], "span": span})
                 k += 2
@@ -394,8 +426,11 @@ def _build_phases(T, P, scores, fps, ppu, W, H, notes):
     holds = []
     for k, ph in enumerate(phases):
         stop = phases[k + 1]["ia"] if k + 1 < len(phases) else n - 1
-        if T[stop] - refined_end[k] >= HOLD_MIN_FRAMES * f - 1e-9:
-            holds.append(_phase_dict("hold", refined_end[k], T[stop], 0.0, 0.0, W, H, ppu,
+        h_end = T[stop]
+        if k + 1 < len(out):
+            h_end = min(h_end, out[k + 1]["t_start"])
+        if h_end - refined_end[k] >= HOLD_MIN_FRAMES * f - 1e-9:
+            holds.append(_phase_dict("hold", refined_end[k], h_end, 0.0, 0.0, W, H, ppu,
                                      "not applicable", None, conf_track))
     out_all = out + holds
     out_all.sort(key=lambda d: d["t_start"])

@@ -318,3 +318,28 @@ def test_overshoot_ease_is_one_action(conn, tmp_path):
     assert acts[0]["displacement"]["px"] == pytest.approx(600, abs=10)
     gd = motion.snippets(m)["godot.gd"]
     assert gd.count("tween_property") == 1 and "TRANS_BACK" in gd and "EASE_OUT" in gd
+
+
+def _cub(t0, t1):
+    return f"(1-pow(1-{_u(t0, t1)}\\,3))"
+
+
+@pytestmark_media
+@pytest.mark.parametrize("ret", [
+    f"-60*(0.5-0.5*cos(PI*{_u(0.6, 0.8)}))",  # immediate sine return of 10%
+    f"-40*pow({_u(0.633, 0.8)}\\,2)",  # 2-frame settle, then a quad return
+])
+def test_move_plus_separate_return_is_not_a_fake_back(conn, tmp_path, ret):
+    root = _ov(conn, tmp_path, f"100+600*{_cub(0.2, 0.6)}{ret}", d=1.4, sq=80)
+    m = motion.analyze(conn, KEY, 0.0, 1.4, store_dir=root)
+    names = [p["name"] for p in m["phases"]]
+    assert names[:2] == ["action", "recovery"], (names, m["notes"])
+    act = m["phases"][0]["curve"]
+    assert act["godot"] == {"trans": "CUBIC", "ease": "OUT"}
+    for ph in m["phases"]:
+        c = ph["curve"]
+        assert not (isinstance(c, dict) and isinstance(c.get("godot"), dict) and c["godot"]["trans"] == "BACK")
+    holds = [p for p in m["phases"] if p["name"] == "hold"]
+    for a, b in zip(m["phases"], m["phases"][1:]):
+        assert a["t_end"] <= b["t_start"] + 1e-6 or a["name"] != "hold"
+    assert holds
