@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from breakdown import assemble, cli, interchange  # noqa: E402
+from breakdown import assemble, interchange  # noqa: E402
 
 ND = "not determined"
 
@@ -233,7 +233,6 @@ def test_single_shot_clip():
 
 
 def test_skip_reason_text():
-    assert cli  # cli prints this reason when nothing was written
     bd = make_bd()
     bd["shots"] = []
     assert interchange.skip_reason(bd).startswith("no shots")
@@ -249,3 +248,71 @@ def test_edl_parses_with_otio_cmx3600_adapter_when_available():
     tl = otio.adapters.read_from_string(interchange.to_edl(bd, "/m/media.mp4"), "cmx_3600", rate=25)
     assert len(list(tl.find_clips())) == len(bd["shots"])
     assert tl.duration().value == 7 * 25
+
+
+# ---------------------------------------------------------------- 0.7.1 backlog
+
+
+def test_reference_audio_travels_with_the_timelines():
+    bd = make_bd()
+    bd["video"]["has_audio"] = True
+    d = interchange.to_otio(bd, "/m/media.mp4")
+    kinds = [t["kind"] for t in d["tracks"]["children"]]
+    assert kinds == ["Video", "Audio"]
+    assert len(d["tracks"]["children"][1]["children"]) == len(bd["shots"])
+    asset = ET.fromstring(interchange.to_fcpxml(bd, "/m/media.mp4")).find(".//asset")
+    assert asset.get("hasAudio") == "1"
+    events = [ln for ln in interchange.to_edl(bd, "/m/media.mp4").splitlines() if re.match(r"\d{3}  ", ln)]
+    assert all(ln.split()[2] == "B" for ln in events)
+
+
+def test_silent_reference_stays_video_only():
+    bd = make_bd()
+    d = interchange.to_otio(bd, "/m/media.mp4")
+    assert [t["kind"] for t in d["tracks"]["children"]] == ["Video"]
+    assert ET.fromstring(interchange.to_fcpxml(bd, "/m/media.mp4")).find(".//asset").get("hasAudio") is None
+
+
+def test_zero_length_dissolve_is_named_as_such():
+    bd = make_bd(kinds={1: ("dissolve", 0.0)})
+    names = [m["name"] for c in interchange._plan(bd, None)["clips"] for m in c["markers"]]
+    assert "dissolve duration not determined" in names
+    assert not any("no native equivalent" in n for n in names)
+
+
+def test_edl_header_and_dissolve_clip_names():
+    bd = make_bd(kinds={1: ("dissolve", 1.0)})
+    edl = interchange.to_edl(bd, "/m/media.mp4")
+    assert "EDL has no markers" not in edl and "LOC comments" in edl
+    assert "* TO CLIP NAME: media.mp4" in edl
+
+
+def test_edl_comments_are_one_line():
+    bd = make_bd()
+    bd["typography"]["tracks"][0]["text"] = "SALE\n50%"
+    bd["notes"] = ["two\nlines"]
+    for ln in interchange.to_edl(bd, "/m/media.mp4").splitlines():
+        assert not ln.startswith(("50%", "lines"))
+
+
+def test_first_shot_start_is_kept():
+    bd = make_bd()
+    bd["shots"][0]["start"] = 0.4
+    p = interchange._plan(bd, None)
+    assert p["clips"][0]["start"] == 10  # 0.4 s at 25 fps
+
+
+def test_text_marker_continues_across_a_cut():
+    bd = make_bd(cuts=(2.0, 4.5, 6.0))
+    bd["typography"]["tracks"][0].update(t_in=1.0, t_out=3.0)
+    p = interchange._plan(bd, None)
+    texts = [(c["i"], m["frame"], m["dur"]) for c in p["clips"] for m in c["markers"] if m["kind"] == "text"]
+    assert texts == [(0, 25, 25), (1, 50, 25)]  # 1.0-2.0 in shot 1, 2.0-3.0 continued in shot 2
+
+
+def test_fcpxml_without_a_known_size_is_skipped_not_guessed(tmp_path):
+    bd = make_bd(width=0, height=0)
+    with pytest.raises(ValueError):
+        interchange.to_fcpxml(bd, None)
+    written = interchange.write_timelines(bd, tmp_path / "breakdown", ["fcpxml", "edl"], media_path="/m/x.mp4")
+    assert [w.name for w in written] == ["timeline.edl"]

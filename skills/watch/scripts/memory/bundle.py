@@ -113,6 +113,21 @@ def _safe_extract(zip_path: Path, dest: Path) -> None:
         z.extractall(dest)
 
 
+def _generated_at(path: Path) -> str:
+    try:
+        return str(json.loads(path.read_text(encoding="utf-8")).get("generated_at") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _older(incoming: Path, existing: Path) -> bool:
+    """True when ``existing`` is a breakdown made after ``incoming`` (ISO timestamps compare as text;
+    a breakdown without one counts as oldest)."""
+    if not existing.is_file() or not incoming.is_file():
+        return False
+    return _generated_at(incoming) < _generated_at(existing)
+
+
 def import_bundle(zip_path, *, embedder: object = "auto") -> dict:
     """Merge a bundle into this machine's memory as origin=import."""
     zip_path = Path(zip_path)
@@ -149,6 +164,9 @@ def import_bundle(zip_path, *, embedder: object = "auto") -> dict:
         if result is None:
             raise BundleError("merge failed (see service log)")
         shipped = _breakdown_files(root / "breakdown")
+        dest_bd = store.video_dir(Path(memory_paths()["store_dir"]), run["video_key"]) / "breakdown" / "breakdown.json"
+        if shipped and _older(root / "breakdown" / "breakdown.json", dest_bd):
+            shipped = []  # never overwrite a newer central breakdown with an older bundled one
         if shipped:
             dest = store.video_dir(Path(memory_paths()["store_dir"]), run["video_key"]) / "breakdown"
             dest.mkdir(parents=True, exist_ok=True)

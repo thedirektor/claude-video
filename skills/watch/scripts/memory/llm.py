@@ -28,6 +28,13 @@ class LLMReply:
     tokens_out: int = 0
 
 
+def model_for(provider: str) -> str:
+    """The model each provider in the chain calls (one place for the defaults)."""
+    return {"headroom": setting("WATCH_LLM_MODEL", "gemini-3.1-flash-lite"),
+            "gemini": setting("WATCH_LLM_GEMINI_MODEL", "gemini-3.1-flash-lite"),
+            "openrouter": setting("WATCH_LLM_OPENROUTER_MODEL", "google/gemini-2.5-flash-lite")}[provider]
+
+
 def _timeout() -> float:
     try:
         return float(setting("WATCH_LLM_TIMEOUT", "30"))
@@ -65,7 +72,7 @@ def _openai_compatible(base_url: str, api_key: str, model: str, system: str, use
 def _headroom(system: str, user: str, max_tokens: int) -> LLMReply | None:
     return _openai_compatible(
         setting("WATCH_LLM_BASE_URL"), setting("WATCH_LLM_API_KEY"),
-        setting("WATCH_LLM_MODEL", "gemini-3.1-flash-lite"), system, user, max_tokens, "headroom")
+        model_for("headroom"), system, user, max_tokens, "headroom")
 
 
 def _openrouter(system: str, user: str, max_tokens: int) -> LLMReply | None:
@@ -76,8 +83,7 @@ def _openrouter(system: str, user: str, max_tokens: int) -> LLMReply | None:
         return None
     return _openai_compatible(
         "https://openrouter.ai/api", key,
-        setting("WATCH_LLM_OPENROUTER_MODEL", "google/gemini-2.5-flash-lite"),
-        system, user, max_tokens, "openrouter")
+        model_for("openrouter"), system, user, max_tokens, "openrouter")
 
 
 def _gemini(system: str, user: str, max_tokens: int) -> LLMReply | None:
@@ -89,7 +95,7 @@ def _gemini(system: str, user: str, max_tokens: int) -> LLMReply | None:
     from google import genai
     from google.genai import types
 
-    model = setting("WATCH_LLM_GEMINI_MODEL", "gemini-3.1-flash-lite")
+    model = model_for("gemini")
     client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=int(_timeout() * 1000)))
     resp = client.models.generate_content(
         model=model, contents=user,

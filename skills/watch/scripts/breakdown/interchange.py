@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import sys
 import xml.etree.ElementTree as ET
 from fractions import Fraction
 from pathlib import Path
@@ -115,7 +116,7 @@ def _plan(bd: dict, media_path) -> dict:
     tc = _rate(bd)
     shots = bd["shots"]
     n = len(shots)
-    b = [0]
+    b = [tc.frames_of(shots[0]["start"])]
     for s in shots[1:]:
         b.append(max(tc.frames_of(s["start"]), b[-1] + 1))
     b.append(max(tc.frames_of(shots[-1]["end"]), b[-1] + 1))
@@ -129,19 +130,21 @@ def _plan(bd: dict, media_path) -> dict:
             dur = (tr or {}).get("duration") or 0.0
             dur = dur if isinstance(dur, (int, float)) else 0.0
             c["transition"] = kind
-            if kind == "dissolve" and dur > 0:
+            if kind == "dissolve" and dur <= 0:
+                _tmark(c, b[i], "dissolve duration not determined (represented as a cut)")
+            elif kind == "dissolve":
                 d = tc.frames_of(dur)
                 h = min(d // 2, (b[i] - b[i - 1]) // 2)
                 tail = min(d - d // 2, (b[i + 1] - b[i]) // 2)
                 if h + tail >= MIN_DISSOLVE_FRAMES:
                     c["h"], c["tail"] = h, tail
                 else:
-                    _tmark(c, tc, b[i], "dissolve too short to place (represented as a cut)", dur)
+                    _tmark(c, b[i], "dissolve too short to place (represented as a cut)")
             elif kind != "cut":
                 if kind == NOT_DETERMINED or not isinstance(kind, str):
-                    _tmark(c, tc, b[i], "transition not determined", dur)
+                    _tmark(c, b[i], "transition not determined")
                 else:
-                    _tmark(c, tc, b[i], f"{kind} {dur:.2f}s (no native equivalent; represented as a cut)", dur)
+                    _tmark(c, b[i], f"{kind} {dur:.2f}s (no native equivalent; represented as a cut)")
                     c["markers"][-1]["name"] = kind
         clips.append(c)
     starts = b[:-1]
@@ -150,10 +153,18 @@ def _plan(bd: dict, media_path) -> dict:
         return clips[max(0, min(n - 1, bisect.bisect_right(starts, frame) - 1))]
 
     def add(frame: int, name: str, comment: str, color: str, kind: str, dur_frames: int = 1) -> None:
-        c = owner(frame)
-        f = max(c["start"], min(frame, c["end"] - 1))
-        c["markers"].append({"frame": f, "dur": max(1, min(dur_frames, c["end"] - f)), "name": name,
-                             "comment": comment, "color": color, "kind": kind})
+        """One marker per clip the span covers (a text that stays on across a cut keeps its tail)."""
+        end = frame + max(1, dur_frames)
+        part = 0
+        while True:
+            c = owner(frame)
+            f = max(c["start"], min(frame, c["end"] - 1))
+            stop = min(end, c["end"])
+            c["markers"].append({"frame": f, "dur": max(1, stop - f), "name": name,
+                                 "comment": comment + (" (continued)" if part else ""), "color": color, "kind": kind})
+            if stop >= end or c is clips[-1]:
+                break
+            frame, part = stop, part + 1
 
     for f in bd.get("fades") or []:
         ev = f.get("evidence") or {}
@@ -179,11 +190,12 @@ def _plan(bd: dict, media_path) -> dict:
     total = b[-1]
     media_frames = max(total, tc.frames_of(bd["video"].get("duration") or 0.0))
     return {"tc": tc, "clips": clips, "total": total, "media_frames": media_frames,
+            "audio": bool(bd["video"].get("has_audio")),
             "start": tc.start_frames(), "media_name": _media_name(bd, media_path),
             "uri": _media_uri(bd, media_path), "path": str(media_path) if media_path else None}
 
 
-def _tmark(c: dict, tc: Timecode, frame: int, text: str, dur: float) -> None:
+def _tmark(c: dict, frame: int, text: str) -> None:
     c["markers"].append({"frame": frame, "dur": 1, "name": text.split(" (")[0], "comment": text,
                          "color": "RED", "kind": "transition"})
 
@@ -222,13 +234,34 @@ def to_otio(bd: dict, media_path) -> dict:
             "metadata": {"watch": {"shot": c["i"], "media_file": p["media_name"]}}})
     track = {"OTIO_SCHEMA": "Track.1", "name": "Video 1", "kind": "Video", "enabled": True, "children": children,
              "source_range": None, "effects": [], "markers": [], "metadata": {}}
+    tracks = [track]
+    if p["audio"]:
+        # the reference sound under the same edit, so a beat-driven rebuild hears what it cuts to
+        audio = [{"OTIO_SCHEMA": "Clip.2", "name": c["name"], "enabled": True, "effects": [], "markers": [],
+                  "source_range": _tr(c["start"], c["end"] - c["start"], rate),
+                  "media_references": {"DEFAULT_MEDIA": dict(ref)}, "active_media_reference_key": "DEFAULT_MEDIA",
+                  "metadata": {"watch": {"shot": c["i"]}}} for c in p["clips"]]
+        tracks.append({"OTIO_SCHEMA": "Track.1", "name": "Audio 1", "kind": "Audio", "enabled": True,
+                       "children": audio, "source_range": None, "effects": [], "markers": [], "metadata": {}})
     return {"OTIO_SCHEMA": "Timeline.1", "name": bd["video"].get("title") or bd["video"].get("key") or "breakdown",
             "global_start_time": _rt(p["start"], rate), "metadata": {"watch": {"schema": bd.get("schema")}},
-            "tracks": {"OTIO_SCHEMA": "Stack.1", "name": "tracks", "enabled": True, "children": [track],
+            "tracks": {"OTIO_SCHEMA": "Stack.1", "name": "tracks", "enabled": True, "children": tracks,
                        "source_range": None, "effects": [], "markers": [], "metadata": {}}}
 
 
 # --------------------------------------------------------------------------- FCPXML
+
+def _frame_size(v: dict, media_path) -> tuple[int, int] | None:
+    if v.get("width") and v.get("height"):
+        return int(v["width"]), int(v["height"])
+    if media_path and "://" not in str(media_path) and Path(str(media_path)).is_file():
+        from . import media
+
+        info = media.probe(Path(str(media_path)))
+        if info and info["width"] and info["height"]:
+            return info["width"], info["height"]
+    return None
+
 
 def to_fcpxml(bd: dict, media_path) -> str:
     """FCPXML 1.10: one ``asset``, a ``spine`` of ``asset-clip`` (one per shot),
@@ -240,11 +273,14 @@ def to_fcpxml(bd: dict, media_path) -> str:
     root = ET.Element("fcpxml", version="1.10")
     res = ET.SubElement(root, "resources")
     fmt = {"id": "r1", "frameDuration": f"{tc.den}/{tc.num}s"}
-    if v.get("width") and v.get("height"):
-        fmt.update(width=str(int(v["width"])), height=str(int(v["height"])))
+    size = _frame_size(v, media_path)
+    if size is None:
+        raise ValueError("frame size unknown: FCPXML needs the picture size")
+    fmt.update(width=str(size[0]), height=str(size[1]))
     ET.SubElement(res, "format", fmt)
     asset = ET.SubElement(res, "asset", {"id": "r2", "name": p["media_name"], "start": "0s",
-                                         "duration": S(p["media_frames"]), "hasVideo": "1", "format": "r1"})
+                                         "duration": S(p["media_frames"]), "hasVideo": "1", "format": "r1",
+                                         **({"hasAudio": "1", "audioSources": "1"} if p["audio"] else {})})
     ET.SubElement(asset, "media-rep", {"kind": "original-media", "src": p["uri"]})
     if any(c["h"] + c["tail"] for c in p["clips"]):
         ET.SubElement(res, "effect", {"id": "r3", "name": "Cross Dissolve", "uid": CROSS_DISSOLVE_UID})
@@ -280,6 +316,11 @@ def _edl_title(bd: dict) -> str:
     return " ".join(str(t).split())[:60]
 
 
+def _one_line(text) -> str:
+    """EDL comments are one line each: a newline inside OCR text or a note would start a bogus event."""
+    return " ".join(str(text).split())
+
+
 def to_edl(bd: dict, media_path) -> str:
     """CMX3600 EDL: one numbered event per shot (``C`` cut, ``D nnn`` dissolve),
     ``* FROM CLIP NAME:`` comments, drop-frame TC (``;``) for 29.97 / 59.94."""
@@ -292,9 +333,10 @@ def to_edl(bd: dict, media_path) -> str:
     out = [f"TITLE: {_edl_title(bd)}", f"FCM: {'DROP FRAME' if tc.drop else 'NON-DROP FRAME'}", ""]
     # strict parsers (OTIO's cmx_3600) reject comment lines before the first event,
     # so the file-level remarks ride along with event 1's comments
-    head = ["* EDL has no markers: text / transition notes follow as LOC comments"
-            + (f"; {beats} beat markers are in the OTIO / FCPXML files only" if beats else "")]
-    head += [f"* NOTE: {m['comment']}" for m in notes]
+    head = ["* text / transition notes follow as LOC comments"
+            + (f"; the {beats} beat markers are in the OTIO / FCPXML files only" if beats else "")]
+    head += [f"* NOTE: {_one_line(m['comment'])}" for m in notes]
+    trk = "B   " if p["audio"] else "V   "  # B = picture and the reference sound
     clips = p["clips"]
     for k, c in enumerate(clips):
         rec_in = c["start"] - c["h"]
@@ -303,23 +345,25 @@ def to_edl(bd: dict, media_path) -> str:
         n = c["i"] + 1
         rows = []
         if c["h"] + c["tail"]:
-            rows.append(f"{n:03d}  AX       V     C        {S(src_in)} {S(src_in)} {T(rec_in)} {T(rec_in)}")
-            rows.append(f"{n:03d}  AX       V     D    {c['h'] + c['tail']:03d} "
+            rows.append(f"{n:03d}  AX       {trk}  C        {S(src_in)} {S(src_in)} {T(rec_in)} {T(rec_in)}")
+            rows.append(f"{n:03d}  AX       {trk}  D    {c['h'] + c['tail']:03d} "
                         f"{S(src_in)} {S(src_out)} {T(rec_in)} {T(rec_out)}")
         else:
-            rows.append(f"{n:03d}  AX       V     C        {S(src_in)} {S(src_out)} {T(rec_in)} {T(rec_out)}")
+            rows.append(f"{n:03d}  AX       {trk}  C        {S(src_in)} {S(src_out)} {T(rec_in)} {T(rec_out)}")
         out += rows
-        out.append(f"* FROM CLIP NAME: {p['media_name']}")
+        out.append(f"* FROM CLIP NAME: {_one_line(p['media_name'])}")
+        if c["h"] + c["tail"]:
+            out.append(f"* TO CLIP NAME: {_one_line(p['media_name'])}")
         if k == 0:
             out += head
         if p["path"]:
-            out.append(f"* SOURCE FILE: {p['path']}")
+            out.append(f"* SOURCE FILE: {_one_line(p['path'])}")
         out.append(f"* COMMENT: {c['name']} (source {S(c['start'])} - {S(c['end'])})")
         if c["h"] + c["tail"]:
             out.append(f"* COMMENT: dissolve {c['h'] + c['tail']} frames centred on the cut at {T(c['start'])}")
         for m in c["markers"]:
             if m["kind"] in ("text", "transition", "fade"):
-                out.append(f"* LOC: {T(m['frame'])} {m['color']:<7} {m['comment']}")
+                out.append(f"* LOC: {T(m['frame'])} {m['color']:<7} {_one_line(m['comment'])}")
         out.append("")
     return "\n".join(out)
 
@@ -345,7 +389,12 @@ def write_timelines(bd: dict, out_dir: Path, formats: list[str], media_path=None
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for fmt in formats:
+        try:
+            text = WRITERS[fmt](bd, media_path)
+        except ValueError as exc:  # e.g. FCPXML without a known frame size: skipped, never guessed
+            print(f"[watch] timeline.{fmt} skipped: {exc}", file=sys.stderr)
+            continue
         path = out_dir / f"timeline.{fmt}"
-        path.write_text(WRITERS[fmt](bd, media_path), encoding="utf-8")
+        path.write_text(text, encoding="utf-8")
         written.append(path)
     return written

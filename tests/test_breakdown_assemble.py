@@ -304,3 +304,65 @@ def test_black_hold_between_fades_is_its_own_shot(tmp_path):
     assert [round(x["start"], 1) for x in kept] == [0.0, 2.0, 3.0], [(x["start"], x["end"]) for x in kept]
     assert kept[1]["transition"]["kind"] == "fade_to_black" and kept[2]["transition"]["kind"] == "fade_from_black"
     assert kept[1]["end"] == pytest.approx(3.0, abs=0.06) and loose == []
+
+
+# ---- 0.7.1 backlog -----------------------------------------------------------
+
+
+def test_short_real_shot_fading_up_is_not_folded_into_a_dip():
+    """A 0.8 s shot whose first 0.2 s fade up from black stays a shot (only a phantom dip folds)."""
+    raw = [_sh(0, 0, 2.0), _sh(1, 2.0, 2.8, "cut"), _sh(2, 2.8, 5.0, "cut")]
+    entries = [_en("cut", 2.0, 0.0), _en("cut", 2.8, 0.0), _en("fade_from_black", 2.15, 0.2)]
+    shots, _ = assemble.reconcile(raw, entries)
+    assert len(shots) == 3 and [s["transition"]["kind"] for s in shots[1:]] == ["cut", "cut"]
+
+
+def test_speech_confidence_follows_the_transcript_source():
+    assert assemble.speech_confidence("captions") > assemble.speech_confidence("whisper (local)")
+    assert assemble.speech_confidence(None) <= assemble.speech_confidence("groq")
+
+
+def test_interpret_cost_refused_before_measuring(conn, monkeypatch):
+    monkeypatch.setenv("WATCH_COST_CEILING_USD", "0.0000001")
+    index.record_run(conn, fake_run(title="Paid", duration=10.0))
+
+    def no_fetch(*a, **k):
+        raise AssertionError("measuring started before the cost check")
+
+    import cost
+    with pytest.raises(cost.CostCeilingExceeded):
+        assemble.build(conn, KEY, interpret=True, fetch=no_fetch, store_dir=Path("/nonexistent-store"))
+
+
+def test_model_names_come_from_one_place():
+    from memory import llm
+
+    assert llm.model_for("gemini") and llm.model_for("openrouter") and llm.model_for("headroom")
+
+
+def test_audio_notes_are_listed_once(bd):
+    import copy
+
+    b = copy.deepcopy(bd)
+    b["audio"]["notes"] = ["half/double-time ambiguous"]
+    b["notes"] = list(b["notes"]) + ["half/double-time ambiguous"]
+    md = assemble.brief_md(b)
+    assert "tempo note" not in md and md.count("half/double-time ambiguous") == 1
+
+
+def test_three_shots_have_distinct_fastest_and_slowest():
+    from breakdown import shots as S
+
+    sh = [{"start": a, "end": b, "duration": b - a, "evidence": {"confidence": 0.9}}
+          for a, b in ((0.0, 0.5), (0.5, 3.0), (3.0, 4.0))]
+    r = S.rhythm(sh)
+    assert r["fastest_window"] != r["slowest_window"]
+
+
+def test_import_keeps_a_newer_local_breakdown(tmp_path):
+    from memory import bundle
+
+    old, new = tmp_path / "old.json", tmp_path / "new.json"
+    old.write_text('{"generated_at": "2026-10-20T10:00:00+00:00"}')
+    new.write_text('{"generated_at": "2026-10-24T10:00:00+00:00"}')
+    assert bundle._older(old, new) and not bundle._older(new, old)

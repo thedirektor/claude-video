@@ -11,6 +11,7 @@ named ``interpretation``.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,7 @@ SAMPLING_NOTE_SEEK = (f"sampled every {typography.STEP_S:g} s by seeking (frame 
 BLIND_SPOT_NOTE = ("dissolves between two moving shots can go undetected and jump cuts within one framing "
                    "may be merged: cuts and shots are what was measured")
 HOLD_MIN_S = 0.5  # a black / white hold this long between two fades is its own shot (0.7.0 ruling)
+FOLD_MIN_COVER = 0.6  # share of the in-between shot the loose fade must cover to fold it into a dip
 FOLD_MAX_S = 1.0  # a fade between two cuts this close is one dip, not a shot
 
 
@@ -180,8 +182,13 @@ def reconcile(raw_shots: list[dict], entries: list[dict]) -> tuple[list[dict], l
         mid, nxt = kept[i], kept[i + 1]
         fade = next((f for f in loose_now if f["evidence"]["t_start"] < nxt["start"] + EPS
                      and f["evidence"]["t_end"] > mid["start"] - EPS), None)
-        if (mid["transition"] and nxt["transition"] and nxt["start"] - mid["start"] <= FOLD_MAX_S
-                and fade is not None):
+        span = nxt["start"] - mid["start"]
+        covered = (min(fade["evidence"]["t_end"], nxt["start"]) - max(fade["evidence"]["t_start"], mid["start"])
+                   if fade is not None else 0.0)
+        # fold only a phantom shot that IS the dip (the fade covers most of it); a real short shot
+        # that fades up inside itself keeps its own boundaries
+        if (mid["transition"] and nxt["transition"] and span <= FOLD_MAX_S
+                and fade is not None and covered >= FOLD_MIN_COVER * span):
             color = fade["kind"].rsplit("_", 1)[1]
             cut = round((mid["start"] + nxt["start"]) / 2, 6)
             lo = min(mid["transition"]["evidence"]["t_start"], fade["evidence"]["t_start"])
@@ -261,8 +268,17 @@ def _music_section(m: dict, a: dict, speech: list[dict], duration: float) -> dic
                             (0.9 if present is False else 0.0))}
 
 
+def speech_confidence(transcript_source: str | None) -> float:
+    """How far a transcript segment's times can be trusted: published captions are timed by a
+    person, speech recognition by a model; an unknown source gets the lower value."""
+    src = (transcript_source or "").lower()
+    if src.startswith("captions") or src == "transcriptapi":
+        return 0.85
+    return 0.7 if src else 0.6
+
+
 def _audio_section(m: dict, bd_shots: list[dict], duration: float, segments: list[dict],
-                   notes: list[str]) -> dict:
+                   notes: list[str], transcript_source: str | None = None) -> dict:
     if m.get("path") and m.get("has_audio"):
         a = audio_mod.analyze(m["path"], duration)
     else:
@@ -279,13 +295,14 @@ def _audio_section(m: dict, bd_shots: list[dict], duration: float, segments: lis
     if isinstance(cob, str):
         cob = {"share": NOT_DETERMINED, "evidence": _ev(0.0, duration, "measured", 0.0)}
     a["cuts_on_beat"] = cob
+    sconf = speech_confidence(transcript_source)
     speech = [{"t_start": s["start"], "t_end": s["end"],
-               "evidence": _ev(s["start"], s["end"], "transcript", 0.8)} for s in segments]
+               "evidence": _ev(s["start"], s["end"], "transcript", sconf)} for s in segments]
     segments = [{"start": s["start"], "end": s["end"]} for s in segments]
     music = _music_section(m, a, segments, duration)
     seg = {"speech": speech if speech else NOT_DETERMINED, "music": music,
            "evidence": _ev(0.0, duration, "transcript" if speech else "measured",
-                           0.8 if speech else music["evidence"]["confidence"])}
+                           sconf if speech else music["evidence"]["confidence"])}
     a["segments"] = seg
     return a
 
@@ -299,7 +316,8 @@ def _typography_section(m: dict, duration: float, notes: list[str]) -> dict:
         _add_note(notes, n)
     if tnotes:
         return {"tracks": NOT_DETERMINED, "evidence": _ev(0.0, duration, "ocr", 0.0)}
-    conf = max((t["evidence"]["confidence"] for t in tracks), default=0.5)
+    # nothing found: the claim "no text in the samples" is as good as the sampling, which the note states
+    conf = max((t["evidence"]["confidence"] for t in tracks), default=0.6 if tracks == [] else 0.0)
     note = SAMPLING_NOTE if typography.scan_available(m["path"], duration) else SAMPLING_NOTE_SEEK
     return {"tracks": tracks, "sampling": note,
             "evidence": _ev(0.0, duration, "ocr", conf, sampling=note)}
@@ -335,14 +353,27 @@ def estimate_interpret_usd(system: str, user: str) -> float:
     at the real price of the most expensive provider in the configured chain."""
     import cost
     from memory import llm
-    from config import setting
 
-    models = {"headroom": setting("WATCH_LLM_MODEL", "gemini-3.1-flash-lite"),
-              "gemini": setting("WATCH_LLM_GEMINI_MODEL", "gemini-3.1-flash-lite"),
-              "openrouter": setting("WATCH_LLM_OPENROUTER_MODEL", "google/gemini-2.5-flash-lite")}
     tin = (len(system) + len(user)) / 4.0
     chain = llm.chain() or ["gemini"]
-    return max(cost._tokens_usd(f"{p}:{models[p]}", tin=tin, tout=INTERPRET_MAX_TOKENS) for p in chain)
+    return max(cost._tokens_usd(f"{p}:{llm.model_for(p)}", tin=tin, tout=INTERPRET_MAX_TOKENS) for p in chain)
+
+
+# the payload is capped at 60 shots + 20 texts, so its largest size is known before measuring
+INTERPRET_WORST_USER_CHARS = 60 * 220 + 20 * 80 + 200
+
+
+def check_interpret_cost(allow_cost: bool = False) -> None:
+    """Refuse an --interpret run up front (before minutes of measuring) when even the largest
+    possible payload would exceed the cost ceiling."""
+    import cost
+
+    system, _ = _interpret_payload({"shots": [], "typography": {"tracks": []}, "video": {"duration": 0}})
+    est, ceiling = estimate_interpret_usd(system, "x" * INTERPRET_WORST_USER_CHARS), cost.ceiling()
+    if not allow_cost and ceiling > 0 and est > ceiling:
+        raise cost.CostCeilingExceeded(
+            f"estimated interpretation cost up to ${est:.4f} exceeds WATCH_COST_CEILING_USD ${ceiling:.2f} - "
+            "re-run with --allow-cost (or raise the ceiling).")
 
 
 def _interpret(bd: dict, complete, allow_cost: bool = False) -> dict | None:
@@ -371,7 +402,10 @@ def _interpret(bd: dict, complete, allow_cost: bool = False) -> dict | None:
 
 def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, complete=None, fetch=None,
           allow_cost: bool = False) -> dict:
-    row = conn.execute("SELECT title, url, duration FROM videos WHERE video_key = ?", (video_key,)).fetchone()
+    if interpret:
+        check_interpret_cost(allow_cost)
+    row = conn.execute("SELECT title, url, duration, transcript_source FROM videos WHERE video_key = ?",
+                       (video_key,)).fetchone()
     title, url, row_dur = (row["title"], row["url"], row["duration"]) if row else (None, None, 0.0)
     m = media.ensure_media(conn, video_key, store_dir, fetch=fetch)
     if m.get("path"):
@@ -404,6 +438,8 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
                                  "(the picture slides the same way through them)")
         else:
             _add_note(notes, "shot detection produced no shots; cuts not determined")
+    elif m.get("path"):
+        _add_note(notes, "media frame rate unknown (fps 0): cuts and shots not determined")
     else:
         _add_note(notes, "media not available (stored frames only); low resolution: cuts and shots not determined")
     shot_list, loose_fades = reconcile(raw, entries) if raw else ([], [])
@@ -419,7 +455,7 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
     video = {"key": video_key, "title": title, "url": url, "duration": duration, "fps": fps,
              "fps_rational": m.get("timeline_fps_rational") or m.get("fps_rational") or "0/1",
              "fps_measured_rational": m.get("fps_rational") or "0/1", "width": width, "height": height,
-             "source": m.get("source"),
+             "has_audio": bool(m.get("has_audio")), "source": m.get("source"),
              "active_aspect": _active_aspect(width, height, shot_list, duration),
              "evidence": _ev(0.0, duration, "measured",
                              (0.45 if m.get("fps_offstandard") else 0.95) if has_media else 0.3)}
@@ -443,7 +479,7 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
         "rhythm": _rhythm_section(shot_list),
     }
     bd["typography"] = _typography_section(m, duration, notes)
-    bd["audio"] = _audio_section(m, shot_list, duration, segs, notes)
+    bd["audio"] = _audio_section(m, shot_list, duration, segs, notes, row["transcript_source"] if row else None)
     bd["notes"] = notes
     version = _evidence_version(conn, video_key)
     if interpret:
@@ -593,8 +629,7 @@ def brief_md(bd: dict) -> str:
              + ", ".join(f"{b:.2f}s" for b in a["beats"][:16])
              + (" (full list in breakdown.json)" if len(a["beats"]) > 16 else ""))
             if a["beats"] else f"- beats: {_v(NOT_DETERMINED)}"]
-    for n in a.get("notes") or []:
-        out.append(f"- tempo note: {_md_nd(n)}")
+    # audio notes (tempo, loudness, missing stream) are listed once, under ## Notes
     cob = a["cuts_on_beat"]
     out.append("- cuts on beat (+-2 frames): " + (_v(cob["share"]) if cob["share"] == NOT_DETERMINED
                                                   else f"{cob['share']:.0%}")
@@ -664,6 +699,8 @@ def store(conn, video_key: str, bd: dict, store_dir=None) -> Path:
     out_dir = breakdown_dir(conn, root, video_key)
     out_dir.mkdir(parents=True, exist_ok=True)
     brief = brief_md(bd)
+    if not bd.get("generated_at"):  # lets an import tell an older bundled breakdown from a newer local one
+        bd["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     (out_dir / "breakdown.json").write_text(json.dumps(bd, ensure_ascii=False, indent=1), encoding="utf-8")
     (out_dir / "breakdown.md").write_text(brief, encoding="utf-8")
     try:
