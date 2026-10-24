@@ -411,3 +411,74 @@ def test_beats_do_not_drift_on_long_tracks(tmp_path, bpm, secs):
     err = np.abs(np.array(res["beats"]) - np.round(np.array(res["beats"]) / per) * per)
     assert err.max() < 0.03, err.max()
     assert len(res["beats"]) >= 0.97 * secs / per
+
+
+# ---- 0.7.1 batch 2: decode failure wording, fractional fold, low-band pulse, octave settling ----
+def test_ffmpeg_failure_is_not_reported_as_no_audio_stream(tmp_path):
+    junk = tmp_path / "junk.mp4"
+    junk.write_bytes(b"this is not a media file")
+    res = A.analyze(str(junk), 5)
+    assert res["tempo_bpm"] == "not determined"
+    assert any("audio decode failed" in n and "ffmpeg exit" in n for n in res["notes"]), res["notes"]
+    assert not any("no audio stream" in n for n in res["notes"])
+
+
+def test_real_missing_audio_stream_still_says_so(ref):
+    truth, _, silent = ref
+    assert any("no audio stream" in n for n in A.analyze(silent, truth["duration"])["notes"])
+
+
+def test_fold_score_wraps_at_the_fractional_period():
+    # energy in the last phase bin and in bin 0 are neighbours on the circle of a 10.3-frame period
+    per = 10.3
+    idx = np.arange(400)
+    ph = np.mod(idx, per)
+    e = ((ph < 0.5) | (ph >= per - 0.5)).astype(float)
+    score, _ = A._fold_score(e, per, np)
+    assert score >= e.sum() - 1e-9, (score, e.sum())
+
+
+def test_kick_only_140_is_determined(tmp_path):
+    # low-frequency-only pattern: the kick is buried in the noise bed of the full-band flux
+    res = A.analyze(_wav(tmp_path / "k140.wav", _groove(140, 60, hats=False, snares=False)), 60)
+    assert res["tempo_bpm"] != "not determined", res["notes"]
+    _never_confident_wrong(res, 140)
+    assert len(res["beats"]) >= 100
+
+
+def test_low_band_fallback_does_not_make_speech_or_noise_a_tempo(tmp_path):
+    rng = np.random.default_rng(5)
+    noise = _wav(tmp_path / "n.wav", rng.standard_normal(30 * SR) * 0.2)
+    assert A.analyze(noise, 30)["tempo_bpm"] == "not determined"
+
+
+def _kick8ths(bpm, secs, hats16=0.0):
+    rng, kick, hat, snare = _kit()
+    x = rng.standard_normal(int(secs * SR)) * 0.03
+    p = 60 / bpm
+    t = 0.0
+    while t < secs - 4 * p:
+        for o in (0, 0.5, 2, 2.5):
+            _put(x, kick, t + o * p)
+        for o in (1, 3):
+            _put(x, snare(), t + o * p)
+        if hats16:
+            for k in range(16):
+                _put(x, hat() * hats16, t + k * p / 4)
+        t += 4 * p
+    return x / np.abs(x).max() * 0.8
+
+
+@pytest.mark.parametrize("hats16", [0.0, 0.5], ids=["no_hats", "hats16"])
+def test_steady_70_kicks_on_8ths_has_no_octave_change_note(tmp_path, hats16):
+    res = A.analyze(_wav(tmp_path / "k8.wav", _kick8ths(70, 60, hats16)), 60)
+    assert not any("octave changes" in n for n in res["notes"]), res["notes"]
+    _never_confident_wrong(res, 70)
+
+
+@pytest.mark.parametrize("bpm", [80, 90, 100])
+def test_kick_on_every_beat_with_8th_hats_settles_the_slow_octave(tmp_path, bpm):
+    # clear evidence: the kick sits strictly on the beat grid, hats are only subdivisions
+    res = A.analyze(_wav(tmp_path / "g.wav", _groove(bpm, 60)), 60)
+    assert abs(res["tempo_bpm"] - bpm) <= 2
+    assert "tempo_alt" not in res and res["evidence"]["confidence"] > 0.5, res

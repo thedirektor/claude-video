@@ -21,6 +21,7 @@ N_FFT = 256
 HOP = 64
 BPM_MIN, BPM_MAX = 60.0, 200.0
 MIN_STRENGTH = 0.35  # comb-averaged normalised autocorrelation needed to call a tempo
+LOW_BAND_MIN_STRENGTH = 0.6  # the kick band alone must be this periodic to stand in for the full band
 MIN_SECONDS = 3.0
 CHUNK_FRAMES = 8192
 PRIOR_BPM = 120.0
@@ -32,6 +33,10 @@ SLOW_COMB_RATIO = 0.8  # faster octave's comb periodicity >= this share of the s
 SLOW_MAX_R = 0.5  # confident slower also needs every band's off-beats clearly weaker
 PRIMARY_R = 0.5  # ambiguous: pulse-band r at or above this makes the faster octave the primary reading
 BAND_MIN_LEVEL = 3.0  # slot medians below this many times the band mean: the band carries no pulse
+LOW_SETTLE_R = 0.1  # kick (low band) off/on at or below this: the kick sits strictly on the slower grid
+KICK_CARRIES_LEVEL = 20.0  # ...and its on-slot median is this many times the band mean (it is the grid)
+MIX_R_CHANGE = 2.0  # mean off/on of a band must change by this factor between halves for a real section change
+MIX_R_DELTA = 0.3
 AMBIG_CONF = 0.5
 SUPPORT_REL = 0.3
 STABILITY_MIN_S = 4.0
@@ -77,8 +82,13 @@ def _decode(path: str):
     except (OSError, subprocess.SubprocessError) as exc:
         return None, f"audio decode failed: {type(exc).__name__}"
     raw = res.stdout
-    if res.returncode != 0 or len(raw) < 2 * N_FFT:
-        return None, "no audio stream"
+    err = (res.stderr or b"").decode("utf-8", "replace")
+    if res.returncode != 0:
+        if "does not contain any stream" in err or "matches no streams" in err:
+            return None, "no audio stream"
+        return None, f"audio decode failed (ffmpeg exit {res.returncode})"
+    if len(raw) < 2 * N_FFT:
+        return None, "no audio stream"  # decoded fine but (nearly) nothing came out
     return np.frombuffer(raw[: len(raw) // 2 * 2], dtype="<i2").astype("float32") / 32768.0, ""
 
 
@@ -178,6 +188,20 @@ def _comb_tempo(env, hop_s: float, np):
     return b_best, s_best
 
 
+def _pulse(env, bands, hop_s: float, np):
+    """``(env_used, (bpm, strength))`` or ``(env, None)``. The full-band flux first; when it
+    shows no steady pulse the low (kick) band's own flux is tried with a higher bar, because a
+    kick-only pattern is buried under the other bins' noise in the full-band sum."""
+    got = _comb_tempo(env, hop_s, np)
+    if got is not None and got[1] >= MIN_STRENGTH:
+        return env, got
+    if bands is not None and len(bands):
+        low = _comb_tempo(bands[0], hop_s, np)
+        if low is not None and low[1] >= LOW_BAND_MIN_STRENGTH:
+            return bands[0], low
+    return env, got
+
+
 def _slot_peaks(e, start: float, period: float, win: int, np):
     n = len(e)
     out = []
@@ -211,18 +235,26 @@ def _comb_at(ac, lag: float) -> float:
     return sum(vals) / len(vals) if len(vals) >= 2 else 0.0
 
 
-def _octave_stats(env, bands, hop_s: float, lo: float, np):
-    """Evidence for ``lo`` vs ``2*lo``: full-band comb periodicity of both octaves, and per band
-    the median on-slot (``lo`` beats) and off-slot (midpoints) onset strength over the band level."""
+def _octave_grid(env, hop_s: float, lo: float, np):
+    """``(period_frames, phase_frames)`` of the ``lo`` beat grid fitted to the whole envelope."""
     e = np.maximum(env - np.median(env), 0)
     # refine first: the 0.5 BPM comb grid drifts by a large part of a beat over a minute,
     # which smears on- and off-slots together
     period, _ = _refine_period(e, 60.0 / lo / hop_s, np)
+    return period, _best_phase(e, period, np)
+
+
+def _octave_stats(env, bands, hop_s: float, lo: float, np, grid=None):
+    """Evidence for ``lo`` vs ``2*lo``: full-band comb periodicity of both octaves, and per band
+    the median on-slot (``lo`` beats) and off-slot (midpoints) onset strength over the band level.
+    ``grid`` pins the (period, phase) fitted on the whole clip, so that sections of one clip are
+    judged on the same beat slots instead of each locking on whichever phase suits it."""
+    e = np.maximum(env - np.median(env), 0)
+    period, ph = grid if grid is not None else _octave_grid(env, hop_s, lo, np)
     win = max(1, int(round(period * 0.08)))
-    ph = _best_phase(e, period, np)
     ac = _autocorr(env, np)
     out = {"s_lo": _comb_at(ac, period) if ac is not None else 0.0,
-           "s_hi": _comb_at(ac, period / 2) if ac is not None else 0.0, "bands": []}
+           "s_hi": _comb_at(ac, period / 2) if ac is not None else 0.0, "bands": [], "mean_r": []}
     for row in bands:
         eb = np.maximum(row - np.median(row), 0)
         on = _slot_peaks(eb, ph, period, win, np)
@@ -230,6 +262,8 @@ def _octave_stats(env, bands, hop_s: float, lo: float, np):
         m = min(len(on), len(off))
         level = float(np.mean(eb)) or 1e-12
         out["bands"].append((float(np.median(on[:m])) / level, float(np.median(off[:m])) / level))
+        # the mean, unlike the median, does not flip when a slot is occupied half the time
+        out["mean_r"].append(float(np.mean(off[:m])) / (float(np.mean(on[:m])) or 1e-12))
     return out
 
 
@@ -242,37 +276,43 @@ def _octave_pair(bpm: float):
     return None
 
 
-def _resolve_octave(env, bands, hop_s: float, bpm: float, np):
+def _resolve_octave(env, bands, hop_s: float, bpm: float, np, grid=None, stats_out: dict | None = None):
     """``(primary_bpm, alt)``: ``alt`` is the other octave when the octave is ambiguous, else None.
 
     Faster is confident only when the low (kick) band keeps its pulse on the off-beats and no
-    band leaves them nearly empty. Slower is confident only when the faster octave's comb
-    periodicity is clearly below the slower's (< 0.8 of it) and every band's off-beats are
-    clearly weaker. Anything else is ambiguous; the pulse band then only picks the primary.
-    Over-flagging an ordinary groove is acceptable, a confident wrong octave is not."""
+    band leaves them nearly empty. Slower is confident only when no band's off-beats are
+    clearly strong (every band's off/on <= 0.5) and either the faster octave's comb periodicity
+    is clearly below the slower's (< 0.8 of it) or the kick itself sits strictly on the slower
+    grid (low band off/on <= LOW_SETTLE_R) with the kick actually carrying the grid, so the
+    faster band(s) are only subdivisions (hats). Anything else is ambiguous; the pulse band then
+    only picks the primary. Over-flagging an ordinary groove is acceptable, a confident wrong
+    octave is not. ``stats_out``, when given, receives the octave statistics."""
     pair = _octave_pair(bpm)
     if pair is None:
         return bpm, None
     lo, hi = pair
-    st = _octave_stats(env, bands, hop_s, lo, np)
+    st = _octave_stats(env, bands, hop_s, lo, np, grid)
+    if stats_out is not None:
+        stats_out.update(st)
     rs = [off / on if on > 0 else float("inf") for on, off in st["bands"] if max(on, off) >= BAND_MIN_LEVEL]
     if not rs:
         return bpm, (lo if bpm == hi else hi)
     on0, off0 = st["bands"][0]
-    pulse_r = (off0 / on0 if on0 > 0 else float("inf")) if max(on0, off0) >= BAND_MIN_LEVEL \
-        else float(np.median(rs))
+    low_ok = max(on0, off0) >= BAND_MIN_LEVEL
+    pulse_r = (off0 / on0 if on0 > 0 else float("inf")) if low_ok else float(np.median(rs))
     comb_ratio = st["s_hi"] / st["s_lo"] if st["s_lo"] > 0 else float("inf")
     if pulse_r >= FAST_PULSE_R and min(rs) >= FAST_MIN_R:
         return hi, None
-    if comb_ratio < SLOW_COMB_RATIO and max(rs) <= SLOW_MAX_R:
+    kick_on_grid = low_ok and on0 >= KICK_CARRIES_LEVEL and pulse_r <= LOW_SETTLE_R
+    if (comb_ratio < SLOW_COMB_RATIO or kick_on_grid) and max(rs) <= SLOW_MAX_R:
         return lo, None
     return (hi, lo) if pulse_r >= PRIMARY_R else (lo, hi)
 
 
 def _fold_score(e, per: float, np):
     """Best phase and strength of ``e`` folded at a (fractional) period, half-frame phase bins."""
-    nb = int(per * 2) + 2
-    bins = (np.mod(np.arange(len(e)), per) * 2).astype(int)
+    nb = max(3, int(math.ceil(per * 2)))  # the circle has exactly ceil(2*per) half-frame bins
+    bins = np.minimum((np.mod(np.arange(len(e)), per) * 2).astype(int), nb - 1)
     sums = np.bincount(bins, weights=e, minlength=nb)
     sm = sums + np.roll(sums, 1) + np.roll(sums, -1)
     j = int(np.argmax(sm))
@@ -340,22 +380,31 @@ def _beat_grid(env, t0: float, hop_s: float, bpm: float, np):
     return float(refined_bpm), beats
 
 
-def _stable(env, bands, hop_s: float, np):
+def _stable(env, bands, hop_s: float, np, bpm: float | None = None):
     """``(change_note, octave_flip, window_ambiguous)``. ``change_note`` is non-empty when the
     window tempi disagree even with octaves folded. ``octave_flip`` is True when windows read
-    different octaves and at least one of them was settled (a 2:1 change between sections);
-    ``window_ambiguous`` when any window could not settle its octave."""
+    different octaves, at least one of them was settled and the two halves really differ in how
+    much the off-beats are played (a 2:1 change between sections, not an evenly balanced groove
+    whose per-window phase lock wobbles); ``window_ambiguous`` when any window could not settle
+    its octave."""
     n = len(env)
     if n * hop_s < 2 * STABILITY_MIN_S:
         return "", False, False
-    raw, res = [], []
+    raw, res, mix = [], [], []
+    pair = _octave_pair(bpm) if bpm else None
+    grid = _octave_grid(env, hop_s, pair[0], np) if pair else None
     for a, b in ((0.0, 0.5), (0.5, 1.0), (0.25, 0.75)):
         i0, i1 = int(a * n), int(b * n)
         seg = env[i0:i1]
         got = _comb_tempo(seg, hop_s, np)
         if got is not None and got[1] >= MIN_STRENGTH:
             raw.append(got[0])
-            res.append(_resolve_octave(seg, bands[:, i0:i1], hop_s, got[0], np))
+            # every window is judged on the clip's own beat grid (shifted to the window start)
+            wg = (grid[0], (grid[1] - i0) % grid[0]) if grid else None
+            st: dict = {}
+            res.append(_resolve_octave(seg, bands[:, i0:i1], hop_s, got[0] if wg is None else bpm, np, wg, st))
+            if (a, b) in ((0.0, 0.5), (0.5, 1.0)):
+                mix.append(st.get("mean_r"))
     if len(raw) < 2:
         return "", False, False
     lo, hi = min(raw), max(raw)
@@ -366,6 +415,9 @@ def _stable(env, bands, hop_s: float, np):
     # two windows that both admit ambiguity may pick different primaries without a real change
     flip = any(abs(math.log2(bi / bj)) > tol and (ai is None or aj is None)
                for i, (bi, ai) in enumerate(res) for bj, aj in res[i + 1:])
+    if flip and len(mix) == 2 and mix[0] and mix[1]:
+        flip = any(abs(r0 - r1) >= MIX_R_DELTA and max(r0, r1) >= MIX_R_CHANGE * max(min(r0, r1), 1e-6)
+                   for r0, r1 in zip(mix[0], mix[1]))
     return "", flip, any(alt is not None for _, alt in res)
 
 
@@ -387,11 +439,11 @@ def analyze(path: str, duration: float = 0.0) -> dict:
         if got is None:
             return _nd(dur, ["audio too short for tempo"], loud)
         env, t0, hop_s, bands = got
-        tempo = _comb_tempo(env, hop_s, np)
+        env, tempo = _pulse(env, bands, hop_s, np)
         if tempo is None or tempo[1] < MIN_STRENGTH:
             strength = 0.0 if tempo is None else tempo[1]
             return _nd(dur, [f"no steady pulse found (periodicity {strength:.2f} < {MIN_STRENGTH})"], loud)
-        change, octave_flip, window_amb = _stable(env, bands, hop_s, np)
+        change, octave_flip, window_amb = _stable(env, bands, hop_s, np, tempo[0])
         if change:
             return _nd(dur, [change], loud)
         bpm0, alt = _resolve_octave(env, bands, hop_s, tempo[0], np)
@@ -455,6 +507,8 @@ def cuts_on_beat(shots: list[dict], beats: list[float], fps: float, tempo_conf: 
     hits = sum(1 for c in cuts if min(abs(c - b) for b in beats) <= tol)
     n = len(cuts)
     out = {"share": round(hits / n, 3), "tolerance_frames": TOLERANCE_FRAMES}
+    # confidence of the share itself: 0.9 at most, scaled up linearly to 4 cuts (fewer cuts say little
+    # about how the edit relates to the music), never above the evidence for the beat grid
     conf = min(0.9 * min(1.0, n / 4), float(tempo_conf))
     if alt_ratio:
         grids = [g for g in _alt_grids(beats, alt_ratio) if g]
@@ -482,10 +536,10 @@ def music_windows(path: str, duration: float = 0.0, window: float = MUSIC_WINDOW
         if x is None:
             return None
         dur = float(duration) if duration else len(x) / SR
-        got = _onset_envelope(x, np)
+        got = _onset_bands(x, np)
         if got is None:
             return None
-        env, t0, hop_s = got
+        env, t0, hop_s, bands = got
         edges = [0.0]
         while edges[-1] + window < dur - MIN_SECONDS + 1e-9:
             edges.append(edges[-1] + window)
@@ -498,8 +552,9 @@ def music_windows(path: str, duration: float = 0.0, window: float = MUSIC_WINDOW
             if float(np.max(np.abs(seg))) < SILENT_PEAK:
                 out.append({"t_start": round(a, 3), "t_end": round(b, 3), "state": "silent", "strength": 0.0})
                 continue
-            e = env[max(0, int((a - t0) / hop_s)):max(0, int((b - t0) / hop_s))]
-            tempo = _comb_tempo(e, hop_s, np) if len(e) > 8 else None
+            i0, i1 = max(0, int((a - t0) / hop_s)), max(0, int((b - t0) / hop_s))
+            e = env[i0:i1]
+            tempo = _pulse(e, bands[:, i0:i1], hop_s, np)[1] if len(e) > 8 else None
             strength = 0.0 if tempo is None else float(tempo[1])
             out.append({"t_start": round(a, 3), "t_end": round(b, 3),
                         "state": "music" if strength >= MIN_STRENGTH else NOT_DETERMINED,
