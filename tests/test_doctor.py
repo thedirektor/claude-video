@@ -146,3 +146,15 @@ def test_no_fallback_proxy_no_check(env):
     rep = doctor.run_checks(online=True, which=lambda n: f"/usr/bin/{n}", run=_ok_run(), embedder_ok=lambda: True,
                             http=lambda url: 200, proxy_status=lambda p: pytest.fail("not configured"))
     assert "fallback proxy" not in _by_name(rep)
+
+
+def test_breakdown_dependency_checks(monkeypatch):
+    import importlib.util
+
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda n, *a: None if n == "cv2" else real(n, *a))
+    checks = {c["name"]: c for c in doctor.run_checks(online=False, which=lambda b: None,
+                                                      run=_run_factory({}), embedder_ok=lambda: None,
+                                                      proxy_status=lambda: None)["checks"]}
+    assert checks["opencv"]["status"] == "warn" and "breakdown fields affected" in checks["opencv"]["detail"]
+    assert "numpy" in checks and "breakdown fields affected" in checks["tesseract"]["detail"]

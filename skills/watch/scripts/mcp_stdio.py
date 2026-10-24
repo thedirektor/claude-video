@@ -52,6 +52,17 @@ TOOLS = [
      "inputSchema": _schema({"video": S, "formats": S}, ["video"])},
     {"name": "plan", "description": "Cost plan for watching a video (no side effects).",
      "inputSchema": _schema({"source": S, "detail": S, "backend": S, "start": S, "end": S}, ["source"])},
+    {"name": "breakdown", "description": "Measure a watched video into a rebuild brief (shots, cuts, camera, "
+     "typography, motion, music, timelines) with evidence per element; anything unmeasured is 'not determined'. "
+     "Stored and pinned. Free unless interpret=true. formats: otio,fcpxml,edl timeline files.",
+     "inputSchema": _schema({"video": S, "interpret": B, "formats": S}, ["video"])},
+    {"name": "motion", "description": "Track a region over a segment (seconds) of a watched video: phases, easing "
+     "fit, Godot/Unity/CSS snippets. region is 'x,y,w,h' (0-1) or a short text found by OCR.",
+     "inputSchema": _schema({"video": S, "start": N, "end": N, "region": S, "px_per_unit": N},
+                            ["video", "start", "end"])},
+    {"name": "compare", "description": "Compare a reference video with your version (local file or URL): alignment, "
+     "timing deltas, side-by-side video. offset = candidate time minus reference time, in seconds.",
+     "inputSchema": _schema({"reference": S, "candidate": S, "offset": N}, ["reference", "candidate"])},
     {"name": "doctor", "description": "Check this machine's /watch dependencies (ffmpeg, yt-dlp, tesseract, "
      "model, keys present).", "inputSchema": _schema({"offline": B}, [])},
 ]
@@ -107,6 +118,20 @@ def call_tool(name: str, args: dict) -> dict:
             if r.returncode != 0:
                 return _text(f"watch failed (exit {r.returncode}):\n{(r.stderr or '')[-1500:]}", True)
             return _text(out)
+        if name in ("breakdown", "motion", "compare"):
+            if name == "breakdown":
+                argv = ["breakdown", args["video"], "--json",
+                        *_flags(args, {"interpret": "--interpret", "formats": "--formats"})]
+            elif name == "motion":
+                argv = ["motion", args["video"], "--start", str(args["start"]), "--end", str(args["end"]), "--json",
+                        *_flags(args, {"region": "--region", "px_per_unit": "--px-per-unit"})]
+            else:
+                argv = ["compare", args["reference"], args["candidate"], "--json",
+                        *_flags(args, {"offset": "--offset"})]
+            r = _run_watch(argv)
+            if r.returncode != 0:
+                return _text(f"{name} failed (exit {r.returncode}):\n{(r.stderr or '')[-1500:]}", True)
+            return _text((r.stdout or "").strip())
         if name == "doctor":
             r = _run_watch(["doctor", *(["--offline"] if args.get("offline") else [])], timeout=300)
             return _text(r.stdout or r.stderr, r.returncode != 0)

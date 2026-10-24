@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -159,7 +160,8 @@ def run_checks(*, online: bool = True, which=shutil.which, run=subprocess.run, h
                                      _last_error(err) or "no metadata returned", fixable=broken))
 
     if which("tesseract") is None:
-        checks.append(_check("tesseract", "warn", "not found — on-screen text (OCR) disabled; install tesseract-ocr"))
+        checks.append(_check("tesseract", "warn", "not found — on-screen text (OCR) disabled; install tesseract-ocr "
+                             "(breakdown fields affected: typography, region lookup)"))
     else:
         ok, _ = version(["tesseract", "--version"])
         try:
@@ -171,6 +173,15 @@ def run_checks(*, online: bool = True, which=shutil.which, run=subprocess.run, h
         checks.append(_check("tesseract", "warn" if missing else "ok",
                              f"missing language data: {', '.join(missing)} — install tesseract-ocr-{missing[0]}"
                              if missing else f"languages: {', '.join(sorted(langs))}"))
+
+    for mod, pip, affected in (("cv2", "opencv-python-headless", "shots, cuts, camera, motion, compare"),
+                               ("numpy", "numpy", "camera, motion, music, compare")):
+        if importlib.util.find_spec(mod) is None:
+            checks.append(_check("opencv" if mod == "cv2" else mod, "warn",
+                                 f"not installed — breakdown fields affected: {affected} (reported as "
+                                 f"'not determined'); pip install {pip}"))
+        else:
+            checks.append(_check("opencv" if mod == "cv2" else mod, "ok", "installed"))
 
     emb = embedder_ok()
     if emb is None:

@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.6.0"
+version: "0.7.0"
 description: Watch a video (URL or local path) with a Claude, Gemini, or OpenRouter backend. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg via scene detection + OCR, pulls the transcript from captions or Whisper (local GPU via faster-whisper, Groq, OpenAI, or AssemblyAI for speaker diarization), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -497,11 +497,23 @@ With `WATCH_REMOTE_URL` (the central service, e.g. `https://watch.example.com`) 
 
 ## Local MCP server (Claude Desktop)
 
-`watch.py mcp` is a dependency-free MCP server over stdio exposing `watch` (local files or URLs), `search`, `ask`, `moment` (with frame images), `videos`, `export`, `plan` and `doctor` against this machine's memory. Claude Desktop (`claude_desktop_config.json`):
+`watch.py mcp` is a dependency-free MCP server over stdio exposing `watch` (local files or URLs), `search`, `ask`, `moment` (with frame images), `videos`, `export`, `breakdown`, `motion`, `compare`, `plan` and `doctor` against this machine's memory. Claude Desktop (`claude_desktop_config.json`):
 
 ```json
 {"mcpServers": {"watch": {"command": "python", "args": ["<SKILL_DIR>/scripts/watch.py", "mcp"]}}}
 ```
+
+## Breakdown (references to rebuild)
+
+Turns an already watched reference video (a game, a music video, a motion piece) into a measured brief someone can rebuild from. Contract, stated at the top of every `breakdown.md` and to be repeated to the user:
+
+> **Build contract:** follow only what this breakdown states. Anything marked _not determined_ stays an explicit placeholder in what you build. Never fill gaps with taste or assumptions.
+
+- `watch.py breakdown <video> [--interpret] [--json] [--formats otio,fcpxml,edl] [--allow-cost]` — shots and cuts, camera, typography, motion, music, transitions, with `evidence {t_start, t_end, method, confidence}` on every element (`method` is `measured`, `ocr`, `transcript` or `interpretation`). A value that cannot be measured is the string `"not determined"` (a missing optional dependency says which one in `notes`; `watch.py doctor` reports `opencv` / `numpy` / `tesseract`). Free by default; `--interpret` adds one LLM call that is costed and subject to the ceiling. `--formats` also writes OpenTimelineIO / FCPXML / CMX3600 EDL timelines (source fps, start `01:00:00:00`, clips pointing at the original media).
+- `watch.py motion <video> --start S --end E [--region x,y,w,h|text] [--px-per-unit N] [--json]` — use when the user wants one movement rebuilt exactly (a tween, a bounce, a UI slide): tracks the region, splits it into phases, fits an easing and prints Godot 4 `Tween` (TRANS x EASE), Unity `AnimationCurve`, CSS cubic-bezier and neutral JSON. Pass a 1–2 s window.
+- `watch.py compare <reference> <candidate> [--offset S] [--slow N] [--out DIR] [--json]` — use after the user has built something: aligns their version (local file or URL, analysed but never stored) against the reference and reports timing deltas plus a slow-motion side-by-side video.
+
+Results are stored with the video and its media is pinned (kept out of retention; cap `WATCH_BREAKDOWN_MEDIA_MAX_MB`, default 2048). Producing a breakdown never builds anything: build only when the user asks, and then only from what the breakdown states. The same three are MCP tools (`breakdown`, `motion`, `compare`) in the local stdio server and the central service.
 
 ## Batch (playlists, channels, lists)
 

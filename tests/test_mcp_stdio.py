@@ -76,3 +76,32 @@ def test_watch_tool_runs_watch_py(monkeypatch):
     out = mcp_stdio.call_tool("watch", {"source": "C:/Videos/clip.mp4", "question": "qué pasa", "detail": "efficient"})
     assert out["isError"] is False and out["content"][0]["text"].startswith("# watch: video report")
     assert seen["argv"][-2:] == ["C:/Videos/clip.mp4", "qué pasa"] and "--detail" in seen["argv"]
+
+
+def test_breakdown_tool_listed_and_runs(monkeypatch):
+    names = {t["name"] for t in mcp_stdio.TOOLS}
+    assert {"breakdown", "motion", "compare"} <= names
+    calls = []
+
+    def fake(argv, timeout=3600):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true}\n', stderr="")
+
+    monkeypatch.setattr(mcp_stdio, "_run_watch", fake)
+    r = mcp_stdio.call_tool("breakdown", {"video": "yt:abc"})
+    assert r["isError"] is False and calls[-1] == ["breakdown", "yt:abc", "--json"]
+    mcp_stdio.call_tool("breakdown", {"video": "yt:abc", "interpret": True, "formats": "otio,edl"})
+    assert calls[-1] == ["breakdown", "yt:abc", "--json", "--interpret", "--formats", "otio,edl"]
+    mcp_stdio.call_tool("motion", {"video": "yt:abc", "start": 1.0, "end": 2.5, "region": "0.1,0.1,0.2,0.2",
+                                   "px_per_unit": 32})
+    assert calls[-1] == ["motion", "yt:abc", "--start", "1.0", "--end", "2.5", "--json",
+                         "--region", "0.1,0.1,0.2,0.2", "--px-per-unit", "32"]
+    mcp_stdio.call_tool("compare", {"reference": "yt:abc", "candidate": "C:\\v\\mine.mp4", "offset": 0.5})
+    assert calls[-1] == ["compare", "yt:abc", "C:\\v\\mine.mp4", "--json", "--offset", "0.5"]
+
+
+def test_breakdown_tool_failure_is_error(monkeypatch):
+    monkeypatch.setattr(mcp_stdio, "_run_watch", lambda argv, timeout=3600: subprocess.CompletedProcess(
+        argv, 3, stdout="", stderr="[watch] not found"))
+    r = mcp_stdio.call_tool("motion", {"video": "x", "start": 0, "end": 1})
+    assert r["isError"] is True and "not found" in r["content"][0]["text"]

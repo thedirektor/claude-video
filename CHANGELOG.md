@@ -2,6 +2,18 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.7.0] — 2026-10-24
+
+Breakdown: measure a reference video into something that can be rebuilt, without inventing anything.
+
+### Added
+- **`watch.py breakdown`**: shots/cuts, camera, typography, motion, music and transitions with per-element evidence (`measured` / `ocr` / `transcript` / `interpretation`, confidence 0–1); unmeasurable values are `"not determined"`, never guessed. `breakdown.md` opens with the build contract. Optional `--interpret` (one costed LLM call).
+- **Timelines**: OpenTimelineIO, FCPXML and CMX3600 EDL at the source frame rate (NTSC as rational), start `01:00:00:00`, clips referencing the original media.
+- **`watch.py motion`**: region tracking over a segment, phases, easing fit, Godot 4 / Unity / CSS / JSON snippets.
+- **`watch.py compare`**: reference vs your version — alignment, timing deltas, slow-motion side-by-side video.
+- Media pinning for videos with a breakdown (`WATCH_BREAKDOWN_MEDIA_MAX_MB`).
+- MCP tools `breakdown`, `motion`, `compare` (local stdio server); `doctor` checks `opencv` and `numpy` and names the breakdown fields affected.
+
 ## [0.6.0] — 2026-10-23
 
 Platform: the plugin side of durable jobs, costs, batch, central memory and integrations (service-side features — job queue, webhooks, subscriptions, `/runs/import`, n8n/Hermes/ingest wiring — live in the private service repo).
