@@ -18,6 +18,9 @@ LUMA_SCALE = 60.0  # a luma jump of this many levels counts as a full-strength c
 CUT_K = 6.0
 GRADUAL_MIN_FRAMES = 3
 
+CROP_MIN_GAIN = 0.9  # crop only when the active picture is below this share of the frame
+_CROP = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
+
 _PTS = re.compile(r"pts_time:([0-9.]+)")
 _SCENE = re.compile(r"lavfi\.scene_score=([0-9.eE+-]+)")
 _YAVG = re.compile(r"lavfi\.signalstats\.YAVG=([0-9.eE+-]+)")
@@ -27,11 +30,43 @@ def _empty() -> dict:
     return {"t": [], "scene": [], "yavg": [], "thumb": []}
 
 
+def active_crop(path: str) -> str | None:
+    """ffmpeg ``crop=w:h:x:y`` for the active picture when black bars take a real share of the
+    frame (a phone recording of a 16:9 video, a pillarboxed 4:3 film), else None. Black bars dilute
+    every frame-difference measure, so cuts in a small picture would read as noise. Keyframes only:
+    cheap, and ``reset=0`` keeps the union of everything that was ever lit."""
+    def detect(args: list[str]) -> list:
+        res = subprocess.run(["ffmpeg", "-hide_banner", *args], capture_output=True, text=True, timeout=900)
+        return _CROP.findall(res.stderr)
+
+    try:
+        found = detect(["-skip_frame", "nokey", "-i", str(path), "-an",
+                        "-vf", "cropdetect=limit=24:round=2:reset=0:skip=0", "-f", "null", "-"])
+        if len(found) < 3:  # few keyframes (short clip): sample decoded frames instead
+            found = detect(["-i", str(path), "-an", "-vf", "fps=2,cropdetect=limit=24:round=2:reset=0:skip=0",
+                            "-f", "null", "-"])
+        dims = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+             "-of", "csv=p=0", str(path)], capture_output=True, text=True, timeout=60).stdout.strip()
+        fw, fh = (int(x) for x in dims.split(",")[:2])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if not found or fw <= 0 or fh <= 0:
+        return None
+    w, h, x, y = (int(v) for v in found[-1])
+    if w <= 16 or h <= 16 or w * h >= CROP_MIN_GAIN * fw * fh:
+        return None
+    return f"crop={w}:{h}:{x}:{y}"
+
+
 def frame_series(path: str, fps: float) -> dict:
-    """Per-frame ``{"t", "scene", "yavg"}``; empty when fps is unknown (0)."""
+    """Per-frame ``{"t", "scene", "yavg", "thumb"}`` over the active picture (black bars cropped);
+    empty when fps is unknown (0)."""
     if not fps or fps <= 0:
         return _empty()
-    vf = "scale=160:-2,signalstats,select='gte(scene,0)',metadata=print:file=-"
+    crop = active_crop(path)
+    pre = f"{crop}," if crop else ""
+    vf = pre + "scale=160:-2,signalstats,select='gte(scene,0)',metadata=print:file=-"
     try:
         res = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-an",
@@ -60,17 +95,18 @@ def frame_series(path: str, fps: float) -> dict:
         elif (m := _YAVG.search(line)):
             cur["yavg"] = float(m.group(1))
     flush()
-    series["thumb"] = _thumbs(path, len(series["t"]))
+    series["thumb"] = _thumbs(path, len(series["t"]), pre)
+    series["crop"] = crop
     return series
 
 
-def _thumbs(path: str, count: int) -> list[list[int]]:
+def _thumbs(path: str, count: int, pre: str = "") -> list[list[int]]:
     """Tiny RGB thumbnail per frame (second pass); [] when the count disagrees."""
     size = THUMB_W * THUMB_H * 3
     try:
         res = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path), "-an", "-vf",
-             f"scale={THUMB_W}:{THUMB_H}:flags=area,format=rgb24", "-vsync", "0", "-f", "rawvideo", "-"],
+             f"{pre}scale={THUMB_W}:{THUMB_H}:flags=area,format=rgb24", "-vsync", "0", "-f", "rawvideo", "-"],
             capture_output=True, timeout=1800)
     except (OSError, subprocess.SubprocessError):
         return []

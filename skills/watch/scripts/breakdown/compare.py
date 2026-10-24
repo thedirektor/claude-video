@@ -96,11 +96,14 @@ def _resolve(source: str, tmp: Path, conn_factory) -> dict:
 
 
 def _gray(path: str, np):
-    """Per-frame ``(mean luma, mean abs difference to the previous frame)`` on a tiny grey copy."""
+    """Per-frame ``(mean luma, mean abs difference to the previous frame)`` on a tiny grey copy of
+    the active picture (black bars cropped, see ``shots.active_crop``)."""
+    crop = shots.active_crop(path)
     try:
         res = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path, "-an",
-             "-vf", f"scale={THUMB_W}:{THUMB_H},format=gray", "-vsync", "0", "-f", "rawvideo", "-"],
+             "-vf", f"{(crop + ',') if crop else ''}scale={THUMB_W}:{THUMB_H},format=gray", "-vsync", "0",
+             "-f", "rawvideo", "-"],
             capture_output=True, timeout=1800)
     except (OSError, subprocess.SubprocessError):
         return None, None

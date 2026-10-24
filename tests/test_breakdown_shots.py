@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from breakdown_fixtures import make_reference  # noqa: E402
+from breakdown_fixtures import _ffmpeg, make_reference  # noqa: E402
 from breakdown import shots as S  # noqa: E402
 
 
@@ -114,3 +114,25 @@ def test_rhythm_slowest_window():
     assert r["fastest_window"] == {"t_start": 0, "t_end": 3, "mean": 1.0}
     assert r["slowest_window"]["t_start"] == 2 and r["slowest_window"]["t_end"] == 13
     assert r["slowest_window"]["mean"] == pytest.approx(11 / 3)
+
+
+def test_cuts_found_in_small_picture_with_big_bars(tmp_path):
+    """Real-media e2e regression: a 16:9 edit inside a 9:16 phone frame (≈30% of the pixels) lost
+    almost every cut because the black bars diluted the scene score."""
+    src = tmp_path / "ref.mp4"
+    gt = make_reference(src)
+    tall = tmp_path / "tall.mp4"
+    _ffmpeg(["-i", str(src), "-vf", "scale=720:-2,pad=720:1280:0:(oh-ih)/2", "-c:a", "copy",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", str(tall)])
+    assert S.active_crop(str(tall)) is not None
+    series = S.frame_series(str(tall), 25.0)
+    found = S.detect_shots(series, gt["duration"])
+    kinds = [(round(s["boundary"]["t"], 2), s["boundary"]["kind"]) for s in found[1:]]
+    assert any(k == "cut" and abs(t - 2.0) <= 0.04 for t, k in kinds), kinds
+    assert any(k == "gradual" and 4.0 <= t <= 5.0 for t, k in kinds), kinds
+
+
+def test_no_crop_on_full_frame(tmp_path):
+    src = tmp_path / "ref.mp4"
+    make_reference(src)
+    assert S.active_crop(str(src)) is None
