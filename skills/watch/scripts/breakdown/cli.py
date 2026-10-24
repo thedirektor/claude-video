@@ -1,8 +1,7 @@
 """``watch.py breakdown|motion|compare`` entry point.
 
-``watch.py`` dispatches those three words here. Only ``breakdown`` exists so
-far; later tasks add ``motion`` and ``compare`` by registering a handler in
-``COMMANDS`` (each is ``handler(argv) -> int``).
+``watch.py`` dispatches those three words here. Each command is a
+handler in ``COMMANDS`` (``handler(argv) -> int``).
 Exit codes: 0 ok, 2 usage/other error, 3 video not found, 4 ambiguous video.
 """
 from __future__ import annotations
@@ -16,7 +15,7 @@ import cost
 from config import memory_paths
 from memory import index, retrieval
 
-from . import assemble, interchange, media, motion
+from . import assemble, compare, interchange, media, motion
 
 EXIT_NOT_FOUND = 3
 EXIT_AMBIGUOUS = 4
@@ -123,7 +122,31 @@ def _cmd_motion(argv: list[str]) -> int:
     return 0
 
 
-COMMANDS = {"breakdown": _cmd_breakdown, "motion": _cmd_motion}
+def _cmd_compare(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="watch compare",
+                                 description="Reference vs your version: alignment, timing deltas, side-by-side video.")
+    ap.add_argument("reference", help="video_key / title of a watched video, URL or local file")
+    ap.add_argument("candidate", help="your version: local file or URL (analysed, never stored)")
+    ap.add_argument("--offset", type=float, default=None,
+                    help="candidate time = reference time + OFFSET seconds (skips automatic alignment)")
+    ap.add_argument("--slow", type=int, default=4, help="slow-motion factor of compare.mp4 (default 4)")
+    ap.add_argument("--out", default=None, help="output folder (default: next to the reference's breakdown)")
+    ap.add_argument("--json", action="store_true", help="print compare.json instead of the summary")
+    a = ap.parse_args(argv)
+    if a.slow < 1:
+        print("[watch] --slow must be >= 1", file=sys.stderr)
+        return 2
+    try:
+        res = compare.run(a.reference, a.candidate, offset=a.offset, slow=a.slow,
+                          out_dir=Path(a.out) if a.out else None)
+    except compare.CompareError as exc:
+        print(f"[watch] {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(res, ensure_ascii=False, indent=1) if a.json else compare.summary_md(res))
+    return 0
+
+
+COMMANDS = {"breakdown": _cmd_breakdown, "motion": _cmd_motion, "compare": _cmd_compare}
 
 
 def main(argv: list[str]) -> int:
