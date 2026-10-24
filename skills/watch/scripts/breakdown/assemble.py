@@ -335,6 +335,7 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
 
     raw: list[dict] = []
     entries: list[dict] = []
+    series: dict = {}
     if has_media and fps > 0:
         series = shots_mod.frame_series(m["path"], fps)
         raw = shots_mod.detect_shots(series, duration)
@@ -348,7 +349,7 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
     shot_list, loose_fades = reconcile(raw, entries) if raw else ([], [])
 
     for sh in shot_list:
-        sh["camera"] = camera.camera_motion(m["path"], sh)
+        sh["camera"] = camera.camera_motion(m["path"], sh, crop=series.get("crop"))
         sh["look"] = look.shot_look(m["path"], sh)
         for n in (sh["camera"].get("notes") or []) + (sh["look"].get("notes") or []):
             _add_note(notes, n)

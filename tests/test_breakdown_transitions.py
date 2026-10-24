@@ -276,3 +276,97 @@ def test_on_ramp_still_absorbs_a_fade_step():
                                        "evidence": {"t_start": series["t"][29], "t_end": series["t"][30], "confidence": 0.9}}}]
     kinds = [e["kind"] for e in T.classify(series, shots)]
     assert "cut" not in kinds and "fade_to_black" in kinds, kinds
+
+
+# ------------------------------------------------------------------ 0.7.1 camera
+
+def _flat_clip(tmp_path, color="0x808080", secs=2):
+    p = tmp_path / "flat.mp4"
+    _ff("-f", "lavfi", "-i", f"color=c={color}:s=640x360:r=25:d={secs}", *ENC, str(p))
+    return p
+
+
+def test_textureless_frames_are_not_static(tmp_path):
+    """Identical blank frames carry no motion evidence: a camera could be panning over a blank wall."""
+    p = _flat_clip(tmp_path)
+    r = C.camera_motion(str(p), {"start": 0.0, "end": 2.0})
+    assert r["type"] == C.NOT_DETERMINED and r["confidence"] == 0
+    assert any("textureless" in n for n in r["notes"])
+
+
+def test_evidence_keeps_contract_keys_and_numbers_live_in_measurements(still):
+    r = _cam(still, "m1", "crop=640:360:'t*200':200,scale=640:360", img="half.png")
+    assert r["type"] == "pan_right"
+    assert set(r["evidence"]) == {"t_start", "t_end", "method", "confidence"}
+    assert {"pairs", "pan_x_per_s", "pan_y_per_s", "zoom_per_s", "jitter"} <= set(r["measurements"])
+
+
+def test_one_seek_per_pair(still, monkeypatch):
+    import cv2
+    seeks = []
+
+    class Counting:
+        def __init__(self, *a):
+            self._c = cv2_capture(*a)
+
+        def set(self, prop, val):
+            if prop == cv2.CAP_PROP_POS_MSEC:
+                seeks.append(val)
+            return self._c.set(prop, val)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    cv2_capture = cv2.VideoCapture
+    monkeypatch.setattr(cv2, "VideoCapture", Counting)
+    r = _cam(still, "seek", "crop=640:360:'t*60':200", img="half.png")
+    assert r["type"] == "pan_right"
+    pairs = r["measurements"]["pairs"]
+    assert 3 <= pairs and len(seeks) == pairs, (len(seeks), pairs)
+
+
+def test_crop_restricts_the_working_picture():
+    """The active picture (shots.active_crop) is cut out before it is scaled to the work size."""
+    import cv2
+    import numpy as np
+    img = np.zeros((360, 1280, 3), np.uint8)
+    img[:, 160:1120] = (200, 120, 60)  # a 960 px picture between black pillars
+    full = C._gray(cv2, img, None)
+    cut = C._gray(cv2, img, C._parse_crop("crop=960:360:160:0"))
+    assert full[:, :20].mean() == 0 and cut.min() > 0  # pillars gone, whole work width is picture
+    assert cut.shape[1] == C.WORK_W and C._parse_crop("crop=960:360:160:0") == (960, 360, 160, 0)
+    assert C._parse_crop(None) is None and C._parse_crop("garbage") is None
+
+
+def test_pillarboxed_pan_is_measured_on_the_picture(still, tmp_path):
+    p = tmp_path / "pb.mp4"
+    _ff("-loop", "1", "-framerate", "25", "-t", "3", "-i", str(still / "half.png"), "-vf",
+        "crop=640:360:'400+t*80':200,scale=480:360,pad=1280:360:400:0", *ENC, str(p))
+    assert S.active_crop(str(p)) == "crop=480:360:400:0"
+    r = C.camera_motion(str(p), {"start": 0.0, "end": 3.0}, crop=S.active_crop(str(p)))
+    assert r["type"] == "pan_right"
+
+
+def test_still_camera_with_a_dominant_moving_subject_is_static(still, tmp_path):
+    """Most features sit on the moving subject, so no fit is dominated by the background; but the
+    background features that did not move at all prove the camera did not either."""
+    p = tmp_path / "subj.mp4"
+    _ff("-loop", "1", "-framerate", "25", "-t", "3", "-i", str(still / "s.png"),
+        "-f", "lavfi", "-i", "testsrc2=s=1600x500:r=25:d=3",
+        "-filter_complex", "[0]scale=640:360[bg];[1]crop=300:360:'mod(t*180,1300)':0,scale=300:360[fg];"
+                           "[bg][fg]overlay=x='60+t*70':y=0:shortest=1", *ENC, str(p))
+    r = C.camera_motion(str(p), {"start": 0.0, "end": 3.0})
+    assert r["type"] == "static", r
+
+
+def test_directional_label_needs_three_pairs(still):
+    """Two frame pairs are enough to see nothing move, not enough to name a direction."""
+    _cam(still, "short", "crop=640:360:'t*300':200,scale=640:360", img="half.png")
+    r = C.camera_motion(str(still / "short.mp4"), {"start": 0.0, "end": 0.12})
+    assert r["type"] == C.NOT_DETERMINED and r["confidence"] == 0
+
+
+def test_very_short_shot_never_names_a_move(still):
+    _cam(still, "tiny", "crop=640:360:'t*300':200,scale=640:360", img="half.png")
+    r = C.camera_motion(str(still / "tiny.mp4"), {"start": 0.0, "end": 0.35})
+    assert r["type"] in (C.NOT_DETERMINED, "static")
