@@ -477,8 +477,39 @@ def test_steady_70_kicks_on_8ths_has_no_octave_change_note(tmp_path, hats16):
 
 
 @pytest.mark.parametrize("bpm", [80, 90, 100])
-def test_kick_on_every_beat_with_8th_hats_settles_the_slow_octave(tmp_path, bpm):
-    # clear evidence: the kick sits strictly on the beat grid, hats are only subdivisions
+def test_kick_on_every_beat_with_8th_hats_stays_ambiguous(tmp_path, bpm):
+    # a slow backbeat and a half-time groove are the same evidence: never a confident slower octave
     res = A.analyze(_wav(tmp_path / "g.wav", _groove(bpm, 60)), 60)
-    assert abs(res["tempo_bpm"] - bpm) <= 2
-    assert "tempo_alt" not in res and res["evidence"]["confidence"] > 0.5, res
+    _never_confident_wrong(res, bpm)
+    assert res["evidence"]["confidence"] <= 0.5 and "tempo_alt" in res, res
+
+
+def _halftime(bpm, secs, kicks=(0,), snares=(2,), hat_amp=0.0, accent=False, k808=False):
+    rng, kick, hat, snare = _kit()
+    if k808:
+        tk = np.arange(int(0.3 * SR)) / SR
+        kick = np.sin(2 * np.pi * (45 + 60 * np.exp(-tk * 10)) * tk) * np.exp(-tk * 6)
+    x = rng.standard_normal(int(secs * SR)) * 0.03
+    p = 60 / bpm
+    t = 0.0
+    while t < secs - 4 * p:
+        for o in kicks:
+            _put(x, kick, t + o * p)
+        for o in snares:
+            _put(x, snare(), t + o * p)
+        if hat_amp:
+            for o in range(4):
+                _put(x, hat() * hat_amp * (2.0 if accent and o in (0, 2) else 1.0) / 0.3 * 0.3, t + o * p)
+        t += 4 * p
+    return x / np.abs(x).max() * 0.8
+
+
+HALFTIME = [(b, h, acc, k8) for b in (130, 140, 150, 160, 170) for h in (0.0, 0.12, 0.3) for acc in (False, True)
+            for k8 in (False, True) if not (h == 0.0 and acc)]
+
+
+@pytest.mark.parametrize("bpm,hat,accent,k808", HALFTIME)
+def test_half_time_groove_is_never_confidently_the_slower_octave(tmp_path, bpm, hat, accent, k808):
+    res = A.analyze(_wav(tmp_path / "h.wav", _halftime(bpm, 60, hat_amp=hat, accent=accent, k808=k808)), 60)
+    if res["tempo_bpm"] != "not determined":
+        _never_confident_wrong(res, bpm)

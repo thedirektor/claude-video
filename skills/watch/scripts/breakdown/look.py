@@ -13,6 +13,7 @@ PALETTE_K = 5
 TEMP_DELTA = 0.06  # mean (R-B)/255 beyond which the shot reads warm / cool
 BLACK_LUMA = 20  # 0-255 luma under which a row counts as a letterbox bar
 BAR_MIN = 0.02  # a bar must cover at least this fraction of the height
+BAR_FLAT = 8  # luma spread allowed inside a bar (codec noise); a gradient spreads wider
 BAR_MAX = 0.4  # more than this per side is a black frame, not a letterbox
 
 
@@ -61,7 +62,7 @@ def _frames(cv2, path: str, shot: dict) -> tuple[list, list]:
                 continue
             h, w = img.shape[:2]
             g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            prof.append((g.max(axis=1), g.max(axis=0)))
+            prof.append((g.max(axis=1), g.max(axis=0), g.min(axis=1), g.min(axis=0)))
             out.append(cv2.resize(img, (WORK_W, max(2, int(round(h * WORK_W / w)))), interpolation=cv2.INTER_AREA))
         return out, prof
     finally:
@@ -123,15 +124,27 @@ def _bars(np, black):
 
 def _letterbox(np, profiles):
     """Bar sizes (fraction of height / width) black in every sampled frame, else None.
-    ``profiles`` are the full-resolution (row max, column max) luma of each frame."""
+    ``profiles`` are the full-resolution (row max, column max, row min, column min) luma of each frame."""
     ps = [p for p in profiles if p[0].shape == profiles[0][0].shape and p[1].shape == profiles[0][1].shape]
-    rows = np.all([(r < BLACK_LUMA) for r, _ in ps], axis=0)
-    cols = np.all([(c < BLACK_LUMA) for _, c in ps], axis=0)
+    rows = np.all([(p[0] < BLACK_LUMA) for p in ps], axis=0)
+    cols = np.all([(p[1] < BLACK_LUMA) for p in ps], axis=0)
     if rows.all() or cols.all():
         return None
     (tf, bf), (lf, rf) = _bars(np, rows), _bars(np, cols)
     if max(tf, bf, lf, rf) > BAR_MAX:
         return None
+    n_r, n_c = len(rows), len(cols)
+
+    def uniform(frac, rng, n, side):  # a bar is flat black, not the dark end of a gradient
+        k = int(round(frac * n))
+        if k == 0:
+            return True
+        sl = slice(0, k) if side == 0 else slice(n - k, n)
+        hi = max(float(p[rng][sl].max()) for p in ps)
+        lo = min(float(p[rng + 2][sl].min()) for p in ps)
+        return hi - lo <= BAR_FLAT
+    tf, bf = (tf if uniform(tf, 0, n_r, 0) else 0.0), (bf if uniform(bf, 0, n_r, 1) else 0.0)
+    lf, rf = (lf if uniform(lf, 1, n_c, 0) else 0.0), (rf if uniform(rf, 1, n_c, 1) else 0.0)
     out = {k: (round(v, 4) if v >= BAR_MIN else 0.0) for k, v in
            (("top", tf), ("bottom", bf), ("left", lf), ("right", rf))}
     return out if any(out.values()) else None

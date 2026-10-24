@@ -413,6 +413,13 @@ def text_tracks(path: str, duration: float, step: float = STEP_S) -> tuple[list[
         ocr = _load_ocr()
     except RuntimeError as exc:
         return [], [f"{exc}; typography not determined (tesseract/pytesseract required)"]
+    cap = cv2.VideoCapture(str(path))
+    try:
+        vfr = _vfr(cv2, cap, float(cap.get(cv2.CAP_PROP_FPS) or 0.0), float(duration))
+    finally:
+        cap.release()
+    if vfr:
+        return [], ["variable frame rate: on-screen text cannot be placed in time; typography not determined"]
     try:
         return _run(cv2, np, ocr, str(path), float(duration), float(step)), []
     except Exception as exc:  # never raise out of a command
@@ -449,75 +456,122 @@ def _new_blob(cv2, np, m0, m1, m2) -> bool:
     return float(new.mean()) >= NEW_BLOB_MIN
 
 
+def scan_usable(cv2, cap, fps: float, duration: float) -> bool:
+    """Sequential sampling needs a steady frame rate: frame time is index / fps. A source slower
+    than the scan cadence, or whose frame count disagrees with its duration (variable frame rate,
+    dropped duplicates), is sampled by seeking instead, without the short-title scan."""
+    return bool(fps) and fps >= 1.0 / SCAN_S and not _vfr(cv2, cap, fps, duration)
+
+
+def _vfr(cv2, cap, fps: float, duration: float) -> bool:
+    """Frame count x fps disagrees with the duration: a variable-frame-rate source, whose frames
+    cannot be placed in time by index or reliably by seeking."""
+    n = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+    if not fps or n <= 0 or duration <= 0:
+        return False
+    return abs(n / fps - duration) > max(0.05 * duration, min(2.0 / fps, 0.5))
+
+
+def scan_available(path: str, duration: float) -> bool:
+    """Whether :func:`text_tracks` will run the short-title scan on this file."""
+    try:
+        cv2, _ = _import_cv()
+    except Exception:
+        return False
+    cap = cv2.VideoCapture(str(path))
+    try:
+        return scan_usable(cv2, cap, float(cap.get(cv2.CAP_PROP_FPS) or 0.0), float(duration))
+    finally:
+        cap.release()
+
+
 def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
     """``[(t, detections)]`` in time order: one entry per base sample (every ``step``), plus the
     extra OCR runs the text-likeness scan asked for between them.
 
-    One sequential decode. A base sample whose frame did not change since the last OCR run reuses
-    that run's detections. Falls back to seeking (no extras) when the source has no usable fps."""
+    One sequential decode, each frame stamped with its own time (index / fps). A base sample whose
+    frame did not change since the last OCR run reuses that run's detections. Falls back to seeking
+    (no extras) when the source frame rate is unusable (see :func:`scan_usable`)."""
     nbase = int(math.ceil(duration / step - 1e-9)) if duration > 0 else 0
-    if not fps or fps <= 0:
-        cap = cv2.VideoCapture(path)
-        try:
+    cap = cv2.VideoCapture(path)
+    try:
+        if not scan_usable(cv2, cap, fps, duration):
             out = []
             for k in range(nbase):
                 t = round(k * step, 6)
                 img = _read(cap, cv2, t)
-                out.append((t, _detect(ocr, img, cv2) if img is not None else []))
+                out.append((t, _detect(ocr, img, cv2) if img is not None else [], False))
             return out
-        finally:
-            cap.release()
-    sub = max(1, int(math.ceil(step / SCAN_S - 1e-9)))
-    scan = step / sub
-    cap = cv2.VideoCapture(path)
-    out: list = []
-    try:
-        k, idx = 0, 0
+        sub = max(1, int(math.ceil(step / SCAN_S - 1e-9)))
+        scan = step / sub
+        out: list = []
+        idx, k = 0, 0  # k: next scan slot (slot k is due at k * scan)
         last_g = None
         last_dets: list = []
         last_ocr_t = -1e9
-        masks: list = [None, None]  # scan masks k-2, k-1
+        masks: list = [None, None]
         extras_total, extras_here = 0, 0
         budget = int(EXTRA_SHARE * nbase) + EXTRA_MIN
-        while k < nbase * sub:
-            ts = k * scan
-            if ts >= duration - 1e-9:
-                break
+        while True:
             if not cap.grab():
                 break
             t_frame = idx / fps
             idx += 1
-            if t_frame < ts - 0.5 / fps:
+            if t_frame >= duration - 1e-9:
+                break
+            if t_frame < k * scan - 0.5 / fps:
                 continue
             ok, img = cap.retrieve()
+            kk = k
+            k = max(k + 1, int(math.floor(t_frame / scan + 0.5)) + 1)  # a slow source skips slots
             if not ok or img is None:
-                k += 1
                 continue
+            ts = round(t_frame, 6)
             g = _small_gray(cv2, img)
             m = _textlike(cv2, np, g)
-            base = k % sub == 0
+            base = kk % sub == 0 or (k - kk) > 1 and any(j % sub == 0 for j in range(kk, k))
             if base:
                 extras_here = 0
             run = False
+            is_extra = False
             if base:
                 run = last_g is None or last_g.shape != g.shape or float(
                     (np.abs(g.astype(np.int16) - last_g.astype(np.int16)) > MASK_T).mean()) > UNCHANGED_MAX
                 if not run:
-                    out.append((round(ts, 6), list(last_dets)))
+                    out.append((ts, list(last_dets), False))
             elif (extras_total < budget and extras_here < EXTRA_PER_INTERVAL and ts - last_ocr_t >= EXTRA_GAP_S
                     and _new_blob(cv2, np, masks[0], masks[1], m)):
                 run = True
+                is_extra = True
                 extras_total += 1
                 extras_here += 1
             if run:
                 last_dets = _detect(ocr, img, cv2)
                 last_g, last_ocr_t = g, ts
-                out.append((round(ts, 6), list(last_dets)))
+                out.append((ts, list(last_dets), is_extra))
             masks = [masks[1], m]
-            k += 1
         return out
     finally:
         cap.release()
+
+
+LATE_START_CONF = 0.4  # track confidence ceiling when the start time is only approximate
+
+
+def _busy_around(cv2, np, cap, fps, t_first: float, box) -> bool:
+    """Does the picture around the text move just before it was first seen?"""
+    if not fps or fps <= 0:
+        return True
+    frames = _gray_frames(cv2, cap, fps, max(0.0, t_first - 0.4), t_first, box)
+    if len(frames) < 2:
+        return True
+    h, w = frames[0][1].shape
+    band = np.zeros((h, w), bool)
+    # the crop is box +- margins: the band holding the text itself is the middle third of the rows
+    band[h // 3: 2 * h // 3, :] = True
+    moved = [float((np.abs(a[1].astype(np.int16) - b[1].astype(np.int16)) > MASK_T)[~band].mean())
+             for a, b in zip(frames, frames[1:]) if a[1].shape == b[1].shape]
+    return bool(moved) and float(np.mean(moved)) > BG_MOVE_MAX
 
 
 def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
@@ -525,10 +579,11 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
     try:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         samples = _sample(cv2, np, ocr, path, duration, step, fps)
-        stamps = [t for t, _ in samples]
+        stamps = [x[0] for x in samples]
+        extra_at = {x[0] for x in samples if x[2]}
         open_tracks: list[dict] = []
         done: list[dict] = []
-        for t, found in samples:
+        for t, found, _x in samples:
             dets = list(found)
             still = []
             for tr in open_tracks:
@@ -575,6 +630,12 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
                 t_out = a_out
             ref = _read(cap, cv2, (t_set_in + t_set_out) / 2.0)  # middle of the stable span: fully opaque
             conf = _track_conf(len(tr["boxes"]), sum(tr["confs"]) / len(tr["confs"]))
+            timing_note = None
+            if t_first in extra_at and entrance == NOT_DETERMINED and _busy_around(cv2, np, cap, fps, t_first, box):
+                # found by the between-samples scan over a moving picture, with no measurable
+                # animation: the start can sit up to a scan step or two late
+                conf = min(conf, LATE_START_CONF)
+                timing_note = "start time approximate (busy background)"
             out.append({
                 "text": tr["text"],
                 "t_in": round(t_in, 3), "t_out": round(t_out, 3),
@@ -587,7 +648,8 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
                 "evidence": {"t_start": round(t_in, 3), "t_end": round(t_out, 3), "method": "ocr",
                              "confidence": round(conf, 3), "samples": len(tr["boxes"]),
                              "ocr_confidence": round(sum(tr["confs"]) / len(tr["confs"]), 3),
-                             "box_track": [[round(tt, 3)] + [round(v, 4) for v in b] for tt, b in tr["boxes"]]},
+                             "box_track": [[round(tt, 3)] + [round(v, 4) for v in b] for tt, b in tr["boxes"]],
+                             **({"timing_note": timing_note} if timing_note else {})},
             })
         out = _drop_fragments(out)
         out.sort(key=lambda r: (r["t_in"], r["box"][1], r["box"][0]))

@@ -35,6 +35,8 @@ EPS = 1e-6
 BRIEF_MIN_TEXT_CONF = 0.5  # OCR tracks below this are listed in breakdown.json only
 SAMPLING_NOTE = (f"sampled every {typography.STEP_S:g} s, with a word-shape scan every {typography.SCAN_S:g} s that "
                  "reads extra frames for short titles; very brief, low-contrast or stylised text may still be missed")
+SAMPLING_NOTE_SEEK = (f"sampled every {typography.STEP_S:g} s by seeking (frame rate too low or variable for the "
+                      "short-title scan); text shorter than that may be missed")
 BLIND_SPOT_NOTE = ("dissolves between two moving shots can go undetected and jump cuts within one framing "
                    "may be merged: cuts and shots are what was measured")
 HOLD_MIN_S = 0.5  # a black / white hold this long between two fades is its own shot (0.7.0 ruling)
@@ -298,8 +300,9 @@ def _typography_section(m: dict, duration: float, notes: list[str]) -> dict:
     if tnotes:
         return {"tracks": NOT_DETERMINED, "evidence": _ev(0.0, duration, "ocr", 0.0)}
     conf = max((t["evidence"]["confidence"] for t in tracks), default=0.5)
-    return {"tracks": tracks, "sampling": SAMPLING_NOTE,
-            "evidence": _ev(0.0, duration, "ocr", conf, sampling=SAMPLING_NOTE)}
+    note = SAMPLING_NOTE if typography.scan_available(m["path"], duration) else SAMPLING_NOTE_SEEK
+    return {"tracks": tracks, "sampling": note,
+            "evidence": _ev(0.0, duration, "ocr", conf, sampling=note)}
 
 
 def _rhythm_section(shot_list: list[dict]) -> dict:
@@ -561,17 +564,18 @@ def brief_md(bd: dict) -> str:
         w = r[k]
         out.append(f"- {k.replace('_', ' ')}: " + (_v(w) if w == NOT_DETERMINED
                                                    else f"{_t(w['t_start'])} - {_t(w['t_end'])} (mean shot {_t(w['mean'])})"))
+    samp = bd["typography"].get("sampling") or SAMPLING_NOTE
     out += ["", "## Typography", "", "Box is x, y, w, h as 0-1 fractions of the frame.",
-            f"Text {SAMPLING_NOTE}.", ""]
+            f"Text {samp}.", ""]
     tracks = bd["typography"]["tracks"]
     if tracks == NOT_DETERMINED:
         out.append(_v(NOT_DETERMINED))
     elif not tracks:
-        out.append(f"No on-screen text found in the samples ({SAMPLING_NOTE}).")
+        out.append(f"No on-screen text found in the samples ({samp}).")
     shown = [t for t in tracks if t["evidence"]["confidence"] >= BRIEF_MIN_TEXT_CONF] if isinstance(tracks, list) else []
     hidden = len(tracks) - len(shown) if isinstance(tracks, list) else 0
     if isinstance(tracks, list) and tracks and not shown:
-        out.append(f"No confidently read on-screen text ({SAMPLING_NOTE}).")
+        out.append(f"No confidently read on-screen text ({samp}).")
     if hidden:
         out.append(f"{hidden} low-confidence OCR reading(s) left out of this brief (likely texture or fragments, "
                    "not text to rebuild); they are listed in breakdown.json.")

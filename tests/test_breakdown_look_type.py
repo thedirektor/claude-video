@@ -277,3 +277,53 @@ def test_bisect_probes_read_only_a_crop_around_the_text(tmp_path, monkeypatch):
     assert crops and len(crops) >= 6, shapes  # the bisect probes
     assert all(c[0] * c[1] < 0.5 * 360 * 640 for c in crops)
     assert abs(t["t_in"] - 1.2) <= 0.1 and abs(t["t_out"] - 3.3) <= 0.1
+
+
+# ---- fix round 1: frame stamps under low / variable frame rates ----
+def _fps_clip(tmp_path, r, d=8):
+    return _title_clip(tmp_path / f"f{r}.mp4", "x=40:enable='between(t,5,6)'",
+                       src=f"color=c=navy:s=640x360:r={r}:d={d}")
+
+
+@pytest.mark.parametrize("r", [5, 8, 12])
+def test_low_frame_rate_sources_are_stamped_with_real_times(tmp_path, r):
+    tracks, _ = TY.text_tracks(_fps_clip(tmp_path, r), 8.0)
+    hit = [t for t in tracks if "HELLO" in t["text"].upper()]
+    assert hit and abs(hit[0]["t_in"] - 5.0) <= 0.3 and abs(hit[0]["t_out"] - 6.0) <= 0.3, (r, tracks)
+
+
+def test_variable_frame_rate_source_is_found_or_flagged(tmp_path):
+    import subprocess
+    src = _title_clip(tmp_path / "v0.mp4", "x=40:enable='between(t,5,6)'", src="color=c=navy:s=640x360:r=25:d=8")
+    p = tmp_path / "vfr.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-vf", "mpdecimate",
+                    "-fps_mode", "vfr", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)], check=True)
+    tracks, notes = TY.text_tracks(str(p), 8.0)
+    hit = [t for t in tracks if "HELLO" in t["text"].upper()]
+    assert (hit and abs(hit[0]["t_in"] - 5.0) <= 0.3) or notes, (tracks, notes)
+
+
+def test_sampling_note_is_worded_per_path(tmp_path):
+    from breakdown import assemble
+    assert TY.scan_available(_fps_clip(tmp_path, 25), 8.0) is True
+    assert TY.scan_available(_fps_clip(tmp_path, 5), 8.0) is False
+    assert "seeking" in assemble.SAMPLING_NOTE_SEEK and "word-shape scan" not in assemble.SAMPLING_NOTE_SEEK
+
+
+@pytest.mark.parametrize("a", [2.13, 2.27, 2.41])
+def test_short_title_over_moving_footage_is_timed_or_flagged_approximate(tmp_path, a):
+    path = _title_clip(tmp_path / "bm.mp4", f"x=40:enable='between(t,{a},{a + 0.4:.2f})'", src=_MOVING)
+    tracks, _ = TY.text_tracks(path, 5.0)
+    hit = [t for t in tracks if "HELLO" in t["text"].upper()]
+    for t in hit:
+        late = t["t_in"] - a
+        assert late <= 0.15 or (t["evidence"]["confidence"] <= 0.4
+                                and t["evidence"]["timing_note"] == "start time approximate (busy background)"), (a, t)
+
+
+def test_dark_gradient_edge_is_not_a_pillarbox(tmp_path):
+    import subprocess
+    p = tmp_path / "grad.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "rgbtestsrc=s=1280x720:r=25:d=2", "-pix_fmt", "yuv420p", str(p)], check=True)
+    assert L.shot_look(str(p), {"start": 0.0, "end": 2.0})["letterbox"] is None

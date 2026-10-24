@@ -29,12 +29,8 @@ PRIOR_BPM = 120.0
 # of one frequency band on the lo grid; the off-slots are the beats only the faster octave claims.
 FAST_PULSE_R = 0.8  # low (kick) band: off-beats carry the same pulse -> faster can be confident
 FAST_MIN_R = 0.3  # ...and no band has nearly empty off-beats
-SLOW_COMB_RATIO = 0.8  # faster octave's comb periodicity >= this share of the slower's -> not confident slower
-SLOW_MAX_R = 0.5  # confident slower also needs every band's off-beats clearly weaker
 PRIMARY_R = 0.5  # ambiguous: pulse-band r at or above this makes the faster octave the primary reading
 BAND_MIN_LEVEL = 3.0  # slot medians below this many times the band mean: the band carries no pulse
-LOW_SETTLE_R = 0.1  # kick (low band) off/on at or below this: the kick sits strictly on the slower grid
-KICK_CARRIES_LEVEL = 20.0  # ...and its on-slot median is this many times the band mean (it is the grid)
 MIX_R_CHANGE = 2.0  # mean off/on of a band must change by this factor between halves for a real section change
 MIX_R_DELTA = 0.3
 AMBIG_CONF = 0.5
@@ -280,13 +276,10 @@ def _resolve_octave(env, bands, hop_s: float, bpm: float, np, grid=None, stats_o
     """``(primary_bpm, alt)``: ``alt`` is the other octave when the octave is ambiguous, else None.
 
     Faster is confident only when the low (kick) band keeps its pulse on the off-beats and no
-    band leaves them nearly empty. Slower is confident only when no band's off-beats are
-    clearly strong (every band's off/on <= 0.5) and either the faster octave's comb periodicity
-    is clearly below the slower's (< 0.8 of it) or the kick itself sits strictly on the slower
-    grid (low band off/on <= LOW_SETTLE_R) with the kick actually carrying the grid, so the
-    faster band(s) are only subdivisions (hats). Anything else is ambiguous; the pulse band then
-    only picks the primary. Over-flagging an ordinary groove is acceptable, a confident wrong
-    octave is not. ``stats_out``, when given, receives the octave statistics."""
+    band leaves them nearly empty. The slower octave is never confident: inside 60-200 BPM a slow
+    backbeat and a half-time groove (kick on 1, snare on 3) are the same evidence, a genuine 2:1
+    ambiguity; the pulse band then only picks the primary. Over-flagging an ordinary groove is
+    acceptable, a confident wrong octave is not. ``stats_out``, when given, receives the octave statistics."""
     pair = _octave_pair(bpm)
     if pair is None:
         return bpm, None
@@ -300,12 +293,8 @@ def _resolve_octave(env, bands, hop_s: float, bpm: float, np, grid=None, stats_o
     on0, off0 = st["bands"][0]
     low_ok = max(on0, off0) >= BAND_MIN_LEVEL
     pulse_r = (off0 / on0 if on0 > 0 else float("inf")) if low_ok else float(np.median(rs))
-    comb_ratio = st["s_hi"] / st["s_lo"] if st["s_lo"] > 0 else float("inf")
     if pulse_r >= FAST_PULSE_R and min(rs) >= FAST_MIN_R:
         return hi, None
-    kick_on_grid = low_ok and on0 >= KICK_CARRIES_LEVEL and pulse_r <= LOW_SETTLE_R
-    if (comb_ratio < SLOW_COMB_RATIO or kick_on_grid) and max(rs) <= SLOW_MAX_R:
-        return lo, None
     return (hi, lo) if pulse_r >= PRIMARY_R else (lo, hi)
 
 
