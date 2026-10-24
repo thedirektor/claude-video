@@ -108,13 +108,13 @@ def test_pillarbox_measured(tmp_path):
 _FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 
-def _title_clip(path, extra, size="48", src="color=c=navy:s=640x360:r=25:d=5", pre=""):
+def _title_clip(path, extra, size="48", src="color=c=navy:s=640x360:r=25:d=5", pre="", t=None):
     import subprocess
     if not Path(_FONT).is_file():
         pytest.skip("no font for drawtext")
     dt = (pre + f"drawtext=fontfile={_FONT}:text='HELLO WORLD':fontsize={size}:y=40:fontcolor=white:{extra}")
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
-                    src, "-vf", dt, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    src, "-vf", dt, *(("-t", str(t)) if t else ()), "-c:v", "libx264", "-pix_fmt", "yuv420p",
                     "-crf", "18", str(path)], check=True)
     return str(path)
 
@@ -292,17 +292,18 @@ def test_low_frame_rate_sources_are_stamped_with_real_times(tmp_path, r):
     assert hit and abs(hit[0]["t_in"] - 5.0) <= 0.3 and abs(hit[0]["t_out"] - 6.0) <= 0.3, (r, tracks)
 
 
-def test_variable_frame_rate_source_places_text_at_its_real_time(tmp_path):
+@pytest.mark.parametrize("a,b", [(5.0, 6.0), (2.2, 3.7)])
+def test_variable_frame_rate_source_places_text_at_its_real_time(tmp_path, a, b):
     import subprocess
-    src = _title_clip(tmp_path / "v0.mp4", "x=40:enable='between(t,5,6)'", src="color=c=navy:s=640x360:r=25:d=8")
+    src = _title_clip(tmp_path / "v0.mp4", f"x=40:enable='between(t,{a},{b})'", src="color=c=navy:s=640x360:r=25:d=8")
     p = tmp_path / "vfr.mp4"
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-vf", "mpdecimate",
                     "-fps_mode", "vfr", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)], check=True)
     tracks, notes = TY.text_tracks(str(p), 8.0)
     hit = [t for t in tracks if "HELLO" in t["text"].upper()]
     assert notes == [] and hit, (tracks, notes)
-    assert abs(hit[0]["t_in"] - 5.0) <= 0.6 and abs(hit[0]["t_out"] - 6.0) <= 1.1, hit[0]
-    assert "variable-frame-rate" in hit[0]["evidence"].get("timing_note", ""), hit[0]["evidence"]
+    # a frame is held until the next one: with no frame in between, the boundaries are exact
+    assert abs(hit[0]["t_in"] - a) <= 0.1 and abs(hit[0]["t_out"] - b) <= 0.1, hit[0]
 
 
 def test_audio_longer_than_video_does_not_lose_the_text(tmp_path):
@@ -366,3 +367,37 @@ def test_real_bars_survive_codec_ringing(tmp_path, name, W, H, box, crf):
         size = int(b.split(":")[3] if "pillar" not in name else b.split(":")[2])
         frac = size / (H if "pillar" not in name else W)
         assert abs(lb[key] - frac) < 0.006, (name, key, lb)
+
+
+# ---- fix round 3: 0.3 s titles over moving busy footage ----
+_BUSY = {"testsrc2": "testsrc2=s=640x360:r=25", "mandelbrot": "mandelbrot=s=640x360:r=25"}
+
+
+@pytest.mark.parametrize("source,boxed", [
+    ("mandelbrot", False), ("mandelbrot", True), ("testsrc2", True),
+    pytest.param("testsrc2", False, marks=pytest.mark.xfail(
+        strict=True, reason="known limit: plain white 0.3 s text over testsrc2's own bright moving "
+                            "graphics is not isolated (disclosed by the sampling note)")),
+], ids=["mandelbrot-plain", "mandelbrot-boxed", "testsrc2-boxed", "testsrc2-plain"])
+def test_0_3s_title_over_busy_moving_footage_is_found(tmp_path, source, boxed):
+    found = 0
+    phases = (2.03, 2.11, 2.17, 2.23, 2.29, 2.37, 2.43, 2.47)
+    for a in phases:
+        extra = f"x=40:enable='between(t,{a},{a + 0.3:.2f})'" + (":box=1:boxcolor=black@0.6" if boxed else "")
+        src = _BUSY[source]
+        path = _title_clip(tmp_path / f"{source}{a}.mp4", extra, src=src, t=4)
+        tracks, _ = TY.text_tracks(path, 4.0)
+        hit = [t for t in tracks if "HELLO" in t["text"].upper()]
+        if hit and abs(hit[0]["t_in"] - a) <= 0.1:
+            found += 1
+    assert found >= 7, (source, boxed, found)
+
+
+def test_busy_footage_without_titles_gets_no_confident_tracks(tmp_path):
+    import subprocess
+    p = tmp_path / "mb.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "mandelbrot=s=640x360:r=25", "-t", "5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)],
+                   check=True)
+    tracks, _ = TY.text_tracks(str(p), 5.0)
+    assert [t for t in tracks if t["evidence"]["confidence"] > 0.5] == [], tracks

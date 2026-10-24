@@ -132,9 +132,9 @@ def _detect(ocr, img, cv2) -> list[dict]:
 PROBE_MARGIN = 0.6  # crop margin (as a share of the box size) around the text for bisect probes
 
 
-def _crop(img, box):
+def _crop(img, box, tight: bool = False):
     h, w = img.shape[:2]
-    mx, my = max(0.04, box[2] * PROBE_MARGIN), max(0.04, box[3] * PROBE_MARGIN * 2)
+    mx, my = (0.005, 0.005) if tight else (max(0.04, box[2] * PROBE_MARGIN), max(0.04, box[3] * PROBE_MARGIN * 2))
     x0, y0 = max(0, int((box[0] - mx) * w)), max(0, int((box[1] - my) * h))
     x1, y1 = min(w, int(math.ceil((box[0] + box[2] + mx) * w))), min(h, int(math.ceil((box[1] + box[3] + my) * h)))
     return img[y0:y1, x0:x1]
@@ -476,8 +476,55 @@ def scan_available(path: str, duration: float) -> bool:
     return _stamps_ok(cv2, path)
 
 
+ISO_DIFF = 40  # grey-level change that marks a pixel as newly appeared
+ISO_MIN_PX = 30
+
+
+def _iso_mask(cv2, np, g, gp):
+    """Small boolean mask of word-shaped blobs among the pixels that changed against ``gp`` (a
+    couple of scan steps earlier) and are bright or dark: the trigger signal for a short title
+    over a moving picture, where whole-frame edge blobs are drowned in clutter."""
+    changed = np.abs(g.astype(np.int16) - gp.astype(np.int16)) > ISO_DIFF
+    m = (changed & (g > 200) & (g > gp)).astype(np.uint8)  # bright and newly brighter: an appearance, never a removal
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    h, w = m.shape
+    small = cv2.resize(m * 255, (SCAN_W, max(2, int(round(h * SCAN_W / w)))), interpolation=cv2.INTER_AREA) > 90
+    joined = cv2.morphologyEx(small.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+    if n <= 1:
+        return np.zeros(small.shape, bool)
+    bw, bh, area = st[1:, cv2.CC_STAT_WIDTH], st[1:, cv2.CC_STAT_HEIGHT], st[1:, cv2.CC_STAT_AREA]
+    ok = (bh >= 3) & (bh <= 0.2 * small.shape[0]) & (bw >= 2.5 * bh) & (bw <= 0.9 * small.shape[1]) & (area >= 0.3 * bw * bh)
+    ids = np.nonzero(ok)[0] + 1
+    return np.isin(lab, ids) if len(ids) else np.zeros(small.shape, bool)
+
+
+def _isolated(cv2, np, g, gp) -> list:
+    """Text-isolated copies of the gray frame ``g`` for OCR: only pixels that changed against ``gp``
+    (a couple of scan steps earlier) and are newly bright survive (drawn white-on-black), the rest is flattened. A short title over a moving picture is
+    unreadable in the whole frame but reads cleanly once the moving background is removed."""
+    changed = np.abs(g.astype(np.int16) - gp.astype(np.int16)) > ISO_DIFF
+    out = []
+    for sel, ink, paper in (((g > 200) & (g > gp), 255, 0),):  # bright text only: a dark selector reads the ghost of a removed title
+        m = (changed & sel).astype(np.uint8)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        if int(m.sum()) >= ISO_MIN_PX:
+            out.append(cv2.cvtColor(np.where(m > 0, ink, paper).astype(np.uint8), cv2.COLOR_GRAY2BGR))
+    return out
+
+
+def _merge_lines(*groups) -> list:
+    seen, out = set(), []
+    for grp in groups:
+        for d in grp:
+            if d["norm"] not in seen:
+                seen.add(d["norm"])
+                out.append(d)
+    return out
+
+
 def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
-    """``(samples, mode)``. ``samples`` is ``[(t, detections, is_extra)]`` in time order: one entry
+    """``(samples, mode, frame_times)``. ``samples`` is ``[(t, detections, is_extra)]`` in time order: one entry
     per base sample (every ``step``), plus the extra OCR runs the text-likeness scan asked for.
     ``mode`` is ``"cfr"`` (frame times follow index / fps), ``"vfr"`` (they drift from it: a
     variable frame rate, so seeking cannot be trusted) or ``"seek"`` (the decoder gives no usable
@@ -494,7 +541,7 @@ def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
                 t = round(k * step, 6)
                 img = _read(cap, cv2, t)
                 out.append((t, _detect(ocr, img, cv2) if img is not None else [], False))
-            return out, "seek"
+            return out, "seek", []
         finally:
             cap.release()
     cap = cv2.VideoCapture(path)
@@ -503,12 +550,16 @@ def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
         scan = step / sub
         tol = min(0.5 / fps, 0.5 * scan) if fps and fps > 0 else 0.5 * scan
         out: list = []
+        stamps_all: list = []
         idx, k = 0, 0  # k: next scan slot (slot k is due at k * scan)
         drift_lo, drift_hi = 1e9, -1e9
         last_g = None
         last_dets: list = []
         last_ocr_t = -1e9
         masks: list = [None, None]
+        frames: list = [None, None]  # gray scan frames k-2, k-1
+        iso_prev = None
+        pending = False  # trigger fired: also read the next scan frame (the mid-span of a short title)
         extras_total, extras_here = 0, 0
         budget = int(EXTRA_SHARE * nbase) + EXTRA_MIN
         while True:
@@ -520,6 +571,7 @@ def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
             idx += 1
             if t_frame >= duration - 1e-9:
                 break
+            stamps_all.append(t_frame)
             if t_frame < k * scan - tol:
                 continue
             ok, img = cap.retrieve()
@@ -530,6 +582,10 @@ def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
             ts = round(t_frame, 6)
             g = _small_gray(cv2, img)
             m = _textlike(cv2, np, g)
+            gfull = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            iso_m = _iso_mask(cv2, np, gfull, frames[0]) if frames[0] is not None else None
+            iso_hit = (iso_m is not None and iso_prev is not None
+                       and float((iso_m & iso_prev).mean()) >= NEW_BLOB_MIN * 0.5)
             base = kk % sub == 0 or (k - kk) > 1 and any(j % sub == 0 for j in range(kk, k))
             if base:
                 extras_here = 0
@@ -541,20 +597,71 @@ def _sample(cv2, np, ocr, path: str, duration: float, step: float, fps: float):
                 if not run:
                     out.append((ts, list(last_dets), False))
             elif (extras_total < budget and extras_here < EXTRA_PER_INTERVAL and ts - last_ocr_t >= EXTRA_GAP_S
-                    and _new_blob(cv2, np, masks[0], masks[1], m)):
+                    and (iso_hit or _new_blob(cv2, np, masks[0], masks[1], m))):
                 run = True
                 is_extra = True
                 extras_total += 1
                 extras_here += 1
             if run:
-                last_dets = _detect(ocr, img, cv2)
+                found = _detect(ocr, img, cv2)
+                known = {d["norm"] for d in last_dets}
+                unread = not any(d["norm"] not in known for d in found)
+                if unread and frames[0] is not None and (
+                        is_extra or (iso_m is not None and float(iso_m.mean()) >= NEW_BLOB_MIN * 0.5)):
+                    # something new showed up but the whole frame reads nothing new: read the text-isolated copies
+                    isos = [d for iso in _isolated(cv2, np, gfull, frames[0]) for d in _detect(ocr, iso, cv2)]
+                    found = _merge_lines(found, isos)
+                    pending = is_extra
+                last_dets = found
                 last_g, last_ocr_t = g, ts
                 out.append((ts, list(last_dets), is_extra))
+            elif pending:
+                pending = False
+                if not base:
+                    out.append((ts, _detect(ocr, img, cv2), True))
+                    last_ocr_t = ts
             masks = [masks[1], m]
+            frames = [frames[1], gfull]
+            iso_prev = iso_m
         vfr = not fps or fps <= 0 or (drift_hi - drift_lo) > min(1.5 / fps, 0.25)
-        return out, "vfr" if vfr else "cfr"
+        return out, "vfr" if vfr else "cfr", stamps_all
     finally:
         cap.release()
+
+
+AMBIG_TIMING_CONF = 0.5  # ceiling when a VFR boundary is only known between two frames
+START_COVER = 0.7  # share of the text's pixels that must already be in place to call a frame the start
+
+
+def _refine_start(cv2, np, cap, fps, t_prev: float, t_first: float, box):
+    """Frame time at which a text first shows, from pixels, between the last sample without it
+    (``t_prev``) and the first with it: the text's own pixels are the bright / dark ones that
+    changed between those two frames; the start is the first frame (that stays so for the next
+    one) where >= START_COVER of them already have their final value. None when unclear."""
+    if not fps or fps <= 0 or t_first <= t_prev:
+        return None
+    i0, i1 = int(t_prev * fps + 1e-6), int(round(t_first * fps))
+    if i1 - i0 < 2:
+        return None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, i0)
+    crops = []
+    for _ in range(i0, i1 + 1):
+        ok, img = cap.read()
+        if not ok or img is None:
+            return None
+        crops.append(_crop(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), box, True).astype(np.int16))
+    base, final = crops[0], crops[-1]
+    if base.size == 0 or base.shape != final.shape:
+        return None
+    t_mask = (np.abs(final - base) > ISO_DIFF) & ((final > 200) | (final < 55))
+    t_mask = cv2.morphologyEx(t_mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)) > 0
+    if int(t_mask.sum()) < ISO_MIN_PX:
+        return None
+    cover = [float((np.abs(c - final)[t_mask] <= 30).mean()) for c in crops]
+    for j in range(1, len(crops) - 1):
+        if cover[j] >= START_COVER and cover[j + 1] >= START_COVER:
+            return (i0 + j) / fps
+    return None
 
 
 LATE_START_CONF = 0.4  # track confidence ceiling when the start time is only approximate
@@ -580,7 +687,7 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
     cap = cv2.VideoCapture(path)
     try:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        samples, mode = _sample(cv2, np, ocr, path, duration, step, fps)
+        samples, mode, frame_times = _sample(cv2, np, ocr, path, duration, step, fps)
         vfr = mode == "vfr"
         stamps = [x[0] for x in samples]
         open_tracks: list[dict] = []
@@ -619,13 +726,20 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
             # the bisected boundaries are the fallback times AND bound the settle window of a
             # track that only one or two OCR samples saw
             timing_note = None
+            vfr_capped = False
+            entrance_refined = False
             if vfr:
-                # frames cannot be placed by seeking in a variable-frame-rate source: the
-                # boundaries are the midpoints between the stamped samples around the text
+                # a frame is held until the next one: when no decoded frame lies between the last
+                # sighting and the next sample the text ended exactly at that sample (and began at
+                # its first sighting when none lies before it); otherwise only a midpoint is known
                 entrance = ex = NOT_DETERMINED
-                t_in = (prv + t_first) / 2.0 if prv is not None else t_first
-                t_out = (t_last + nxt) / 2.0 if nxt is not None else t_last
-                timing_note = "variable-frame-rate source: start and end are approximate"
+                gap_in = prv is not None and any(prv < f < t_first - 1e-9 for f in frame_times)
+                gap_out = nxt is not None and any(t_last + 1e-9 < f < nxt - 1e-9 for f in frame_times)
+                t_in = (prv + t_first) / 2.0 if gap_in else t_first
+                t_out = ((t_last + nxt) / 2.0 if gap_out else nxt) if nxt is not None else t_last
+                if gap_in or gap_out:
+                    timing_note = "variable-frame-rate source: start or end only known to between two frames"
+                    vfr_capped = True
             else:
                 t_out_b = _bisect(ocr, cv2, cap, t_last, nxt, tr["norm"], box) if nxt is not None else duration
                 t_in_b = _bisect(ocr, cv2, cap, t_first, prv, tr["norm"], box) if prv is not None else 0.0
@@ -634,15 +748,24 @@ def _run(cv2, np, ocr, path: str, duration: float, step: float) -> list[dict]:
                                            t_out_b - _BISECT_MARGIN)
                 if a_in is not None:
                     t_in = a_in
-                ex, a_out = _exit(cv2, np, cap, fps, t_set_in, t_set_out, nxt, duration, box,
-                                  t_in_b + _BISECT_MARGIN) if nxt is not None and nxt < duration - 1e-9 \
+                # the exit window runs a full OCR step past the last sighting, as before the scan added
+                # closer samples (they can still sit inside a slow fade)
+                ex, a_out = _exit(cv2, np, cap, fps, t_set_in, t_set_out, max(nxt, t_last + step) if nxt is not None else None, duration, box,
+                                  t_in_b + _BISECT_MARGIN) if nxt is not None and max(nxt, t_last + step) < duration - 1e-9 \
                     else (NOT_DETERMINED, None)
                 if a_out is not None:
                     t_out = a_out
             ref = _read(cap, cv2, (t_set_in + t_set_out) / 2.0) if not vfr else None  # middle of the stable span: fully opaque
             conf = _track_conf(len(tr["boxes"]), sum(tr["confs"]) / len(tr["confs"]))
-            if (not vfr and entrance == NOT_DETERMINED and t_first - t_in <= SCAN_S + 1e-6
-                    and _busy_around(cv2, np, cap, fps, t_first, box)):
+            if vfr_capped:
+                conf = min(conf, AMBIG_TIMING_CONF)
+            if not vfr and entrance == NOT_DETERMINED and prv is not None and t_first - t_in <= 2 * SCAN_S + 1e-6:
+                refined = _refine_start(cv2, np, cap, fps, prv, t_first, box)
+                if refined is not None and prv <= refined <= t_first:
+                    t_in = refined  # measured from the text's own pixels: no longer approximate
+                    entrance_refined = True
+            if (not vfr and entrance == NOT_DETERMINED and not entrance_refined
+                    and t_first - t_in <= 2 * SCAN_S + 1e-6 and _busy_around(cv2, np, cap, fps, t_first, box)):
                 # over a moving picture with no measurable animation the start is only known to
                 # the sampling grid: it can sit a scan step or two late
                 conf = min(conf, LATE_START_CONF)
