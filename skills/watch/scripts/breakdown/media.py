@@ -18,6 +18,8 @@ from config import memory_paths
 from memory import store
 
 PINNED_MARKER = store.PINNED_MARKER
+OVER_CAP_MARKER = ".over_cap"  # the full-size fetch exceeded the cap once: refetch smaller next time
+LIGHT_FETCH_FORMAT = "bv*[vcodec^=avc1][height<=720]+ba/bv*[height<=720]+ba/b[height<=720]/b"
 # H.264 first: OpenCV's bundled ffmpeg has no software AV1 decoder, so an AV1 download leaves
 # camera / look / typography / motion "not determined" (ensure_media transcodes as a fallback)
 FETCH_FORMAT = "bv*[vcodec^=avc1][height<=1080]+ba/bv*[height<=1080]+ba/b"
@@ -31,6 +33,7 @@ def pin(store_dir: Path, video_key: str) -> bool:
     vdir.mkdir(parents=True, exist_ok=True)
     cap = store._breakdown_media_cap_bytes()
     if any(m.stat().st_size > cap for m in vdir.glob("media.*") if m.is_file()):
+        (vdir / PINNED_MARKER).unlink(missing_ok=True)  # a stale marker would claim an exemption it no longer has
         return False
     (vdir / PINNED_MARKER).touch()
     return True
@@ -110,7 +113,7 @@ def probe(path: Path) -> dict | None:
     }
 
 
-def default_fetch(url: str, vdir: Path) -> dict | None:
+def default_fetch(url: str, vdir: Path, fmt: str | None = None) -> dict | None:
     """Download ``url`` (<=1080p) via the plugin's yt-dlp wrapper.
 
     Returns ``{"video_path", "via_fallback_proxy"}`` (a fetch may also return a bare path)."""
@@ -119,7 +122,7 @@ def default_fetch(url: str, vdir: Path) -> dict | None:
     tmp = Path(vdir) / ".fetch"
     shutil.rmtree(tmp, ignore_errors=True)
     try:
-        res = download.download_url(url, tmp, fmt=FETCH_FORMAT)
+        res = download.download_url(url, tmp, fmt=fmt or FETCH_FORMAT)
         if res.get("video_path"):
             return res
         shutil.rmtree(tmp, ignore_errors=True)
@@ -215,8 +218,11 @@ def ensure_media(conn, video_key: str, store_dir: Path | None = None, fetch=None
     url = (row["url"] or row["source"]) if row else None
     if url and url.startswith(("http://", "https://")):
         fetcher = fetch or default_fetch
+        light = vdir.is_dir() and (vdir / OVER_CAP_MARKER).exists()
         try:
-            got = fetcher(url, vdir)
+            # once the full-size copy was over the cap, fetch the <=720p one instead of looping
+            got = fetcher(url, vdir, fmt=LIGHT_FETCH_FORMAT) if light and fetcher is default_fetch \
+                else fetcher(url, vdir)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 raise
@@ -234,7 +240,12 @@ def ensure_media(conn, video_key: str, store_dir: Path | None = None, fetch=None
                 res = _result(dest, info, "fetched")
                 if proxied:  # fallback proxy forces <=480p
                     res["low_resolution"] = True
+                if light and fetcher is default_fetch:
+                    res["media_note"] = ("full-size media exceeded WATCH_BREAKDOWN_MEDIA_MAX_MB earlier: "
+                                         "refetched at <=720p")
                 if dest.stat().st_size > store._breakdown_media_cap_bytes():
+                    vdir.mkdir(parents=True, exist_ok=True)
+                    (vdir / OVER_CAP_MARKER).touch()
                     res["over_cap"] = True
                     res["media_note"] = ("fetched media exceeds WATCH_BREAKDOWN_MEDIA_MAX_MB: used for this "
                                          "run but not pinned, so retention may evict it and a later run refetch it")

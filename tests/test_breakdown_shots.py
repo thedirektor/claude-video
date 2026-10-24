@@ -215,3 +215,52 @@ def test_dissolve_window_is_refined_on_the_blend_ramp(ref):
     assert g["evidence"]["t_start"] == pytest.approx(truth["dissolve"]["start"], abs=0.05)
     assert g["evidence"]["t_end"] == pytest.approx(truth["dissolve"]["end"], abs=0.05)
     assert g["t"] == pytest.approx(truth["dissolve"]["center"], abs=0.04)
+
+
+# ------------------------------------------------------------------ fix round 1: motion bursts
+
+def _whip_clip(tmp_path, img, travel, secs, blur):
+    name = tmp_path / f"{img}_{travel}_{secs}_{blur}.mp4"
+    src = tmp_path / f"{img}.png"
+    if not src.exists():
+        spec = ("mandelbrot=s=3200x180:r=25:start_scale=0.05:start_x=-0.74:start_y=0.1" if img == "w"
+                else "testsrc2=s=3200x180:r=25:d=1")
+        _ff("-f", "lavfi", "-i", spec, "-frames:v", "1", str(src))
+    ss = f"(3*pow((t-1.5)/{secs},2)-2*pow((t-1.5)/{secs},3))"
+    x = f"if(lt(t,1.5),0,if(lt(t,{1.5 + secs}),{travel}*{ss},{travel}))"
+    vf = f"crop=320:180:x='{x}':y=0" + (",tmix=frames=3" if blur else "")
+    _ff("-loop", "1", "-framerate", "25", "-i", str(src), "-t", "4", "-vf", vf, *_ENC, str(name))
+    return name
+
+
+@pytest.mark.parametrize("img", ["w", "w2"])
+@pytest.mark.parametrize("travel,secs", [(1200, 0.2), (2000, 0.24), (2400, 0.32)])
+@pytest.mark.parametrize("blur", [False, True])
+def test_fast_whip_pan_is_one_boundary_never_a_confident_cut(tmp_path, img, travel, secs, blur):
+    """Fast moves change every frame: they used to leave 1-3 cuts at confidence 1.0 and 0.1 s phantom shots."""
+    p = _whip_clip(tmp_path, img, travel, secs, blur)
+    series = S.frame_series(str(p), 25)
+    found = S.detect_shots(series, 4.0)
+    assert len(found) == 2, [(s["start"], s["boundary"] and s["boundary"]["kind"]) for s in found]
+    b = found[1]["boundary"]
+    assert b["kind"] == "motion" and b["evidence"]["confidence"] <= 0.5
+    from breakdown import transitions as T
+    out = T.classify(series, found)
+    assert [e["kind"] for e in out] == [T.NOT_DETERMINED] and out[0]["evidence"]["confidence"] == 0
+
+
+def test_montage_of_unrelated_stills_keeps_every_cut(tmp_path):
+    """Three cuts 0.12 s apart between unrelated stills are edits: the picture holds between them."""
+    parts = []
+    specs = [("testsrc=s=320x180:r=25", 25), ("smptebars=s=320x180:r=25", 3), ("color=c=red:s=320x180:r=25", 3),
+             ("mandelbrot=s=320x180:r=25:start_scale=0.3", 3), ("testsrc2=s=320x180:r=25", 25)]
+    for i, (spec, n) in enumerate(specs):
+        q = tmp_path / f"p{i}.mp4"
+        _ff("-f", "lavfi", "-i", spec, "-frames:v", str(n), *_ENC, str(q))
+        parts.append(q)
+    p = tmp_path / "montage.mp4"
+    args = [a for q in parts for a in ("-i", str(q))]
+    _ff(*args, "-filter_complex", f"concat=n={len(parts)}:v=1", *_ENC, str(p))
+    found = _shots(p, 59 / 25)
+    kinds = [s["boundary"]["kind"] for s in found if s["boundary"]]
+    assert kinds == ["cut"] * 4, kinds

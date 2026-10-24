@@ -135,3 +135,31 @@ def test_rewatch_keeps_pinned_media(conn, tmp_path):
     (vdir / store.PINNED_MARKER).unlink()
     store.write_run(conn, root, run, res)
     assert (vdir / "media.mp4").read_bytes() == b"720p"
+
+
+def _clip(path, size):
+    import subprocess
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    f"color=c=blue:s={size}:r=5:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)], check=True)
+
+
+def _height_of(path):
+    return store._height(path)
+
+
+def test_rewatch_swaps_pinned_proxy_copy_for_a_sharper_one(conn, tmp_path):
+    run, res = _record(conn, tmp_path)
+    root = tmp_path / "st"
+    vdir = store.video_dir(root, KEY)
+    vdir.mkdir(parents=True)
+    _clip(vdir / "media.mp4", "640x480")  # the 480p fallback-proxy fetch
+    (vdir / store.PINNED_MARKER).touch()
+    sharp, worse = tmp_path / "sharp.mp4", tmp_path / "worse.mp4"
+    _clip(sharp, "1280x720")
+    _clip(worse, "320x240")
+    run.media_path = str(worse)
+    store.write_run(conn, root, run, res)
+    assert _height_of(vdir / "media.mp4") == 480  # not sharper: kept
+    run.media_path = str(sharp)
+    store.write_run(conn, root, run, res)
+    assert _height_of(vdir / "media.mp4") == 720  # sharper: swapped

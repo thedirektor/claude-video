@@ -8,6 +8,7 @@ is ``"not determined"`` with confidence 0 -- never a guess.
 from __future__ import annotations
 
 import bisect
+import math
 import statistics
 
 from .shots import THUMB_H, THUMB_W
@@ -21,7 +22,9 @@ MIN_FRAMES = 3
 MIN_DROP = 15.0
 RAMP_TOL = 1.0  # luma levels from the extreme at which a fade ramp counts as having arrived / left
 SAME_CONTENT = 0.8  # thumbnail correlation above which two frames are the same picture (a fade step)
-SHIFT_DX = tuple(d / 4 for d in range(-16, 17))  # candidate frame-to-frame translations, in thumbnail columns
+SHIFT_MAX = 9  # cap on the frame-to-frame translation tried, in thumbnail columns: past ~60% of the
+# width two frames no longer overlap enough to compare (faster moves: see shots._collapse_bursts)
+SHIFT_TRAVEL = 1.5  # a move across the window cannot exceed this many frame widths: bounds the per-step shift
 SHIFT_IMPROVE = 0.25  # a shift that explains a frame step this much better than no shift = motion
 SHIFT_MEDIAN = 0.4  # median improvement above which the in-between frames are a translating picture
 SHIFT_SHARE = 0.75  # share of frame steps that must improve for the same
@@ -149,18 +152,25 @@ def _translating(thumb: list, i0: int, i1: int) -> bool:
     A pan over a soft scene also fits a straight blend (residual tiny), which is why the blend test
     alone would call a whip pan between held framings a confident dissolve."""
     g = [_gray(thumb[k]) for k in range(i0, i1 + 1)]
+    # the range scales with the window: a short window has to cover the same ground in fewer steps
+    reach = min(SHIFT_MAX, max(2, math.ceil(SHIFT_TRAVEL * THUMB_W / max(1, len(g) - 1))))
     gains = []
     for k in range(len(g) - 1):
         base = _step_error(g[k], g[k + 1], 0.0, 0)
         if not base or base < 1e-6:
             gains.append(0.0)
             continue
-        best = base
-        for dy in (-1, 0, 1):
-            for dx in SHIFT_DX:
+        best, at = base, (0.0, 0)
+        for dy in (-1, 0, 1):  # coarse: whole columns
+            for dx in range(-reach, reach + 1):
                 if dx == 0 and dy == 0:
                     continue
-                e = _step_error(g[k], g[k + 1], dx, dy)
+                e = _step_error(g[k], g[k + 1], float(dx), dy)
+                if e is not None and e < best:
+                    best, at = e, (float(dx), dy)
+        if at != (0.0, 0):  # fine: quarter columns around the best whole shift
+            for step in (-0.75, -0.5, -0.25, 0.25, 0.5, 0.75):
+                e = _step_error(g[k], g[k + 1], at[0] + step, at[1])
                 if e is not None and e < best:
                     best = e
         gains.append(1.0 - best / base)

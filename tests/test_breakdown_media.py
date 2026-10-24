@@ -282,3 +282,41 @@ def test_fixture_skips_explicitly_without_font(tmp_path, monkeypatch):
     with pytest.raises(pytest.skip.Exception) as ei:
         make_reference(tmp_path / "ref.mp4")
     assert "font" in str(ei.value).lower()
+
+
+def test_over_cap_refetch_uses_the_light_format(conn, tmp_path, monkeypatch):
+    """A full-size fetch over the cap is evicted and fetched again forever: remember it and fetch <=720p."""
+    root = tmp_path / "st"
+    _video_row(conn, KEY_A, url="https://example.com/clip")
+    src = tmp_path / "dl" / "video.mp4"
+    src.parent.mkdir()
+    make_reference(src, with_audio=False)
+    monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", "0.001")
+    keep = src.read_bytes()
+    first = media.ensure_media(conn, KEY_A, store_dir=root, fetch=lambda u, v: src)
+    assert first["over_cap"] is True
+    vdir = store.video_dir(root, KEY_A)
+    for m in vdir.glob("media.*"):  # retention evicted it
+        m.unlink()
+    seen = {}
+
+    def fake_default(url, vd, fmt=None):
+        seen["fmt"] = fmt
+        shutil_copy = tmp_path / "dl" / "again.mp4"
+        shutil_copy.write_bytes(keep)
+        return {"video_path": str(shutil_copy)}
+
+    monkeypatch.setattr(media, "default_fetch", fake_default)
+    info = media.ensure_media(conn, KEY_A, store_dir=root)
+    assert seen["fmt"] == media.LIGHT_FETCH_FORMAT and info["source"] == "fetched"
+
+
+def test_pin_over_cap_removes_a_stale_marker(conn, tmp_path, monkeypatch):
+    root = tmp_path / "st"
+    vdir = store.video_dir(root, KEY_A)
+    vdir.mkdir(parents=True)
+    (vdir / "media.mp4").write_bytes(b"x" * 2048)
+    assert media.pin(root, KEY_A) is True and media.is_pinned(root, KEY_A)
+    monkeypatch.setenv("WATCH_BREAKDOWN_MEDIA_MAX_MB", "0.001")
+    assert media.pin(root, KEY_A) is False
+    assert not media.is_pinned(root, KEY_A)

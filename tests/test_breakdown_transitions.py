@@ -369,4 +369,21 @@ def test_directional_label_needs_three_pairs(still):
 def test_very_short_shot_never_names_a_move(still):
     _cam(still, "tiny", "crop=640:360:'t*300':200,scale=640:360", img="half.png")
     r = C.camera_motion(str(still / "tiny.mp4"), {"start": 0.0, "end": 0.35})
-    assert r["type"] in (C.NOT_DETERMINED, "static")
+    assert r["type"] == C.NOT_DETERMINED and r["confidence"] == 0  # a "static" here would be confident and wrong
+
+
+def test_translation_search_scales_with_the_window():
+    """Five steps across a 16-column picture can move 5 columns each; a fixed +-4 search misses it."""
+    import random
+    rnd = random.Random(3)
+    cols = 16 + 5 * 6
+    strip = [[rnd.randrange(30, 220) for _ in range(cols)] for _ in range(9)]
+    thumbs = []
+    for k in range(6):
+        px = []
+        for r in range(9):
+            for x in range(16):
+                v = strip[r][x + 5 * k]
+                px += [v, v, v]
+        thumbs.append(bytes(px))
+    assert T._translating(thumbs, 0, 5) is True

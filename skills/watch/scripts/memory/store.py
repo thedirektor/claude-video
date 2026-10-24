@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import identity
@@ -78,6 +79,28 @@ def _copy_frames(conn, root: Path, vdir: Path, new_frames) -> None:
         )
 
 
+def _height(path: Path) -> int:
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=height", "-of", "csv=p=0", str(path)],
+                             capture_output=True, text=True, timeout=60).stdout.strip().split(",")[0]
+        return int(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def _may_replace_media(vdir: Path, new: Path) -> bool:
+    if not (vdir / PINNED_MARKER).exists():
+        return True
+    old = sorted(vdir.glob("media.*"))
+    if not old:
+        return True
+    if new.stat().st_size > _breakdown_media_cap_bytes():
+        return False
+    new_h, old_h = _height(new), max(_height(m) for m in old)
+    return new_h > old_h > 0
+
+
 def write_run(conn, store_dir: Path, run, result) -> Path:
     """Persist one merged run's artifacts; returns the video's store dir."""
     root = Path(store_dir)
@@ -90,9 +113,9 @@ def write_run(conn, store_dir: Path, run, result) -> Path:
 
     if run.media_path and Path(run.media_path).is_file():
         mp = Path(run.media_path)
-        # a pinned (breakdown) video keeps the file its timestamps were measured on: a re-watch
-        # often fetched a smaller copy, and swapping it would shift every measurement
-        if keep_media(mp.stat().st_size) and not (vdir / PINNED_MARKER).exists():
+        # a pinned (breakdown) video keeps the file its measurements came from; it is only swapped
+        # for a copy of the same video that is sharper (e.g. the 480p proxy fetch -> a re-watch's 1080p)
+        if keep_media(mp.stat().st_size) and _may_replace_media(vdir, mp):
             for old in vdir.glob("media.*"):
                 old.unlink(missing_ok=True)
             shutil.copy2(mp, vdir / ("media" + mp.suffix.lower()))

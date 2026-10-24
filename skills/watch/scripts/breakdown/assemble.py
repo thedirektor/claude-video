@@ -35,6 +35,7 @@ EPS = 1e-6
 BRIEF_MIN_TEXT_CONF = 0.5  # OCR tracks below this are listed in breakdown.json only
 SAMPLING_NOTE = f"sampled every {typography.STEP_S:g} s; shorter or stylised text may be missed"
 BLIND_SPOT_NOTE = "dissolves between two moving shots can go undetected: cuts and shots are what was measured"
+HOLD_MIN_S = 0.5  # a black / white hold this long between two fades is its own shot (0.7.0 ruling)
 FOLD_MAX_S = 1.0  # a fade between two cuts this close is one dip, not a shot
 
 
@@ -71,6 +72,8 @@ def _fade_spans(entries: list[dict]) -> tuple[list[tuple[float, float, dict | No
         color = e["kind"][len("fade_to_"):]
         for f in fades[i + 1:]:
             if f["kind"] == f"fade_from_{color}" and id(f) not in used:
+                if f["evidence"]["t_start"] - e["evidence"]["t_end"] >= HOLD_MIN_S:
+                    break  # a real hold: two fades around a shot of their own (see _retime_holds)
                 lo, hi = e["evidence"]["t_start"], f["evidence"]["t_end"]
                 comp = {"t": round((e["evidence"]["t_end"] + f["evidence"]["t_start"]) / 2, 6),
                         "kind": f"dip_{color}", "duration": round(hi - lo, 6),
@@ -87,12 +90,51 @@ def _fade_spans(entries: list[dict]) -> tuple[list[tuple[float, float, dict | No
     return spans, consumed
 
 
+def _retime_holds(raw_shots: list[dict], entries: list[dict]) -> tuple[list[dict], list[dict]]:
+    """A black / white hold of >= HOLD_MIN_S between a fade-to and a fade-from is a shot an NLE
+    timeline needs (0.7.0 black-hold ruling). Its boundaries go to where the fade-to ends and the
+    fade-from starts (shot detection puts them at the ramp centres), carrying those fades as their
+    transitions; boundaries inside the dip are dropped. Dips without a hold are left to the fold."""
+    pairs = []
+    fades = sorted((e for e in entries if e["kind"].startswith("fade_")), key=lambda e: e["evidence"]["t_start"])
+    used: set[int] = set()
+    for e in fades:
+        if not e["kind"].startswith("fade_to_") or id(e) in used:
+            continue
+        color = e["kind"][len("fade_to_"):]
+        f = next((g for g in fades if g["kind"] == f"fade_from_{color}" and id(g) not in used
+                  and g["evidence"]["t_start"] >= e["evidence"]["t_end"]), None)
+        if f is not None and f["evidence"]["t_start"] - e["evidence"]["t_end"] >= HOLD_MIN_S:
+            pairs.append((e, f))
+            used.update((id(e), id(f)))
+    if not pairs or not raw_shots:
+        return raw_shots, entries
+    bounds = []
+    for sh in raw_shots:
+        b = sh.get("boundary")
+        if b:
+            bounds.append({"kind": b["kind"], "t": b["t"], "frames": b["frames"],
+                           "t_start": b["evidence"]["t_start"], "t_end": b["evidence"]["t_end"],
+                           "confidence": b["evidence"]["confidence"]})
+    new_entries = list(entries)
+    for e, f in pairs:
+        lo, hi = e["evidence"]["t_start"], f["evidence"]["t_end"]
+        bounds = [b for b in bounds if not (lo - EPS <= b["t"] <= hi + EPS)]
+        for fade, t in ((e, e["evidence"]["t_end"]), (f, f["evidence"]["t_start"])):
+            bounds.append({"kind": "fade", "t": t, "frames": 0, "t_start": fade["evidence"]["t_start"],
+                           "t_end": fade["evidence"]["t_end"], "confidence": fade["evidence"]["confidence"]})
+            new_entries[new_entries.index(fade)] = {**fade, "t": round(t, 6)}
+    bounds.sort(key=lambda b: b["t"])
+    return shots_mod.build_shots(bounds, raw_shots[-1]["end"]), new_entries
+
+
 def reconcile(raw_shots: list[dict], entries: list[dict]) -> tuple[list[dict], list[dict]]:
     """Merge shots whose boundary ``classify`` absorbed into a fade / dip.
 
     Every remaining boundary carries exactly one transition entry (a dip keeps
     ONE boundary with a composite ``dip_<color>`` entry). Returns
     (shots with ``transition``, fade entries not attached to a boundary)."""
+    raw_shots, entries = _retime_holds(raw_shots, entries)
     spans, consumed = _fade_spans(entries)
     by_t = {round(e["t"], 6): e for e in entries if id(e) not in consumed}
     dip_kept: set[int] = set()
@@ -121,6 +163,11 @@ def reconcile(raw_shots: list[dict], entries: list[dict]) -> tuple[list[dict], l
                          "evidence": _ev(b["evidence"]["t_start"], b["evidence"]["t_end"], "measured", 0.0)}
         else:
             attached.add(id(entry))
+        if entry.get("components") and kept and kept[-1]["start"] < entry["t"] < sh["end"]:
+            # the dip's t is where the shot starts: the boundary sat at the ramp centre
+            kept[-1]["end"] = entry["t"]
+            sh = {**sh, "start": entry["t"], "boundary": {"kind": "dip", "t": entry["t"], "frames": 0,
+                                                          "evidence": entry["evidence"]}}
         kept.append({**sh, "transition": entry, "_conf": [sh["evidence"]["confidence"]]})
     loose_now = [e for e in entries if e["kind"].startswith("fade_") and id(e) not in consumed
                  and id(e) not in attached]

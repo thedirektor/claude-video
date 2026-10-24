@@ -184,7 +184,9 @@ def test_reconcile_dip_keeps_one_boundary():
     shots, loose = assemble.reconcile(raw, entries)
     assert len(shots) == 2 and shots[1]["transition"]["kind"] == "dip_white"
     assert shots[1]["transition"]["evidence"]["t_start"] == pytest.approx(1.9)
-    assert shots[0]["end"] == 2.12 and shots[1]["end"] == 5.0 and loose == []
+    # the dip's t is where its shot starts (it used to disagree with the boundary at the ramp centre)
+    t = shots[1]["transition"]["t"]
+    assert shots[0]["end"] == t == shots[1]["start"] and shots[1]["end"] == 5.0 and loose == []
 
 
 def test_frames_only(conn, tmp_path, monkeypatch):
@@ -280,3 +282,25 @@ def test_brief_leaves_low_confidence_ocr_out(bd):
     md = assemble.brief_md(b)
     assert '"SALE 50%"' in md and '"AVA"' not in md and "1 low-confidence OCR reading(s)" in md
     assert "voice (speech or sung lyrics" in md
+
+
+def test_black_hold_between_fades_is_its_own_shot(tmp_path):
+    """0.7.0 ruling: fade-out 1-2 s, 1 s black slug, fade-in 3-4 s keeps the slug as a shot of its own."""
+    import subprocess
+    from breakdown import shots as S
+    enc = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25"]
+
+    def ff(*a):
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *a], check=True)
+
+    a, k, b, p = (tmp_path / n for n in ("a.mp4", "k.mp4", "b.mp4", "h.mp4"))
+    ff("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=2", "-vf", "fade=t=out:st=1:d=1", *enc, str(a))
+    ff("-f", "lavfi", "-i", "color=c=black:s=320x180:r=25:d=1", *enc, str(k))
+    ff("-f", "lavfi", "-i", "testsrc=s=320x180:r=25:d=3", "-vf", "fade=t=in:st=0:d=1", *enc, str(b))
+    ff("-i", str(a), "-i", str(k), "-i", str(b), "-filter_complex", "[0][1][2]concat=n=3:v=1", *enc, str(p))
+    s = S.frame_series(str(p), 25)
+    raw = S.detect_shots(s, 6.0)
+    kept, loose = assemble.reconcile(raw, T.classify(s, raw))
+    assert [round(x["start"], 1) for x in kept] == [0.0, 2.0, 3.0], [(x["start"], x["end"]) for x in kept]
+    assert kept[1]["transition"]["kind"] == "fade_to_black" and kept[2]["transition"]["kind"] == "fade_from_black"
+    assert kept[1]["end"] == pytest.approx(3.0, abs=0.06) and loose == []

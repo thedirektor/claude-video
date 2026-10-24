@@ -304,6 +304,87 @@ def _boundaries(series: dict) -> list[dict]:
     return out
 
 
+BURST_GAP_S = 0.4  # cuts closer than this form one candidate burst
+BURST_ACTIVE = 0.015  # thumbnail change per frame below which the picture holds still
+BURST_RUN = 4  # a move changes the picture for at least this many consecutive frames (accelerate, peak, brake)
+BURST_RATIO = 0.4  # ... and the motion beside the cuts reaches this share of the weakest cut jump
+BURST_HOLD = 3  # a held framing before and after the move: this many steps with no change
+BURST_FLURRY = 3  # ... or this many cuts, each within BURST_FLURRY_GAP_S of the last (no edit cuts every 3 frames)
+BURST_FLURRY_GAP_S = 0.16
+BURST_MAX_S = 1.2  # a move is bounded by held frames: longer runs of change are ordinary footage
+BURST_CONF = 0.4  # confidence cap of a collapsed motion boundary
+
+
+def _steps(series: dict) -> list[float]:
+    th = series.get("thumb") or []
+    return [0.0] + [_dist(th[i - 1], th[i]) for i in range(1, len(th))]
+
+
+def _collapse_bursts(series: dict, bounds: list[dict]) -> list[dict]:
+    """A fast whip / handheld move changes every frame, so it trips the cut detector once to a few
+    times and leaves phantom 0.1 s shots. A real cut sits in a held picture: the frames around it
+    barely change, and between two close cuts the picture holds still.
+
+    Candidate groups (cuts < BURST_GAP_S apart; a lone cut is a group of one) are collapsed into one
+    ``motion`` boundary when the picture is in motion on every step from before the first cut to
+    after the last (a run of >= BURST_RUN changing frames) and that motion is not dwarfed by the cuts
+    (in a montage of moving footage the cut jump is ~10x the motion around it). Needs thumbnails;
+    otherwise the cuts stay."""
+    t, th = series["t"], series.get("thumb") or []
+    if len(th) != len(t) or not bounds:
+        return bounds
+    d = _steps(series)
+    n = len(d)
+    pos = {round(x, 6): i for i, x in enumerate(t)}
+    cuts = [(pos.get(round(b["t"], 6)), b) for b in bounds if b["kind"] == "cut"]
+    if any(i is None for i, _ in cuts):
+        return bounds
+    groups: list[list[tuple[int, dict]]] = []
+    for i, b in cuts:
+        if groups and t[i] - t[groups[-1][-1][0]] < BURST_GAP_S:
+            groups[-1].append((i, b))
+        else:
+            groups.append([(i, b)])
+    drop: set[int] = set()
+    merged: list[dict] = []
+    for g in groups:
+        i0, i1 = g[0][0], g[-1][0]
+        if any(d[k] < BURST_ACTIVE for k in range(i0, i1 + 1)):
+            continue  # the picture holds still between two cuts
+        lo, hi = i0, i1
+        others = {i for i, _ in cuts} - {i for i, _ in g}  # a run never swallows another edit
+        while lo - 1 > 0 and d[lo - 1] >= BURST_ACTIVE and lo - 1 not in others:
+            lo -= 1
+        while hi + 1 < n and d[hi + 1] >= BURST_ACTIVE and hi + 1 not in others:
+            hi += 1
+        cut_steps = {i for i, _ in g}
+        beside = [d[k] for k in range(lo, hi + 1) if k not in cut_steps]
+        jump = min(d[i] for i in cut_steps)
+        if not BURST_RUN <= hi - lo + 1 or t[hi] - t[lo - 1] > BURST_MAX_S or not beside or max(beside) < BURST_RATIO * jump:
+            continue
+        if merged and t[lo - 1] <= merged[-1]["t_end"]:
+            continue  # the same run already collapsed (two groups inside one move)
+        held = (all(d[k] < BURST_ACTIVE for k in range(max(1, lo - BURST_HOLD), lo))
+                and lo - BURST_HOLD >= 1
+                and all(d[k] < BURST_ACTIVE for k in range(hi + 1, min(n, hi + 1 + BURST_HOLD)))
+                and hi + BURST_HOLD < n)
+        tight = all(t[b2] - t[a] <= BURST_FLURRY_GAP_S + 1e-6 for (a, _), (b2, _) in zip(g, g[1:]))
+        flurry = len(g) >= BURST_FLURRY
+        if len(g) > 1 and not tight:
+            continue  # separate edits, however fast
+        if not (held or flurry):
+            continue  # ordinary footage in motion between two cuts
+        drop.update(id(b) for _, b in g)
+        merged.append({"kind": "motion", "t": round((t[lo - 1] + t[hi]) / 2, 6), "frames": hi - lo + 1,
+                       "t_start": t[lo - 1], "t_end": t[hi],
+                       "confidence": min(BURST_CONF, min(b["confidence"] for _, b in g))})
+    if not merged:
+        return bounds
+    out = [b for b in bounds if id(b) not in drop] + merged
+    out.sort(key=lambda b: b["t"])
+    return out
+
+
 SINGLE_SHOT_CONF = 0.6  # no neighbouring boundary: a dissolve between two moving shots can go undetected
 
 
@@ -311,7 +392,12 @@ def detect_shots(series: dict, duration: float) -> list[dict]:
     """Shots from a frame series. Empty list when nothing can be measured."""
     if not series or len(series.get("t", [])) < 2 or not duration or duration <= 0:
         return []
-    bounds = _boundaries(series)
+    bounds = _collapse_bursts(series, _boundaries(series))
+    return build_shots(bounds, duration)
+
+
+def build_shots(bounds: list[dict], duration: float) -> list[dict]:
+    """Shots between consecutive boundaries (see ``detect_shots`` for the boundary dict)."""
     edges = [0.0] + [b["t"] for b in bounds] + [float(duration)]
     shots = []
     for k in range(len(edges) - 1):
