@@ -122,6 +122,9 @@ def call_tool(name: str, args: dict) -> dict:
                 return _text(f"watch failed (exit {r.returncode}):\n{(r.stderr or '')[-1500:]}", True)
             return _text(out)
         if name in ("breakdown", "motion", "compare"):
+            for k in ("video", "reference", "candidate", "region"):
+                if str(args.get(k) or "").lstrip().startswith("-"):  # would be read as a flag
+                    return _text(f"invalid arguments: {k} may not start with '-'", True)
             if name == "breakdown":
                 argv = ["breakdown", args["video"], "--json",
                         *_flags(args, {"interpret": "--interpret", "formats": "--formats",

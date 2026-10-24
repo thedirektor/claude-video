@@ -366,3 +366,13 @@ def test_import_keeps_a_newer_local_breakdown(tmp_path):
     old.write_text('{"generated_at": "2026-10-20T10:00:00+00:00"}')
     new.write_text('{"generated_at": "2026-10-24T10:00:00+00:00"}')
     assert bundle._older(old, new) and not bundle._older(new, old)
+
+
+def test_kept_interpretation_is_stale_only_when_its_facts_changed(bd):
+    import copy
+
+    b = copy.deepcopy(bd)
+    d1 = assemble._facts_digest(b)
+    assert assemble._facts_digest(copy.deepcopy(b)) == d1
+    b["shots"][0]["camera"]["type"] = "pan_left"
+    assert assemble._facts_digest(b) != d1

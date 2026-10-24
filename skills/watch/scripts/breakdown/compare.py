@@ -28,7 +28,7 @@ VIS_MIN_SCORE = 0.5  # picture cross-correlation needed to align on the picture 
 VIS_CHECK = 0.2  # picture agreement an onset alignment must reach to keep its confidence
 UNCONFIRMED_CONF = 0.2
 ONSET_MAX_CONF = 0.6  # one event aligns the clips; its own timing difference is absorbed
-AMBIG_PARTNER_S = 0.15  # a second partner this close in |delta| makes a pairing ambiguous
+RIVAL_SLACK_S = 0.05  # a second partner no more than this further away makes a pairing ambiguous
 PEAK_ALIKE = 0.85  # peaks scoring within this share of the best are alternatives
 PEAK_SEP = 0.05  # seconds: closer peaks are the same alignment
 VIS_MARGIN = 0.1  # picture correlation lead needed to pick between alike audio peaks
@@ -233,6 +233,19 @@ def _visual_alignment(rv, cv, np, notes: list[str]):
     return peaks[0][0], min(0.85, peaks[0][1])
 
 
+def _confusable_shifts(rv, np) -> list[float]:
+    """Offsets an onset alignment could be confused with: ±0.5 s and ± the reference's own repeat
+    periods (regular cut spacing), from the autocorrelation of its change series."""
+    out = [-0.5, 0.5]
+    lags, sc = _xcorr(rv[1], rv[1], np)
+    for lag, val in _peaks(lags, sc, np):
+        if abs(lag) > 0.15 and val > 0.3:
+            out += [lag, -lag]
+        if len(out) >= 8:
+            break
+    return out
+
+
 def _vis_score(rv, cv, lag_s: float) -> float:
     """Picture agreement: mean of luma and frame-change correlation over whichever of the two carries
     information (``rv``/``cv`` = (luma, change)); 0 when neither does."""
@@ -318,9 +331,11 @@ def _match(ref: list[float], cand: list[float], off: float):
     keep, amb_r, amb_c = [], set(), set()
     for i, j in pairs:
         d = abs(cand[j] - off - ref[i])
-        rival = any(0 <= k < m and k != j and abs(abs(cand[k] - off - ref[i]) - d) <= AMBIG_PARTNER_S
+        # a rival only counts when it is nearly as good as the chosen partner (an exact pair next
+        # to a flash frame 130 ms away is not ambiguous)
+        rival = any(0 <= k < m and k != j and abs(cand[k] - off - ref[i]) - d <= RIVAL_SLACK_S
                     and abs(cand[k] - off - ref[i]) <= MATCH_TOL_S for k in (j - 1, j + 1))
-        rival = rival or any(0 <= k < n and k != i and abs(abs(cand[j] - off - ref[k]) - d) <= AMBIG_PARTNER_S
+        rival = rival or any(0 <= k < n and k != i and abs(cand[j] - off - ref[k]) - d <= RIVAL_SLACK_S
                              and abs(cand[j] - off - ref[k]) <= MATCH_TOL_S for k in (i - 1, i + 1))
         if rival:
             amb_r.add(i)
@@ -501,11 +516,15 @@ def _compare(ref: dict, cand: dict, offset: float | None, slow: int, out_dir: Pa
         off_s, conf, o_r, o_c = onset
         if rv is not None and _has_picture(rv, cv):
             here = _vis_score(rv, cv, off_s)
-            near = max(_vis_score(rv, cv, off_s - 0.5), _vis_score(rv, cv, off_s + 0.5))
+            near = max(_vis_score(rv, cv, off_s + k) for k in _confusable_shifts(rv, np))
             if here < VIS_CHECK or here <= near:
                 notes.append(f"first visible motion suggests {off_s:+.3f} s but the rest of the picture does "
                              "not agree (the two first motions may be different events)")
                 conf = UNCONFIRMED_CONF
+            elif here - near < VIS_MARGIN:
+                notes.append("first visible motion and a shifted alignment one cut period away fit the picture "
+                             "almost equally; offset approximate")
+                conf = min(conf, 0.5)
         if conf > UNCONFIRMED_CONF:
             al = {"method": "motion_onset", "offset_s": off_s, "confidence": min(conf, ONSET_MAX_CONF),
                   "evidence": _ev(o_r["t"], o_r["t"], min(conf, ONSET_MAX_CONF)),

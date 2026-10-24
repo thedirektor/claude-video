@@ -544,3 +544,13 @@ def test_three_to_two_misread_is_never_confident(tmp_path, bpm, hat_s, kicks):
         assert res["evidence"]["confidence"] <= 0.5, res
         assert abs(res.get("tempo_alt", 0) - bpm) <= 4 or abs(res.get("tempo_alt", 0) - bpm / 2) <= 3, res
         assert any("3:2" in n or "half/double" in n for n in res["notes"]), res
+
+
+def test_cuts_on_beat_uses_the_reconciled_transition():
+    from breakdown import audio
+
+    shots = [{"start": 0.0, "boundary": None},
+             {"start": 1.0, "boundary": {"kind": "cut", "t": 1.0}, "transition": {"kind": "dip_black"}},
+             {"start": 2.0, "boundary": {"kind": "cut", "t": 2.0}, "transition": {"kind": "cut"}}]
+    res = audio.cuts_on_beat(shots, [1.0, 2.0, 3.0], 25.0)
+    assert res["evidence"]["n_cuts"] == 1

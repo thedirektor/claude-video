@@ -363,6 +363,12 @@ def estimate_interpret_usd(system: str, user: str) -> float:
 INTERPRET_WORST_USER_CHARS = 60 * 220 + 20 * 80 + 200
 
 
+def _facts_digest(bd: dict) -> str:
+    import hashlib
+
+    return hashlib.sha256("\n".join(_interpret_payload(bd)).encode("utf-8")).hexdigest()[:16]
+
+
 def check_interpret_cost(allow_cost: bool = False) -> None:
     """Refuse an --interpret run up front (before minutes of measuring) when even the largest
     possible payload would exceed the cost ceiling."""
@@ -485,13 +491,15 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
     if interpret:
         interp = _interpret(bd, complete, allow_cost)
         if interp:
-            bd["interpretation"] = {**interp, "evidence_version": version, "stale": False}
+            bd["interpretation"] = {**interp, "evidence_version": version, "made_from_digest": _facts_digest(bd),
+                                    "stale": False}
         else:
             _add_note(notes, "interpretation requested but no LLM reply was available")
     if "interpretation" not in bd:
         kept = _stored_interpretation(conn, video_key, store_dir)
         if kept:
-            bd["interpretation"] = {**kept, "stale": kept.get("evidence_version") != version}
+            # stale only when the measured facts it was written from changed (not on every re-run)
+            bd["interpretation"] = {**kept, "stale": kept.get("made_from_digest") != _facts_digest(bd)}
             _add_note(notes, "interpretation kept from an earlier run (not regenerated); measured fields may "
                              "have changed since")
     return bd

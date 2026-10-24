@@ -506,8 +506,10 @@ def cuts_on_beat(shots: list[dict], beats: list[float], fps: float, tempo_conf: 
     two phases for half time): one confident share would be wrong for one of the readings."""
     if not beats or not fps or fps <= 0:
         return NOT_DETERMINED
+    # the reconciled transition is the truth when present (a dip whose raw boundary was a cut is no cut)
     cuts = [s["boundary"]["t"] for s in shots or []
-            if s.get("boundary") and s["boundary"].get("kind") == "cut"]
+            if s.get("boundary") and ((s.get("transition") or {}).get("kind") == "cut" if "transition" in s
+                                      else s["boundary"].get("kind") == "cut")]
     if not cuts:
         return NOT_DETERMINED
     tol = TOLERANCE_FRAMES / fps + 1e-6

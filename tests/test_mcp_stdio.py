@@ -105,3 +105,11 @@ def test_breakdown_tool_failure_is_error(monkeypatch):
         argv, 3, stdout="", stderr="[watch] not found"))
     r = mcp_stdio.call_tool("motion", {"video": "x", "start": 0, "end": 1})
     assert r["isError"] is True and "not found" in r["content"][0]["text"]
+
+
+def test_breakdown_tools_refuse_flag_like_arguments(monkeypatch):
+    import mcp_stdio
+
+    monkeypatch.setattr(mcp_stdio, "_run_watch", lambda argv, timeout=3600: pytest.fail("must not run"))
+    res = mcp_stdio.call_tool("breakdown", {"video": "--allow-cost"})
+    assert res["isError"] and "may not start with '-'" in res["content"][0]["text"]

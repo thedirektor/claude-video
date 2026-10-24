@@ -15,7 +15,8 @@
       },
       "source": "./",
       "category": "productivity",
-      "homepage": "https://github.com/thedirektor/claude-video"
+      "homepage": "https://github.com/thedirektor/claude-video",
+      "version": "0.7.0"
     }
   ]
 }

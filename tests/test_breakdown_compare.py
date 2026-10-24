@@ -250,3 +250,28 @@ def test_not_determined_offset_is_a_string(tmp_path):
     res = compare.run(str(a), str(b), out_dir=tmp_path / "o")
     assert res["alignment"]["offset_s"] == "not determined"
     assert "_not determined_" in compare.summary_md(res)
+
+
+# ---- 0.7.1 backlog -----------------------------------------------------------
+
+
+def test_exact_pairs_next_to_a_flash_are_paired():
+    """Flash-on / flash-off cuts 133 ms apart, both exact: not ambiguous."""
+    ref = [1.0, 1.133, 3.0]
+    pairs, amb_r, amb_c = compare._match(ref, list(ref), 0.0)
+    assert pairs == [(0, 0), (1, 1), (2, 2)] and not amb_r and not amb_c
+
+
+def test_equally_close_partners_stay_unpaired():
+    pairs, amb_r, _ = compare._match([3.24], [2.83, 3.64], 0.0)  # 0.41 vs 0.40 away
+    assert pairs == [] and amb_r == {0}
+
+
+def test_onset_check_probes_the_cut_period():
+    np = pytest.importorskip("numpy")
+    # change impulses every 0.8 s: an onset alignment could slip by one period
+    series = np.zeros(1000)
+    series[::80] = 1.0
+    rv = (np.zeros(1000), series)
+    shifts = compare._confusable_shifts(rv, np)
+    assert any(abs(abs(s) - 0.8) < 0.02 for s in shifts)

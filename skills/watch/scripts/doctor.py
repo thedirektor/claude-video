@@ -174,14 +174,14 @@ def run_checks(*, online: bool = True, which=shutil.which, run=subprocess.run, h
                              f"missing language data: {', '.join(missing)} — install tesseract-ocr-{missing[0]}"
                              if missing else f"languages: {', '.join(sorted(langs))}"))
 
-    for mod, pip, affected in (("cv2", "opencv-python-headless", "camera, look, typography, motion"),
-                               ("numpy", "numpy", "look, typography, audio, motion, compare")):
+    for mod, label, pip, affected in (("cv2", "opencv", "opencv-python-headless", "camera, look, typography, motion"),
+                                      ("numpy", "numpy", "numpy", "look, typography, audio, motion, compare")):
         if importlib.util.find_spec(mod) is None:
-            checks.append(_check("opencv" if mod == "cv2" else mod, "warn",
+            checks.append(_check(label, "warn",
                                  f"not installed — breakdown fields affected: {affected} (reported as "
                                  f"'not determined'); pip install {pip}"))
         else:
-            checks.append(_check("opencv" if mod == "cv2" else mod, "ok", "installed"))
+            checks.append(_check(label, "ok", "installed"))
 
     emb = embedder_ok()
     if emb is None:
