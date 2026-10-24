@@ -329,7 +329,8 @@ PAN_CONTEXT = 3  # steps either side of a cut that must slide with it
 PAN_MIN_STEPS = 4
 
 
-def _small_gray(cv2, np, img, crop):
+def _small_gray(cv2, np, img, crop, colour: bool = False):
+    """160 px wide grey frame (float32); with ``colour`` also the 160 px colour frame."""
     h, w = img.shape[:2]
     m = re.fullmatch(r"crop=(\d+):(\d+):(\d+):(\d+)", crop or "")
     if m:
@@ -337,7 +338,8 @@ def _small_gray(cv2, np, img, crop):
         if cx + cw <= w and cy + ch <= h:
             img, h, w = img[cy:cy + ch, cx:cx + cw], ch, cw
     img = cv2.resize(img, (160, max(2, int(h * 160 / w))), interpolation=cv2.INTER_AREA)
-    return np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    gray = np.float32(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    return (gray, np.float32(img)) if colour else gray
 
 
 PAN_OUTLIER = 3.0  # a step this many tolerances off the slide is a break in it, wherever it falls
@@ -370,8 +372,9 @@ class _PanReader:
             self.cap = None
 
 
-def _pan_frames(cv2, np, cap, t: list[float], first: int, last: int, crop) -> list:
-    """Grey 160 px frames ``first..last``: one seek, then a sequential decode (shorter if it stops)."""
+def _pan_frames(cv2, np, cap, t: list[float], first: int, last: int, crop, colour: bool = False) -> list:
+    """Grey 160 px frames ``first..last`` (``(grey, colour)`` pairs with ``colour``): one seek, then a
+    sequential decode (shorter if it stops)."""
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t[first] - 0.5 / fps) * 1000.0)
     grays = []
@@ -379,7 +382,7 @@ def _pan_frames(cv2, np, cap, t: list[float], first: int, last: int, crop) -> li
         ok, img = cap.read()
         if not ok or img is None:
             break
-        grays.append(_small_gray(cv2, np, img, crop))
+        grays.append(_small_gray(cv2, np, img, crop, colour))
     return grays
 
 
@@ -470,7 +473,8 @@ def continuous_pan(series: dict, i_before: int, i_after: int):
         return False  # too little picture around the window to show a move
 
     def run(cv2, np, cap):
-        grays = _pan_frames(cv2, np, cap, t, lo - 1, hi, series.get("crop"))
+        pairs = _pan_frames(cv2, np, cap, t, lo - 1, hi, series.get("crop"), colour=True)
+        grays, cols = [g for g, _ in pairs], [c for _, c in pairs]
         steps = _shifts_of(cv2, grays)
         if len(steps) < PAN_MIN_STEPS:
             return False
@@ -482,7 +486,8 @@ def continuous_pan(series: dict, i_before: int, i_after: int):
         axis, speed, drift, tol = sl
         off = [max(abs(s[axis] - speed), abs(s[1 - axis] - drift)) for s in steps]
         dx, dy = (speed, drift) if axis == 0 else (drift, speed)
-        res = [_residual(cv2, np, grays[j], grays[j + 1], dx, dy) for j in range(len(steps))]
+        # in colour: a cut to a regraded / hue-rotated copy keeps the grey picture and the shift
+        res = [_residual(cv2, np, cols[j], cols[j + 1], dx, dy) for j in range(len(steps))]
         known = [r for r in res if r is not None]
         if known and any(r is not None and r > PAN_BREAK_RATIO * statistics.median(known) + PAN_BREAK_FLOOR
                          for r in res):
@@ -711,7 +716,10 @@ def _boundaries(series: dict) -> list[dict]:
     # cut strength: ffmpeg's scene score, or the luma jump when the score under-reads
     th = series.get("thumb") or []
     dt = _steps(series) if len(th) == n else [0.0] * n  # a big picture change the score under-reads
-    strength = [max(scene[i], dy[i] / LUMA_SCALE, dt[i] / THUMB_SCALE) for i in range(n)]
+    cs = _chroma_steps(series) if len(th) == n else []
+    # a colour-balance jump that stands out (a regrade / hue cut keeps the luma, so the score misses it)
+    dc = [cs[i] / CHROMA_SCALE if _colour_edit(cs, i) else 0.0 for i in range(n)] if cs else [0.0] * n
+    strength = [max(scene[i], dy[i] / LUMA_SCALE, dt[i] / THUMB_SCALE, dc[i]) for i in range(n)]
     thr = _cut_threshold(strength)
     cands = [i for i in range(1, n) if strength[i] >= thr]
     flash = _flash_cuts(cands, strength, series)
@@ -750,6 +758,38 @@ BURST_CONF = 0.4  # confidence cap of a collapsed motion boundary
 def _steps(series: dict) -> list[float]:
     th = series.get("thumb") or []
     return [0.0] + [_dist(th[i - 1], th[i]) for i in range(1, len(th))]
+
+
+CHROMA_EDIT = 0.05  # shift of the picture's colour balance (0..1, brightness removed) that is an edit ...
+CHROMA_STAND_OUT = 3.0  # ... when it is this many x the colour drift of the frames around it
+CHROMA_SCALE = 0.3  # a colour-balance jump of this size counts as a full-strength cut
+
+
+def _chroma(th) -> tuple[float, float, float]:
+    """Colour balance of a thumbnail: per-channel mean minus the mean of the three (brightness removed,
+    so a lighting change or a flash of white does not count, a grade or hue change does)."""
+    n = len(th) // 3
+    m = [sum(th[c::3]) / n for c in range(3)]
+    g = sum(m) / 3
+    return tuple((v - g) / 255.0 for v in m)
+
+
+def _chroma_steps(series: dict) -> list[float]:
+    th = series.get("thumb") or []
+    c = [_chroma(x) for x in th]
+    return [0.0] + [max(abs(a - b) for a, b in zip(c[i - 1], c[i])) for i in range(1, len(c))]
+
+
+def _colour_edit(cs: list[float], i: int) -> bool:
+    """The colour balance jumps at frame ``i`` far beyond its own drift: a cut to a regraded or
+    recoloured picture, however alike the structure (luma, shift) on either side."""
+    if not cs or not 1 <= i < len(cs) or cs[i] < CHROMA_EDIT:
+        return False
+    near = sorted(cs[k] for k in range(max(1, i - 5), min(len(cs), i + 6)) if k != i)
+    med = near[len(near) // 2] if near else 0.0
+    # one frame, not a ramp: a pan sweeping into a new colour changes the balance over several steps
+    adj = max(cs[k] for k in (i - 1, i + 1) if 1 <= k < len(cs)) if len(cs) > 2 else 0.0
+    return cs[i] >= CHROMA_STAND_OUT * max(med, adj)
 
 
 def _collapse_bursts(series: dict, bounds: list[dict]) -> list[dict]:
@@ -897,6 +937,7 @@ def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
     if len(th) != len(t):
         return bounds
     d = _steps(series)
+    cs = _chroma_steps(series)
     pos = {round(x, 6): i for i, x in enumerate(t)}
     out = []
     merged_out = 0
@@ -911,6 +952,9 @@ def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
             if all(abs(v) >= 2.0 for v in run) and (all(v > 0 for v in run) or all(v < 0 for v in run)):
                 out.append(b)  # transitions.classify owns fades
                 continue
+        if _colour_edit(cs, i):
+            out.append(b)  # the colour balance jumps: a regrade / hue cut, not the same picture
+            continue
         near = sorted(d[k] for k in range(max(1, i - 5), min(len(d), i + 6)) if k != i)
         med = near[len(near) // 2] if near else 0.0
         if med > 0 and d[i] < CUT_STAND_OUT * med:

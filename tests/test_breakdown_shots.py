@@ -591,3 +591,20 @@ def test_cut_between_two_slowly_drifting_shots_is_kept(mont, v):
     bounds = [(s["boundary"]["kind"], round(s["boundary"]["t"], 2), s["boundary"]["evidence"]["confidence"])
               for s in found if s["boundary"]]
     assert bounds == [("cut", 2.0, 1.0)], bounds
+
+
+@pytest.mark.parametrize("v,hue", [(2, 120), (4, 180), (3, 120), (3, 180)])
+def test_cut_to_a_hue_rotated_copy_is_an_edit(mont, v, hue):
+    """A hard cut from a drifting picture to a hue-rotated copy of it (a grade / colour flash cut) keeps
+    nearly the same luma, so neither the grey-level pan check nor the cut score saw it: no boundary at
+    2/120, dropped as part of the slide at 4/180. A colour change that large is an edit."""
+    a = _pan(mont, "c", 50, v, 0, 1, f"hu_a{v}.mp4")
+    q = mont / f"hu_b{v}_{hue}.mp4"
+    _ff("-loop", "1", "-framerate", "25", "-i", str(mont / "c.png"), "-frames:v", "50",
+        "-vf", f"crop=320:180:150+n*{v}:0,hue=h={hue}" + (":s=1.5" if hue == 180 else ""), *_ENC, str(q))
+    p = mont / f"hue{v}_{hue}.mp4"
+    _ff("-i", str(a), "-i", str(q), "-filter_complex", "concat=n=2:v=1", *_ENC, str(p))
+    found = S.detect_shots(S.frame_series(str(p), 25), 4.0)
+    bounds = [(s["boundary"]["kind"], round(s["boundary"]["t"], 2), s["boundary"]["evidence"]["confidence"])
+              for s in found if s["boundary"]]
+    assert bounds == [("cut", 2.0, 1.0)], bounds
