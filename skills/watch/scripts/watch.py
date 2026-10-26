@@ -652,25 +652,25 @@ MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index", "stats", "export"
 def main() -> int:
     if sys.argv[1:2] == ["doctor"]:
         return doctor.main(sys.argv[2:])
-    if sys.argv[1:2] == ["mcp"] and not os.path.exists("mcp"):
+    if sys.argv[1:2] == ["mcp"] and not os.path.isfile("mcp"):
         import mcp_stdio
 
         return mcp_stdio.main(sys.argv[2:])
-    if sys.argv[1:2] == ["push"] and not os.path.exists("push"):
+    if sys.argv[1:2] == ["push"] and not os.path.isfile("push"):
         import push
 
         return push.main(sys.argv[2:])
-    if sys.argv[1:2] == ["batch"] and not os.path.exists("batch"):
+    if sys.argv[1:2] == ["batch"] and not os.path.isfile("batch"):
         import playlist
 
         return playlist.main(sys.argv[2:])
-    if sys.argv[1:2] and sys.argv[1] in BREAKDOWN_COMMANDS and not os.path.exists(sys.argv[1]):
+    if sys.argv[1:2] and sys.argv[1] in BREAKDOWN_COMMANDS and not os.path.isfile(sys.argv[1]):
         from breakdown import cli as breakdown_cli
 
         return breakdown_cli.main(sys.argv[1:])
     # Video-memory read path: `watch.py search|ask|moment|list|index ...`, unless the
-    # word is an existing path (a file literally named "search" is still watched).
-    if len(sys.argv) > 1 and sys.argv[1] in MEMORY_COMMANDS and not os.path.exists(sys.argv[1]):
+    # word is an existing file (a file literally named "search" is still watched).
+    if len(sys.argv) > 1 and sys.argv[1] in MEMORY_COMMANDS and not os.path.isfile(sys.argv[1]):
         from memory import cli as memory_cli
 
         return memory_cli.main(sys.argv[1:])

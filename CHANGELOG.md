@@ -2,6 +2,14 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.7.2] — 2026-10-26
+
+Windows fixes found running the breakdown on a Windows PC.
+
+### Fixed
+- **Contact sheet and compare labels on Windows**: the font path `C:/Windows/Fonts/arial.ttf` broke the ffmpeg `drawtext` filter (unescaped drive colon), so `contact.png` was skipped and `compare.mp4` lost its labels. Paths are now escaped for filter options (`exports.filter_path`).
+- **Subcommands from the scripts folder**: `watch.py breakdown|motion|compare|search|…` run from a folder that holds a *directory* of the same name (the `scripts/` folder has `breakdown/`) watched that word as a video. Only an existing *file* of that name is watched now.
+
 ## [0.7.1] — 2026-10-24
 
 Breakdown backlog cleared: fewer invented values, more measured.

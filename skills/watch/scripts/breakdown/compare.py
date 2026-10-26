@@ -391,6 +391,10 @@ def _render(ref: dict, cand: dict, off: float, a: float, b: float, slow: int, ou
     w = _even(h * (ri["width"] / ri["height"]) if ri["width"] and ri["height"] else h * 16 / 9)
     fps = ri["fps"] or ci["fps"] or 30.0
     font = _font()
+    if font:
+        from exports import filter_path
+
+        font = filter_path(font)
 
     def label(text: str) -> str:
         if not font:

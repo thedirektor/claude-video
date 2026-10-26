@@ -71,6 +71,11 @@ def _run(cmd: list[str], cwd: Path | None = None) -> None:
         raise RuntimeError(f"{Path(cmd[0]).name} exit {r.returncode}: {(r.stderr or r.stdout).strip()[:300]}")
 
 
+def filter_path(p: str) -> str:
+    """A file path as an ffmpeg filter option value: forward slashes, and the drive colon escaped."""
+    return p.replace("\\", "/").replace(":", r"\:")
+
+
 def _font() -> str | None:
     for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
               "/System/Library/Fonts/Supplemental/Arial.ttf", "C:/Windows/Fonts/arial.ttf"):
@@ -267,7 +272,7 @@ def write_contact(d: dict, tmp: Path, out: Path, max_tiles: int = 24) -> Path:
         vf = "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2:black"
         if font:
             label = stamp(f["t"]).replace(":", r"\:")
-            vf += (f",drawtext=fontfile='{font}':text='{label}':x=6:y=h-th-6:fontsize=18:fontcolor=white:"
+            vf += (f",drawtext=fontfile='{filter_path(font)}':text='{label}':x=6:y=h-th-6:fontsize=18:fontcolor=white:"
                    "box=1:boxcolor=black@0.6:boxborderw=4")
         _run(["ffmpeg", "-v", "error", "-y", "-i", f["path"], "-vf", vf, "-frames:v", "1", str(tmp / f"c_{i:03d}.png")])
     cols = min(6, len(picks))

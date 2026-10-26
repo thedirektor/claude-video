@@ -191,3 +191,24 @@ def test_build_with_real_clis(conn, video):
     cell = subprocess.run([exports.find_cli("gridcraft"), "cat", res["xlsx"]["path"], "--sheet", "Transcript", "--csv"],
                           capture_output=True, text=True).stdout
     assert "=SUM(A1:A9) no es" in cell and ",=SUM" not in cell
+
+
+def test_filter_path_escapes_windows_drive_colon():
+    # drawtext reads "C:/..." as option "C" followed by junk; the colon must be escaped
+    assert exports.filter_path("C:/Windows/Fonts/arial.ttf") == r"C\:/Windows/Fonts/arial.ttf"
+    assert exports.filter_path(r"C:\Windows\Fonts\arial.ttf") == r"C\:/Windows/Fonts/arial.ttf"
+    assert exports.filter_path("/usr/share/fonts/DejaVuSans.ttf") == "/usr/share/fonts/DejaVuSans.ttf"
+
+
+@needs_ffmpeg
+def test_contact_sheet_font_path_with_drive_colon(conn, video, tmp_path, monkeypatch):
+    font = exports._font()
+    if font is None:
+        pytest.skip("no font")
+    # a path with a colon, like a Windows drive letter
+    odd = tmp_path / "C:x"
+    odd.mkdir()
+    shutil.copy(font, odd / "f.ttf")
+    monkeypatch.setattr(exports, "_font", lambda: str(odd / "f.ttf"))
+    d = exports.load(conn, KEY, video)
+    assert exports.write_contact(d, tmp_path, tmp_path / "sheet.png").is_file()

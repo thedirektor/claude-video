@@ -125,3 +125,11 @@ def test_no_ocr_and_scene_threshold_accepted(cut_clip: Path, tmp_path: Path):
     proc = _run_raw(cut_clip, "--no-whisper", "--no-ocr", "--no-scene-detect",
                     "--scene-threshold", "30", "--no-two-pass", "--out-dir", str(tmp_path))
     assert proc.returncode == 0, proc.stderr
+
+
+def test_subcommand_runs_when_cwd_has_a_folder_of_that_name(tmp_path):
+    # running from the scripts folder (it has a breakdown/ package) must not watch "breakdown"
+    (tmp_path / "breakdown").mkdir()
+    r = subprocess.run([sys.executable, str(WATCH), "breakdown", "--help"], cwd=tmp_path,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "watch breakdown" in r.stdout
