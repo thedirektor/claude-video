@@ -42,8 +42,13 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 
-OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+OPENROUTER_BASE = (os.environ.get("WATCH_OPENROUTER_BASE") or "https://openrouter.ai/api/v1").rstrip("/")
 CHAT_ENDPOINT = f"{OPENROUTER_BASE}/chat/completions"
+
+# Optional self-hosted vision model tried before OpenRouter (any OpenAI-compatible
+# base URL, e.g. a Runpod vLLM endpoint: https://api.runpod.ai/v2/<id>/openai/v1).
+# Unset = OpenRouter only. Any failure falls back to OpenRouter.
+_LOCAL_VISION_TIMEOUT = 420  # a scale-to-zero GPU worker cold-starts in ~3 min
 TRANSCRIPTION_ENDPOINT = f"{OPENROUTER_BASE}/audio/transcriptions"
 
 DEFAULT_VISION_MODEL = "google/gemini-2.5-flash"
@@ -62,7 +67,12 @@ _VOXTRAL_FALLBACK_MODEL = "mistralai/voxtral-mini-transcribe"
 
 def load_api_key() -> str | None:
     """Return OPENROUTER_API_KEY from env or ~/.config/watch/.env."""
-    value = os.environ.get("OPENROUTER_API_KEY")
+    return _load_setting("OPENROUTER_API_KEY")
+
+
+def _load_setting(name: str) -> str | None:
+    """Return `name` from env or ~/.config/watch/.env (or ./.env)."""
+    value = os.environ.get(name)
     if value and value.strip():
         return value.strip()
     for candidate in [
@@ -77,7 +87,7 @@ def load_api_key() -> str | None:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, _, v = line.partition("=")
-                if k.strip() != "OPENROUTER_API_KEY":
+                if k.strip() != name:
                     continue
                 v = v.strip()
                 if len(v) >= 2 and v[0] in ('"', "'") and v[-1] == v[0]:
@@ -349,6 +359,46 @@ def transcribe_audio(
     return _groq_transcribe(audio_path, groq_key)
 
 
+def _local_vision(content: list[dict]) -> str | None:
+    """Try the self-hosted vision endpoint once; None means "use OpenRouter".
+
+    Configured by WATCH_LOCAL_VISION_URL (OpenAI-compatible base URL),
+    WATCH_LOCAL_VISION_KEY (falls back to RUNPOD_API_KEY) and
+    WATCH_LOCAL_VISION_MODEL (served model name, default "qwen-vl").
+    """
+    base = _load_setting("WATCH_LOCAL_VISION_URL")
+    if not base:
+        return None
+    key = _load_setting("WATCH_LOCAL_VISION_KEY") or _load_setting("RUNPOD_API_KEY")
+    model = _load_setting("WATCH_LOCAL_VISION_MODEL") or "qwen-vl"
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": content}]}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = Request(f"{base.rstrip('/')}/chat/completions", data=body, headers=headers, method="POST")
+    started = time.monotonic()
+    try:
+        with urlopen(req, timeout=_LOCAL_VISION_TIMEOUT, context=ssl.create_default_context()) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        text = (data["choices"][0]["message"]["content"] or "").strip()
+    except urllib.error.HTTPError as exc:
+        print(f"[watch] local vision HTTP {exc.code}{_read_error(exc)} — falling back to OpenRouter", file=sys.stderr)
+        return None
+    except Exception as exc:  # timeout, network, bad JSON, missing fields
+        print(f"[watch] local vision failed ({type(exc).__name__}: {exc}) — falling back to OpenRouter", file=sys.stderr)
+        return None
+    if not text:
+        print("[watch] local vision returned an empty answer — falling back to OpenRouter", file=sys.stderr)
+        return None
+    usage = data.get("usage") or {}
+    # Billed per GPU-second by the host, not per token: record tokens, $0 here.
+    spend.record("local", f"answer ({model})", usd=0.0,
+                 tokens_in=int(usage.get("prompt_tokens") or 0), tokens_out=int(usage.get("completion_tokens") or 0),
+                 seconds=time.monotonic() - started)
+    print(f"[watch] answered by local vision model {model}", file=sys.stderr)
+    return text
+
+
 def analyze_with_frames(
     frame_paths: list[str],
     transcript_text: str | None,
@@ -360,16 +410,10 @@ def analyze_with_frames(
 
     Structures the message as: text preamble (with optional transcript), then
     one image_url part per frame, then the question as the final text part.
+    Tries the self-hosted vision endpoint first when WATCH_LOCAL_VISION_URL is
+    set, falling back to OpenRouter on any failure.
     Returns the model's text response. Raises SystemExit on failure.
     """
-    if api_key is None:
-        api_key = load_api_key()
-    if not api_key:
-        raise SystemExit(
-            "OPENROUTER_API_KEY not set. Add it to ~/.config/watch/.env or "
-            "export OPENROUTER_API_KEY in your environment."
-        )
-
     content: list[dict] = []
 
     preamble_parts: list[str] = [
@@ -394,6 +438,18 @@ def analyze_with_frames(
         raise SystemExit("No valid frame files found to send to OpenRouter vision")
 
     content.append({"type": "text", "text": question.strip()})
+
+    local_text = _local_vision(content)
+    if local_text is not None:
+        return local_text
+
+    if api_key is None:
+        api_key = load_api_key()
+    if not api_key:
+        raise SystemExit(
+            "OPENROUTER_API_KEY not set. Add it to ~/.config/watch/.env or "
+            "export OPENROUTER_API_KEY in your environment."
+        )
 
     body = json.dumps({
         "model": vision_model,
