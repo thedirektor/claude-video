@@ -2,6 +2,12 @@
 
 All notable changes to `/watch` are documented here.
 
+## [Unreleased]
+
+### Added
+- **Self-hosted vision before OpenRouter**: with `WATCH_LOCAL_VISION_URL` set (any OpenAI-compatible base URL, e.g. a Runpod vLLM endpoint `https://api.runpod.ai/v2/<id>/openai/v1`), `--backend openrouter` asks that model first and falls back to OpenRouter on any error, timeout (420 s, enough for a scale-to-zero cold start) or empty answer. Key: `WATCH_LOCAL_VISION_KEY`, else `RUNPOD_API_KEY`; model: `WATCH_LOCAL_VISION_MODEL` (default `qwen-vl`). Spend records the call as provider `local` at $0 (the host bills GPU time, not tokens).
+- **`WATCH_OPENROUTER_BASE`** overrides the OpenRouter base URL.
+
 ## [0.7.2] — 2026-10-26
 
 Windows fixes found running the breakdown on a Windows PC.
