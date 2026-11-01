@@ -35,6 +35,23 @@ def _check(name: str, status: str, detail: str, **extra) -> dict:
     return {"name": name, "status": status, "detail": detail, **extra}
 
 
+def _redact_url(url: str) -> str:
+    """`scheme://user:pass@host` → `scheme://user:***@host`; URLs without a password are unchanged."""
+    import urllib.parse
+
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<unparseable url>"
+    if p.password is None:
+        return url
+    host = p.hostname or ""
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    netloc = f"{p.username}:***@{host}" + (f":{p.port}" if p.port else "")
+    return urllib.parse.urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment))
+
+
 def _first_line(text: str) -> str:
     return next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
 
@@ -205,17 +222,19 @@ def run_checks(*, online: bool = True, which=shutil.which, run=subprocess.run, h
                 continue
             code = http(url)
             reachable = code is not None and code < 500
+            shown = _redact_url(url)
             checks.append(_check(name, "ok" if reachable else "warn",
-                                 f"{url} reachable (HTTP {code})" if reachable
-                                 else f"{url} unreachable" + (f" (HTTP {code})" if code else "")))
+                                 f"{shown} reachable (HTTP {code})" if reachable
+                                 else f"{shown} unreachable" + (f" (HTTP {code})" if code else "")))
 
         proxy = setting("WATCH_YTDLP_FALLBACK_PROXY")
         if proxy:
             code = proxy_status(proxy)
             ok = code is not None and code < 400
+            shown = _redact_url(proxy)  # the report goes to agents and chat; never the password
             checks.append(_check("fallback proxy", "ok" if ok else "warn",
-                                 f"{proxy} → YouTube HTTP {code}" if code is not None
-                                 else f"{proxy} unreachable — blocked downloads fall back to storyboards"))
+                                 f"{shown} → YouTube HTTP {code}" if code is not None
+                                 else f"{shown} unreachable — blocked downloads fall back to storyboards"))
 
     checks.extend(_keys())
     return {"ok": not any(c["status"] == "fail" for c in checks), "checks": checks}

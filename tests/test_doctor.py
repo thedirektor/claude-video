@@ -141,6 +141,16 @@ def test_fallback_proxy_check(env):
     assert c["status"] == "warn" and "storyboards" in c["detail"]
 
 
+def test_fallback_proxy_check_never_shows_password(env):
+    env.setenv("WATCH_YTDLP_FALLBACK_PROXY", "http://watch:s3cretPW@100.64.0.9:3128")
+    common = dict(online=True, which=lambda n: f"/usr/bin/{n}", run=_ok_run(), embedder_ok=lambda: True,
+                  http=lambda url: 200)
+    for status in (204, None):
+        c = _by_name(doctor.run_checks(**common, proxy_status=lambda p: status))["fallback proxy"]
+        assert "s3cretPW" not in c["detail"]
+        assert "http://watch:***@100.64.0.9:3128" in c["detail"]
+
+
 def test_no_fallback_proxy_no_check(env):
     env.delenv("WATCH_YTDLP_FALLBACK_PROXY", raising=False)
     rep = doctor.run_checks(online=True, which=lambda n: f"/usr/bin/{n}", run=_ok_run(), embedder_ok=lambda: True,
