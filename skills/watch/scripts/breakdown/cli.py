@@ -15,7 +15,7 @@ import cost
 from config import memory_paths
 from memory import index, retrieval
 
-from . import assemble, compare, interchange, media, motion
+from . import assemble, compare, interchange, media, motion, subtitles
 
 EXIT_NOT_FOUND = 3
 EXIT_AMBIGUOUS = 4
@@ -27,8 +27,8 @@ def _parse_formats(value: str | None) -> list[str]:
         f = f.strip().lower()
         if not f:
             continue
-        if f not in assemble.FORMATS:
-            raise ValueError(f"unknown timeline format {f!r} (choose from {', '.join(assemble.FORMATS)})")
+        if f not in assemble.FORMATS + subtitles.FORMATS:
+            raise ValueError(f"unknown format {f!r} (choose from {', '.join(assemble.FORMATS + subtitles.FORMATS)})")
         if f not in out:
             out.append(f)
     return out
@@ -53,7 +53,9 @@ def _cmd_breakdown(argv: list[str]) -> int:
     ap.add_argument("video", help="video_key, URL/path or title fragment of an already watched video")
     ap.add_argument("--interpret", action="store_true", help="add one LLM-written interpretation (paid)")
     ap.add_argument("--json", action="store_true", help="print breakdown.json instead of the brief")
-    ap.add_argument("--formats", default="", help="timeline files to write: otio,fcpxml,edl")
+    ap.add_argument("--formats", default="",
+                    help="files to write: timelines otio,fcpxml,edl; subtitles srt (captions.srt + onscreen.srt), "
+                         "ass (onscreen.ass, placed and coloured as measured)")
     ap.add_argument("--allow-cost", action="store_true", help="ignore WATCH_COST_CEILING_USD for --interpret")
     ap.add_argument("--spend-out", default=None, help="write spend.json (the --interpret call's cost) to this folder")
     ap.add_argument("--stored", action="store_true",
@@ -98,10 +100,17 @@ def _cmd_breakdown(argv: list[str]) -> int:
             print(f"[watch] {exc}", file=sys.stderr)
             return 2
         out_dir = assemble.store(conn, key, bd)
-        if formats:
-            written = assemble.write_timelines(bd, out_dir, formats)
+        timeline_fmts = [f for f in formats if f in assemble.FORMATS]
+        sub_fmts = [f for f in formats if f in subtitles.FORMATS]
+        if timeline_fmts:
+            written = assemble.write_timelines(bd, out_dir, timeline_fmts)
             if not written:
                 print(f"[watch] no timeline files written: {interchange.skip_reason(bd)}", file=sys.stderr)
+        if sub_fmts:
+            segs = [dict(r) for r in conn.execute(
+                'SELECT start, "end" AS end, text FROM segments WHERE video_key = ? ORDER BY start', (key,))]
+            if not subtitles.write(bd, segs, out_dir, sub_fmts):
+                print("[watch] no subtitle files written: no transcript and no on-screen text", file=sys.stderr)
         _push(key)
     finally:
         conn.close()
