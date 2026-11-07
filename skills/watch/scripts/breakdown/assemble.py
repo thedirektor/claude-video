@@ -21,7 +21,7 @@ from config import memory_paths
 from memory import index, store as mstore
 
 from . import audio as audio_mod
-from . import camera, look, media, shots as shots_mod, transitions, typography
+from . import camera, look, media, production, provenance, shots as shots_mod, transitions, typography
 
 SCHEMA = "watch.breakdown/1"
 NOT_DETERMINED = "not determined"
@@ -323,6 +323,37 @@ def _typography_section(m: dict, duration: float, notes: list[str]) -> dict:
             "evidence": _ev(0.0, duration, "ocr", conf, sampling=note)}
 
 
+def _production_section(shot_list: list[dict], prov: dict | None, duration: float) -> dict:
+    """Duration-weighted share of each production label + file provenance."""
+    share: dict[str, float] = {}
+    lean: dict[str, float] = {}
+    for s in shot_list:
+        p = s.get("production") or {}
+        d = max(0.0, float(s.get("duration") or 0.0))
+        share[p.get("label", NOT_DETERMINED)] = share.get(p.get("label", NOT_DETERMINED), 0.0) + d
+        if p.get("label") == NOT_DETERMINED and p.get("candidates"):
+            top = p["candidates"][0]["label"]
+            lean[top] = lean.get(top, 0.0) + d
+    total = sum(share.values()) or 1.0
+    out = {"share": {k: round(v / total, 4) for k, v in sorted(share.items(), key=lambda kv: -kv[1])},
+           "undetermined_leaning": {k: round(v / total, 4) for k, v in sorted(lean.items(), key=lambda kv: -kv[1])},
+           "provenance": {k: v for k, v in (prov or {}).items() if k != "evidence"} if prov else NOT_DETERMINED,
+           "provenance_evidence": (prov or {}).get("evidence") or [],
+           "evidence": _ev(0.0, duration, "measured",
+                           0.0 if not shot_list else round(sum(
+                               (s.get("production") or {}).get("evidence", {}).get("confidence", 0.0)
+                               * float(s.get("duration") or 0.0) for s in shot_list) / total, 3))}
+    return out
+
+
+def _production_line(p: dict) -> str:
+    lab = p.get("label", NOT_DETERMINED)
+    txt = _v(lab)
+    if lab == NOT_DETERMINED and p.get("candidates"):
+        txt += " (leans " + ", ".join(f"{c['label']} {c['confidence']:.2f}" for c in p["candidates"][:2]) + ")"
+    return txt + _lc(p.get("evidence"))
+
+
 def _rhythm_section(shot_list: list[dict]) -> dict:
     r = shots_mod.rhythm(shot_list)
     for k in ("fastest_window", "slowest_window"):
@@ -450,10 +481,12 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
         _add_note(notes, "media not available (stored frames only); low resolution: cuts and shots not determined")
     shot_list, loose_fades = reconcile(raw, entries) if raw else ([], [])
 
+    prov = provenance.probe(m["path"]) if has_media else None
     for sh in shot_list:
         _add_note(notes, (sh.get("boundary") or {}).get("note", ""))
         sh["camera"] = camera.camera_motion(m["path"], sh, crop=series.get("crop"))
         sh["look"] = look.shot_look(m["path"], sh)
+        sh["production"] = production.shot_production(m["path"], sh, fps, prov)
         for n in (sh["camera"].get("notes") or []) + (sh["look"].get("notes") or []):
             _add_note(notes, n)
 
@@ -483,6 +516,7 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
         "shots": shot_list,
         "fades": loose_fades,
         "rhythm": _rhythm_section(shot_list),
+        "production": _production_section(shot_list, prov, duration),
     }
     bd["typography"] = _typography_section(m, duration, notes)
     bd["audio"] = _audio_section(m, shot_list, duration, segs, notes, row["transcript_source"] if row else None)
@@ -593,10 +627,21 @@ def brief_md(bd: dict) -> str:
         pal_s = _v(pal) if pal == NOT_DETERMINED else ", ".join(f"{p['hex']} {p['share']:.0%}" for p in pal)
         out.append(f"{s['index'] + 1}. {_t(s['start'])} - {_t(s['end'])} ({_t(s['duration'])}) "
                    f"· in: {_trans(s.get('transition'))}"
+                   + (f" · made as: {_production_line(s['production'])}" if s.get("production") else "")
+                   +
                    f" · camera: {_v(s['camera']['type'])}{_lc(s['camera']['evidence'])} · palette: {pal_s}"
                    f" · brightness {_v(s['look']['brightness'])} · contrast {_v(s['look']['contrast'])}"
                    f" · saturation {_v(s['look']['saturation'])} · temperature {_v(s['look']['temperature'])}"
                    + _bars(s["look"].get("letterbox")) + _lc(s["look"]["evidence"]))
+    pr = bd.get("production")
+    if isinstance(pr, dict) and pr.get("share"):
+        out += ["", "Production (share of runtime): " + ", ".join(f"{k} {v:.0%}" for k, v in pr["share"].items())
+                + (" · undetermined shots lean: " + ", ".join(f"{k} {v:.0%}" for k, v in pr["undetermined_leaning"].items())
+                   if pr.get("undetermined_leaning") else "")]
+        if pr.get("provenance_evidence"):
+            out.append("File provenance: " + "; ".join(e["detail"] for e in pr["provenance_evidence"]))
+        else:
+            out.append("File provenance: none declared (stripped by re-encoding, or never written)")
     if bd.get("fades"):
         out += ["", "Fades at clip edges / not tied to a cut: "
                 + "; ".join(f"{f['kind']} {_span(f['evidence'])}" + _lc(f["evidence"]) for f in bd["fades"])]
