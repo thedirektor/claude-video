@@ -649,7 +649,7 @@ def brief_md(bd: dict) -> str:
                    + _bars(s["look"].get("letterbox")) + _lc(s["look"]["evidence"]))
     pr = bd.get("production")
     if isinstance(pr, dict) and pr.get("share"):
-        out += ["", "Production (share of runtime): " + ", ".join(f"{k} {v:.0%}" for k, v in pr["share"].items())
+        out += ["", "Production (share of runtime): " + ", ".join(f"{_v(k)} {v:.0%}" for k, v in pr["share"].items())
                 + (" · undetermined shots lean: " + ", ".join(f"{k} {v:.0%}" for k, v in pr["undetermined_leaning"].items())
                    if pr.get("undetermined_leaning") else "")]
         if pr.get("provenance_evidence"):

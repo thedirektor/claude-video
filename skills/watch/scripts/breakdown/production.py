@@ -30,7 +30,9 @@ MOVE_DIFF = 1.5  # ... and above which the picture is moving
 SPREAD_FRAMES = 5
 STILL_DIFF = 0.8  # every spread frame within this of the first: nothing moves in the shot
 FLAT_STD = 0.75  # an 8x8 block this flat has no grain and no texture
-FLAT_LO, FLAT_HI = 8, 247  # crushed blacks / clipped whites are flat on camera too
+FLAT_LO, FLAT_HI = 40, 247  # dark and clipped-white areas are flat on camera too: a close-up of dark clothing
+# with motion blur read 0.59 at a floor of 8 and 0.23 at 40, while 3D surfaces stayed at 0.41 (a dark-theme UI
+# now reads undetermined instead of synthetic: the price of not labelling camera footage synthetic)
 CENTRE_SIDE = 512  # full-resolution centre crop for the flat-block measure
 RIGID_RESIDUAL = 2.2  # mean abs residual (0-255) after one similarity warp: the picture moved as one plane
 RIGID_MIN_MOTION = 1.0  # px of motion (work width) needed before "moved as one plane" means anything

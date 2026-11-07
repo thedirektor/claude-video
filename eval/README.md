@@ -19,8 +19,8 @@ relative to it. Format: see `labels.example.json`.
 ## Seed results (2026-11-07)
 
 Six clips: a phone TikTok (12 hand-labelled cuts), its AI remake, a 3D explainer, a code-UI promo,
-a 131-shot music video and a one-shot clip. Cuts: recall 100%, precision 100%. Production: 24% of
-410 s determined, 99% right when determined, undetermined shots lean right 93%.
+a 131-shot music video and a one-shot clip. Cuts: recall 100%, precision 100%. Production: 20% of
+410 s determined, 99% right when determined, undetermined shots lean right 92%.
 
 **These numbers are not independent**: the thresholds were set on the same clips. Treat them as a
 regression floor; only a set labelled after the thresholds were fixed measures accuracy.
