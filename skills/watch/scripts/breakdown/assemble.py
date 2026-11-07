@@ -21,11 +21,11 @@ from config import memory_paths
 from memory import index, store as mstore
 
 from . import audio as audio_mod
-from . import camera, look, media, production, provenance, shots as shots_mod, transitions, typography
+from . import camera, corrections, look, media, production, provenance, shots as shots_mod, transitions, typography
 
 SCHEMA = "watch.breakdown/1"
 NOT_DETERMINED = "not determined"
-METHODS = ("measured", "ocr", "transcript", "interpretation")
+METHODS = ("measured", "ocr", "transcript", "interpretation", "correction")
 CONTRACT = ("> **Build contract:** follow only what this breakdown states. Anything marked _not determined_ "
             "stays an explicit placeholder in what you build. Never fill gaps with taste or assumptions.")
 FORMATS = ("otio", "fcpxml", "edl")
@@ -349,6 +349,9 @@ def _production_section(shot_list: list[dict], prov: dict | None, duration: floa
 def _production_line(p: dict) -> str:
     lab = p.get("label", NOT_DETERMINED)
     txt = _v(lab)
+    if (p.get("evidence") or {}).get("method") == "correction":
+        was = (p.get("measured") or {}).get("label")
+        return txt + f" (corrected by the user; measured: {_v(was) if was else 'n/a'})"
     if lab == NOT_DETERMINED and p.get("candidates"):
         txt += " (leans " + ", ".join(f"{c['label']} {c['confidence']:.2f}" for c in p["candidates"][:2]) + ")"
     return txt + _lc(p.get("evidence"))
@@ -459,9 +462,13 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
     raw: list[dict] = []
     entries: list[dict] = []
     series: dict = {}
+    corr_root = Path(store_dir) if store_dir is not None else Path(memory_paths()["store_dir"])
+    corr = corrections.load(corrections.path_for(conn, corr_root, video_key))
     if has_media and fps > 0:
         series = shots_mod.frame_series(m["path"], fps)
         raw = shots_mod.detect_shots(series, duration)
+        if raw and corr:
+            raw = corrections.apply_cuts(raw, corr, duration, fps)
         if raw:
             entries = transitions.classify(series, raw)
             _add_note(notes, BLIND_SPOT_NOTE)
@@ -489,6 +496,11 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
         sh["production"] = production.shot_production(m["path"], sh, fps, prov)
         for n in (sh["camera"].get("notes") or []) + (sh["look"].get("notes") or []):
             _add_note(notes, n)
+    if corr:
+        corrections.apply_production(shot_list, corr)
+        cs = corrections.summary(corr)
+        _add_note(notes, f"{cs['total']} user correction(s) applied (watch.py correct): measured values kept "
+                         "under `measured`, evidence method `correction`")
 
     width, height = int(m.get("width") or 0), int(m.get("height") or 0)
     video = {"key": video_key, "title": title, "url": url, "duration": duration, "fps": fps,
@@ -518,6 +530,8 @@ def build(conn, video_key: str, *, interpret: bool = False, store_dir=None, comp
         "rhythm": _rhythm_section(shot_list),
         "production": _production_section(shot_list, prov, duration),
     }
+    if corr:
+        bd["corrections"] = corrections.summary(corr)
     bd["typography"] = _typography_section(m, duration, notes)
     bd["audio"] = _audio_section(m, shot_list, duration, segs, notes, row["transcript_source"] if row else None)
     bd["notes"] = notes
