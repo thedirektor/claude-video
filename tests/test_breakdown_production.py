@@ -97,6 +97,21 @@ def test_flat_graphics_animation_is_synthetic(tmp_path):
 
 
 @needs_ffmpeg
+def test_white_ui_background_is_synthetic(tmp_path):
+    p = tmp_path / "white_ui.mp4"
+    _ff("-f", "lavfi", "-i", "color=c=white:s=640x360:r=25:d=4", "-f", "lavfi", "-i",
+        "testsrc2=s=200x120:r=25:d=4", "-filter_complex", "[0][1]overlay=x='60+t*40':y=120", "-pix_fmt", "yuv420p", str(p))
+    r = _shot(p)
+    assert r["label"] == "synthetic", r
+    assert r["measurements"]["white_fill"] >= production.WHITE_FILL
+
+
+def test_denoised_footage_between_bounds_only_leans_synthetic():
+    r = production.classify(SHOT, _m(flat=0.35))
+    assert r["label"] == production.NOT_DETERMINED and r["candidates"][0]["label"] == "synthetic"
+
+
+@needs_ffmpeg
 def test_photo_push_in_is_still_moved(tmp_path):
     img = tmp_path / "photo.png"
     _ff("-f", "lavfi", "-i", "mandelbrot=s=1280x720", "-frames:v", "1", str(img))

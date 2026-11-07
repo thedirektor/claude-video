@@ -645,7 +645,7 @@ def _run_openrouter_backend(args, work: Path) -> int:
     return 0
 
 
-BREAKDOWN_COMMANDS = {"breakdown", "motion", "compare"}
+BREAKDOWN_COMMANDS = {"breakdown", "motion", "compare", "evaluate"}
 MEMORY_COMMANDS = {"search", "ask", "moment", "list", "index", "stats", "export"}
 
 

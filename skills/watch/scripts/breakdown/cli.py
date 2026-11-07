@@ -184,12 +184,18 @@ def _cmd_compare(argv: list[str]) -> int:
     return 0
 
 
-COMMANDS = {"breakdown": _cmd_breakdown, "motion": _cmd_motion, "compare": _cmd_compare}
+def _cmd_evaluate(argv: list[str]) -> int:
+    from . import evaluate  # noqa: PLC0415
+
+    return evaluate.main(argv)
+
+
+COMMANDS = {"breakdown": _cmd_breakdown, "motion": _cmd_motion, "compare": _cmd_compare, "evaluate": _cmd_evaluate}
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("breakdown", "motion", "compare"):
-        print("usage: watch.py breakdown|motion|compare ...", file=sys.stderr)
+    if not argv or argv[0] not in COMMANDS:
+        print("usage: watch.py breakdown|motion|compare|evaluate ...", file=sys.stderr)
         return 2
     handler = COMMANDS.get(argv[0])
     if handler is None:

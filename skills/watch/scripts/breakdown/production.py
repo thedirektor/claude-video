@@ -35,7 +35,9 @@ CENTRE_SIDE = 512  # full-resolution centre crop for the flat-block measure
 RIGID_RESIDUAL = 2.2  # mean abs residual (0-255) after one similarity warp: the picture moved as one plane
 RIGID_MIN_MOTION = 1.0  # px of motion (work width) needed before "moved as one plane" means anything
 RIGID_INLIERS = 0.85
-FLAT_SYNTHETIC = 0.30
+FLAT_SYNTHETIC = 0.45  # labelled: 3D explainer 0.36-0.70, code UI up to 0.9 ...
+WHITE_FILL = 0.35  # flat pure-white share of the frame: UI promo median 0.70, camera clips <= 0.05 (a huge blown-out sky could reach it)
+FLAT_LEAN = 0.30  # ... but a denoised 4K music-video remaster reached 0.30-0.42: in between only leans
 HELD_MIN = 0.15  # repeated-frame share that marks a lower source rate
 CAP_UNDECLARED = 0.7  # pixel evidence alone never claims more than this
 
@@ -94,6 +96,15 @@ def flat_share(np, gray) -> float:
     if not mid.any():
         return 0.0
     return float(((std < FLAT_STD) & mid).sum() / max(1, mid.sum()))
+
+
+def white_fill(np, gray) -> float:
+    """Share of 8x8 blocks that are flat pure white (a drawn background; FLAT_HI leaves them out of ``flat``)."""
+    h, w = (gray.shape[0] // 8) * 8, (gray.shape[1] // 8) * 8
+    if h < 8 or w < 8:
+        return 0.0
+    b = gray[:h, :w].astype(np.float64).reshape(h // 8, 8, w // 8, 8).swapaxes(1, 2).reshape(-1, 64)
+    return float(((b.mean(axis=1) >= FLAT_HI) & (b.std(axis=1) < FLAT_STD)).mean())
 
 
 def _rigid(cv2, np, a, b) -> tuple[float, float] | None:
@@ -168,6 +179,7 @@ def measure(cv2, np, path: str, shot: dict, fps: float) -> dict:
         "motion": round(float(np.median(diffs)), 3) if diffs else 0.0,
         "still_diff": round(still_d, 3),
         "flat": round(float(np.median([flat_share(np, c) for c in centres])), 3) if centres else None,
+        "white_fill": round(float(np.median([white_fill(np, c) for c in centres])), 3) if centres else None,
         "rigid_residual": round(float(np.median([r[0] for r in moved])), 3) if moved else None,
         "rigid_pairs": len(moved),
     }
@@ -185,7 +197,8 @@ def classify(shot: dict, m: dict, provenance: dict | None = None) -> dict:
     still = m.get("still_diff", 99.0) < STILL_DIFF
     rigid = (m.get("rigid_residual") is not None and m["rigid_residual"] < RIGID_RESIDUAL
              and m.get("rigid_pairs", 0) >= 2)
-    smooth = flat is not None and flat >= FLAT_SYNTHETIC
+    white = m.get("white_fill") or 0.0
+    smooth = (flat is not None and flat >= FLAT_SYNTHETIC) or white >= WHITE_FILL
     held = bool(m.get("source_fps"))
     if held:
         notes.append(f"{m['held_share']:.0%} of consecutive frames repeat while the picture moves: source rate "
@@ -194,12 +207,16 @@ def classify(shot: dict, m: dict, provenance: dict | None = None) -> dict:
         return _out(shot, m, "still", 0.85, [("still", 0.85)], notes)
     if rigid:
         notes.append("the whole picture moves as one rigid plane (digital push / pan / scroll, no parallax)")
-        cands = [("still_moved", 0.7)] + ([("synthetic", 0.5)] if smooth else [])
+        cands = [("still_moved", 0.7)] + ([("synthetic", 0.5)] if flat is not None and flat >= FLAT_LEAN else [])
         return _out(shot, m, "still_moved", 0.7, cands, notes)
     if smooth:
-        notes.append(f"{flat:.0%} of the picture is texture-free: drawn / rendered surfaces (graphics, UI, "
-                     "slides or 3D), not camera footage")
-        cands = [("synthetic", min(CAP_UNDECLARED, 0.35 + flat))]
+        if white >= WHITE_FILL:
+            notes.append(f"{white:.0%} of the picture is a flat pure-white fill: a drawn background (UI, slide, "
+                         "card); a very large blown-out sky would read the same")
+        else:
+            notes.append(f"{flat:.0%} of the picture is texture-free: drawn / rendered surfaces (graphics, UI, "
+                         "slides or 3D), not camera footage")
+        cands = [("synthetic", min(CAP_UNDECLARED, 0.35 + max(flat or 0.0, white)))]
         if declared == "ai_generated":
             cands.append(("ai_generated", 0.6))
         return _out(shot, m, "synthetic", cands[0][1], cands, notes)
@@ -210,6 +227,11 @@ def classify(shot: dict, m: dict, provenance: dict | None = None) -> dict:
     if declared == "camera":
         notes.append("camera make / model tags in the file")
         return _out(shot, m, "camera", 0.8, [("camera", 0.8)], notes)
+    if flat is not None and flat >= FLAT_LEAN:
+        notes.append(f"{flat:.0%} of the picture is texture-free: rendered / drawn surfaces or heavily denoised "
+                     "footage; not enough to tell")
+        cands = [("synthetic", 0.4), ("ai_video", 0.3), ("camera", 0.3)]
+        return _out(shot, m, NOT_DETERMINED, 0.0, cands, notes)
     cands = [("ai_video", 0.45), ("camera", 0.3)] if held else [("camera", 0.4), ("ai_video", 0.35)]
     notes.append("textured footage with no provenance in the file: camera or AI video cannot be told apart "
                  "from pixels" + ("; the lowered source rate leans to generated video (film transfers do "
