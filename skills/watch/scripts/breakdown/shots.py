@@ -750,6 +750,15 @@ def _boundaries(series: dict) -> list[dict]:
         cut_idx.add(i)
         out.append({"kind": "cut", "t": t[i], "frames": 1, "t_start": t[i - 1], "t_end": t[i],
                     "confidence": _clamp(0.5 + strength[i] / (2 * thr))})
+    # weak candidates: a spike under the floor that towers over its neighbourhood (a jump cut inside one
+    # framing changes little of the picture); _vet_cuts keeps one only when it passes the jump-cut test
+    for i in range(2, n - 1):
+        if i in cut_idx or i - 1 in cut_idx or i + 1 in cut_idx or not (WEAK_FLOOR <= strength[i] < thr):
+            continue
+        near = sorted(strength[k] for k in range(max(1, i - 5), min(n, i + 6)) if k != i)
+        if near and strength[i] >= WEAK_STAND_OUT * max(near[len(near) // 2], 1e-4) and strength[i] > max(near):
+            out.append({"kind": "cut", "t": t[i], "frames": 1, "t_start": t[i - 1], "t_end": t[i], "weak": True,
+                        "confidence": JUMP_CONF})
     grads = _gradual(series, cut_idx)
     pos = {round(x, 6): i for i, x in enumerate(t)}
     taken = [(pos.get(round(g["t_start"], 6), 0), pos.get(round(g["t_end"], 6), 0)) for g in grads]
@@ -938,6 +947,41 @@ def correlation(a, b) -> float | None:
 SAME_PICTURE_MAX_STEP = 0.1  # false steps on real footage were 0.055-0.067, real cuts >= 0.11; a big step is an edit however alike the frames
 SAME_PICTURE = 0.8  # frames either side of a "cut" correlating this well are one picture
 CUT_STAND_OUT = 2.5  # a cut's step must exceed the change around it by this factor
+# Jump cut inside one framing (same set, the subject jumps): kept only with a sharp stand-out, calm
+# sides at least JUMP_SIDE_S long (no sliver shots) and a picture that does not come back. Measured on
+# hand-labelled phone footage: real jump cuts stood out 7.6x and 17x the frames around them.
+JUMP_STAND_OUT = 6.0
+JUMP_SIDE_S = 0.3
+JUMP_SIDE_CALM = 3.0  # every step on either side stays this many times under the jump
+JUMP_NO_RETURN = 0.5  # the old picture stays at least this share of the jump away afterwards
+JUMP_MIN_MED = 0.0015  # a frozen picture (slides, UI) has no motion to stand out of: a build, not a jump cut.
+# Local median step measured: code-UI promo p50 0.00017 (83% under this), phone talking head p10 0.0022 (none under)
+JUMP_CONF = 0.6
+WEAK_FLOOR = 0.08  # scene strength under CUT_FLOOR that may still be a jump cut ...
+WEAK_STAND_OUT = 15.0  # ... when it towers this many times over the median of the frames around it
+JUMP_NOTE = ("jump cut(s) inside one framing kept: the subject jumps while the set stays (measured); "
+             "the cut count may still miss subtler ones")
+
+
+def _jump_cut(series: dict, d: list[float], i: int, med: float) -> bool:
+    """A same-picture step that is still an edit: see JUMP_* above."""
+    t, th = series["t"], series["thumb"]
+    if med < JUMP_MIN_MED or d[i] < JUMP_STAND_OUT * med:
+        return False
+    dts = [t[k + 1] - t[k] for k in range(max(0, i - 10), min(len(t) - 1, i + 10))]
+    dt = statistics.median(dts) if dts else 0.0
+    if dt <= 0:
+        return False
+    side = max(2, int(math.ceil(JUMP_SIDE_S / dt)))
+    if i - side < 1 or i + side >= len(d):
+        return False  # a side shorter than JUMP_SIDE_S would be a sliver shot
+    calm = d[i] / JUMP_SIDE_CALM
+    if any(d[k] > calm for k in range(i - side + 1, i)) or any(d[k] > calm for k in range(i + 1, i + side + 1)):
+        return False
+    floor = JUMP_NO_RETURN * d[i]
+    if any(_dist(th[i - 1], th[k]) < floor for k in range(i + 1, i + side + 1)):
+        return False  # the old picture came back: a glitch / flash, not a cut
+    return _dist(th[i - side], th[i + side - 1]) >= floor  # and the change holds across both sides
 
 
 def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
@@ -971,11 +1015,21 @@ def _vet_cuts(series: dict, bounds: list[dict]) -> list[dict]:
             continue
         near = sorted(d[k] for k in range(max(1, i - 5), min(len(d), i + 6)) if k != i)
         med = near[len(near) // 2] if near else 0.0
+        if b.get("weak"):  # under the cut floor: only a measured jump cut survives
+            b = {k: v for k, v in b.items() if k != "weak"}
+            if _jump_cut(series, d, i, med):
+                series["jump_cuts"] = series.get("jump_cuts", 0) + 1
+                out.append({**b, "jump": True, "note": JUMP_NOTE})
+            continue
         if med > 0 and d[i] < CUT_STAND_OUT * med:
             merged_out += 1
             continue
         corr = correlation(th[i - 1], th[i])
         if corr is not None and corr >= SAME_PICTURE and d[i] < SAME_PICTURE_MAX_STEP:
+            if _jump_cut(series, d, i, med):
+                series["jump_cuts"] = series.get("jump_cuts", 0) + 1
+                out.append({**b, "jump": True, "confidence": min(b["confidence"], JUMP_CONF), "note": JUMP_NOTE})
+                continue
             merged_out += 1
             continue  # the same picture either side: a small step inside one shot, not an edit
         out.append(b)
@@ -1191,6 +1245,8 @@ def build_shots(bounds: list[dict], duration: float) -> list[dict]:
                                              "method": "measured", "confidence": round(b["confidence"], 3)}}
             if b.get("note"):
                 shot["boundary"]["note"] = b["note"]
+            if b.get("jump"):
+                shot["boundary"]["jump"] = True
         shots.append(shot)
     return shots
 

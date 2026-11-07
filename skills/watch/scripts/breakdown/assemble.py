@@ -38,8 +38,8 @@ SAMPLING_NOTE = (f"sampled every {typography.STEP_S:g} s, with a word-shape scan
                  "reads extra frames for short titles; very brief, low-contrast or stylised text may still be missed")
 SAMPLING_NOTE_SEEK = (f"sampled every {typography.STEP_S:g} s by seeking (frame rate too low or variable for the "
                       "short-title scan); text shorter than that may be missed")
-BLIND_SPOT_NOTE = ("dissolves between two moving shots can go undetected and jump cuts within one framing "
-                   "may be merged: cuts and shots are what was measured")
+BLIND_SPOT_NOTE = ("dissolves between two moving shots can go undetected and subtle jump cuts within one framing "
+                   "may be merged (clear ones are kept and marked jump): cuts and shots are what was measured")
 HOLD_MIN_S = 0.5  # a black / white hold this long between two fades is its own shot (0.7.0 ruling)
 FOLD_MIN_COVER = 0.6  # share of the in-between shot the loose fade must cover to fold it into a dip
 FOLD_MAX_S = 1.0  # a fade between two cuts this close is one dip, not a shot
